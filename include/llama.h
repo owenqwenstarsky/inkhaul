@@ -634,17 +634,6 @@ extern "C" {
     // Get metadata value as a string by index
     LLAMA_API int32_t llama_model_meta_val_str_by_index(const struct llama_model * model, int32_t i, char * buf, size_t buf_size);
 
-    // GGUF metadata arrays of strings
-    // currently, only these keys are support:
-    // - tokenizer.tts_dicts
-    // - tokenizer.tts_dict.*
-
-    // Get the number of elements, or -1 if there is no such array
-    LLAMA_API int32_t llama_model_meta_arr_n(const struct llama_model * model, const char * key);
-
-    // Get element i, owned by the model; nullptr if not found
-    LLAMA_API const char * llama_model_meta_arr_str(const struct llama_model * model, const char * key, int32_t i);
-
     // Get a string describing the model type
     LLAMA_API int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t buf_size);
 
@@ -747,20 +736,6 @@ extern "C" {
             struct llama_adapter_lora ** adapters,
             size_t n_adapters,
             float * scales);
-
-    // Apply a loaded control vector to a llama_context, or if data is NULL, clear
-    // the currently loaded vector.
-    // n_embd should be the size of a single layer's control, and data should point
-    // to an n_embd x n_layers buffer starting from layer 1.
-    // il_start and il_end are the layer range the vector should apply to (both inclusive)
-    // See llama_control_vector_load in common to load a control vector.
-    LLAMA_API int32_t llama_set_adapter_cvec(
-            struct llama_context * ctx,
-                     const float * data,
-                          size_t   len,
-                         int32_t   n_embd,
-                         int32_t   il_start,
-                         int32_t   il_end);
 
     //
     // Memory
@@ -1309,7 +1284,8 @@ extern "C" {
 
     /// Apply chat template. Inspired by hf apply_chat_template() on python.
     ///
-    /// NOTE: This function does not use a jinja parser. It only support a pre-defined list of template. See more: https://github.com/ggml-org/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template
+    /// NOTE: This fork has no built-in (non-jinja) templates, so this always returns -1.
+    ///       Use the jinja engine in common (common_chat_templates_apply) instead.
     /// @param tmpl A Jinja template to use for this chat.
     /// @param chat Pointer to a list of multiple llama_chat_message
     /// @param n_msg Number of llama_chat_message in this chat
@@ -1325,7 +1301,7 @@ extern "C" {
                                   char * buf,
                                int32_t   length);
 
-    // Get list of built-in chat templates
+    // Get list of built-in chat templates (this fork has none, returns 0)
     LLAMA_API int32_t llama_chat_builtin_templates(const char ** output, size_t len);
 
     //

@@ -64,7 +64,6 @@ struct common_adapter_lora_info {
 
 using llama_tokens = std::vector<llama_token>;
 
-struct common_control_vector_load_info;
 
 //
 // CPU utils
@@ -100,12 +99,10 @@ enum llama_example {
     LLAMA_EXAMPLE_IMATRIX,
     LLAMA_EXAMPLE_BENCH,
     LLAMA_EXAMPLE_SERVER,
-    LLAMA_EXAMPLE_CVECTOR_GENERATOR,
     LLAMA_EXAMPLE_EXPORT_LORA,
     LLAMA_EXAMPLE_MTMD,
     LLAMA_EXAMPLE_LOOKUP,
     LLAMA_EXAMPLE_PARALLEL,
-    LLAMA_EXAMPLE_TTS,
     LLAMA_EXAMPLE_DIFFUSION,
     LLAMA_EXAMPLE_FINETUNE,
     LLAMA_EXAMPLE_FIT_PARAMS,
@@ -131,12 +128,6 @@ enum common_sampler_type {
     COMMON_SAMPLER_TYPE_PENALTIES   = 10,
     COMMON_SAMPLER_TYPE_TOP_N_SIGMA = 11,
     COMMON_SAMPLER_TYPE_ADAPTIVE_P  = 12,
-};
-
-// dimensionality reduction methods, used by cvector-generator
-enum dimre_method {
-    DIMRE_METHOD_PCA,
-    DIMRE_METHOD_MEAN,
 };
 
 enum common_conversation_mode {
@@ -549,12 +540,8 @@ struct common_params {
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
-    std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
-
-    int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
-    int32_t control_vector_layer_start = -1; // layer range for control vector
-    int32_t control_vector_layer_end   = -1; // layer range for control vector
-    bool    offline                    = false;
+    int32_t verbosity = 3;  // LOG_LEVEL_INFO
+    bool    offline   = false;
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
     int32_t ppl_output_type = 0;     // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line
@@ -756,13 +743,6 @@ struct common_params {
     bool activation_statistics  = false; // generate data to calculate activation based statistics
     bool parse_special          = false; // whether to parse special tokens during imatrix tokenization
 
-    // cvector-generator params
-    int n_pca_batch = 100;
-    int n_pca_iterations = 1000;
-    dimre_method cvector_dimre_method = DIMRE_METHOD_PCA;
-    std::string cvector_positive_file = "tools/cvector-generator/positive.txt";
-    std::string cvector_negative_file = "tools/cvector-generator/negative.txt";
-
     bool spm_infill = false; // suffix/prefix/middle pattern for infill
 
     // batched-bench params
@@ -786,8 +766,6 @@ struct common_params {
     // TTS params
     std::string tts_lang = "";
     std::string tts_voice = "";
-    std::string tts_speaker_file = "";
-    std::string tts_speaker_text = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
@@ -1237,28 +1215,6 @@ std::string common_detokenize(
 void common_embd_normalize(const float * inp, float * out, int n, int embd_norm);
 
 float common_embd_similarity_cos(const float * embd1, const float * embd2, int n);
-
-//
-// Control vector utils
-//
-
-struct common_control_vector_data {
-    int n_embd;
-
-    // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
-    std::vector<float> data;
-};
-
-struct common_control_vector_load_info {
-    float strength;
-
-    std::string fname;
-};
-
-// Load control vectors, scale each by strength, and add them together.
-// Direction layer indices must be in [1, n_layer].
-// On error, returns {-1, empty}
-common_control_vector_data common_control_vector_load(const std::vector<common_control_vector_load_info> & load_infos, int32_t n_layer);
 
 //
 // Split utils

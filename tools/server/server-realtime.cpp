@@ -158,7 +158,6 @@ struct realtime_conversation {
     bool        started   = false; // something went into the slot, the session config is fixed
     bool        turn_open = false; // a user turn is being filled
     bool        has_audio = false; // the open turn has audio not committed yet
-    int64_t     n_turn_samples = 0; // audio of the open turn, at the model rate
     bool        tool_results = false; // tool results went in after the last response, the next one answers them
     int         n_turns   = 0;
     std::string next_header;       // text that goes in before the next user turn
@@ -356,9 +355,9 @@ struct realtime_conversation {
     //
 
     // the transcription instruction, built the same way as /v1/audio/transcriptions
-    std::string asr_user_text(const common_chat_prompt_preset & preset) const {
-        std::string text = prompt.empty() || preset.has_context ? preset.user : prompt;
-        if (!language.empty() && !preset.has_language) {
+    std::string asr_user_text() const {
+        std::string text = prompt.empty() ? std::string(SERVER_ASR_DEFAULT_PROMPT) : prompt;
+        if (!language.empty()) {
             text += string_format(" (language: %s)", language.c_str());
         }
         return text;
@@ -371,11 +370,8 @@ struct realtime_conversation {
         }
         std::string header = n_turns == 0 ? first_header : next_header + user_header;
         if (type == "transcription") {
-            // most models take the instruction before the audio, the others get it in on_commit
-            const auto preset = common_chat_get_asr_prompt(deps.meta.chat_params.tmpls.get(), language, 0.0, prompt);
-            if (!preset.media_first) {
-                header += asr_user_text(preset);
-            }
+            // the instruction goes in before the audio
+            header += asr_user_text();
         }
         if (!control(SERVER_CONTROL_ACTION_TEXT_APPEND, header)) {
             return false;
@@ -423,10 +419,8 @@ struct realtime_conversation {
         if (!resample(samples) || samples.empty() || !ensure_turn()) {
             return;
         }
-        const int64_t n = (int64_t) samples.size();
         if (control(SERVER_CONTROL_ACTION_AUDIO_APPEND, {}, std::move(samples))) {
             has_audio = true;
-            n_turn_samples += n;
         }
     }
 
@@ -459,8 +453,7 @@ struct realtime_conversation {
         if (!control(SERVER_CONTROL_ACTION_AUDIO_END)) {
             return false;
         }
-        has_audio      = false;
-        n_turn_samples = 0;
+        has_audio = false;
 
         std::lock_guard<std::mutex> lock(mutex);
         const json prev = last_item_id.empty() ? json(nullptr) : json(last_item_id);
@@ -478,7 +471,6 @@ struct realtime_conversation {
             send_error("input_audio_buffer.commit: the model answers while it listens, there is no turn to commit");
             return;
         }
-        const int64_t n_audio = n_turn_samples;
         if (!commit() || type != "transcription") {
             return;
         }
@@ -488,19 +480,11 @@ struct realtime_conversation {
             transcribe_item_id = last_item_id;
             transcript.clear();
         }
-        // some models (VibeVoice-ASR) take an instruction after the audio, with its length
-        const auto * tmpls = deps.meta.chat_params.tmpls.get();
-        common_chat_prompt_preset preset = common_chat_get_asr_prompt(tmpls, language, 0.0, prompt);
-        if (preset.needs_audio_length) {
-            preset = common_chat_get_asr_prompt(tmpls, language, (double) n_audio / mtmd_get_audio_sample_rate(deps.mctx), prompt);
-        }
-        const std::string after_audio = preset.media_first ? asr_user_text(preset) : "";
-
         server_control_response response;
         response.n_predict = max_output_tokens;
         response.out_mode  = MTMD_HELPER_GEN_AUDIO_OUT_TEXT;
         response.sampling  = response_sampling(nullptr);
-        if (!control(SERVER_CONTROL_ACTION_RESPONSE_CREATE, after_audio + user_footer + assistant_header, {}, response)) {
+        if (!control(SERVER_CONTROL_ACTION_RESPONSE_CREATE, user_footer + assistant_header, {}, response)) {
             return;
         }
         control(SERVER_CONTROL_ACTION_CLEAR);
@@ -781,13 +765,8 @@ struct realtime_conversation {
     bool configure() {
         const std::string saved = instructions;
         if (type == "transcription") {
-            const auto preset = common_chat_get_asr_prompt(deps.meta.chat_params.tmpls.get(), language);
-            instructions = preset.system;
-        } else if (deps.cap.audio_gen) {
-            const std::string speech = common_chat_get_speech_system_prompt(deps.meta.chat_params.tmpls.get(), out_language, out_voice);
-            if (!speech.empty()) {
-                instructions = instructions.empty() ? speech : speech + "\n" + instructions;
-            }
+            // a transcription turn has no system instructions
+            instructions.clear();
         }
         const bool ok = derive_turn_text();
         instructions = saved;

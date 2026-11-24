@@ -243,9 +243,6 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
-    // the gguf metadata string arrays kept after load, see load_hparams()
-    std::unordered_map<std::string, std::vector<std::string>> gguf_kv_arr;
-
     // list of devices used in this model
     std::vector<llama_device> devices;
 
@@ -292,8 +289,6 @@ struct llama_model {
 
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
-
-    ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
 

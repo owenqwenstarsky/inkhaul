@@ -2000,10 +2000,6 @@ size_t mtmd_gen_audio_read_tensor(mtmd_context * /*ctx*/, const char * /*name*/,
     return 0;
 }
 
-int32_t mtmd_gen_audio_g2p(const mtmd_context * /*ctx*/, const char * /*word*/, char * /*buf*/, size_t /*buf_size*/) {
-    return 0;
-}
-
 const char * mtmd_gen_audio_voice_name(const mtmd_context * /*ctx*/, int32_t /*idx*/) {
     return nullptr;
 }

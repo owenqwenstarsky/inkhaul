@@ -104,7 +104,6 @@
 /tools/server/tests/                    @ggml-org/llama-server
 /ui/                                       @ggml-org/llama-ui
 /tools/tokenize/                        @ggerganov
-/tools/tts/                             @ggerganov
 /vendor/                                @ggerganov
 /AUTHORS                                @ggerganov
 /CMakeLists.txt                         @ggerganov

@@ -38,7 +38,6 @@ static std::initializer_list<enum llama_example> mmproj_examples = {
     LLAMA_EXAMPLE_MTMD,
     LLAMA_EXAMPLE_SERVER,
     LLAMA_EXAMPLE_CLI,
-    LLAMA_EXAMPLE_TTS,
 };
 
 static std::string read_file(const std::string & fname) {
@@ -890,7 +889,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::runtime_error(string_format(
             "error: the supplied chat template is not supported: %s%s\n",
             params.chat_template.c_str(),
-            params.use_jinja ? "" : "\nnote: llama.cpp was started without --jinja, we only support commonly used templates"
+            params.use_jinja ? "" : "\nnote: llama.cpp was started without --jinja, chat templates need --jinja"
         ));
     }
 
@@ -1006,7 +1005,6 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-cli",
         "llama-completion",
         "llama-convert-llama2c-to-ggml",
-        "llama-cvector-generator",
         "llama-debug",
         "llama-diffusion-cli",
         "llama-embedding",
@@ -1039,11 +1037,9 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-save-load-state",
         "llama-server",
         "llama-simple",
-        "llama-simple-chat",
         "llama-speculative",
         "llama-speculative-simple",
         "llama-tokenize",
-        "llama-tts",
         "llama-vdot"
     };
 
@@ -1218,18 +1214,6 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
     return true;
 }
 
-static std::string list_builtin_chat_templates() {
-    std::vector<const char *> supported_tmpl;
-    int32_t res = llama_chat_builtin_templates(nullptr, 0);
-    supported_tmpl.resize(res);
-    res = llama_chat_builtin_templates(supported_tmpl.data(), supported_tmpl.size());
-    std::ostringstream msg;
-    for (auto & tmpl : supported_tmpl) {
-        msg << tmpl << (&tmpl == &supported_tmpl.back() ? "" : ", ");
-    }
-    return msg.str();
-}
-
 bool common_arg_utils::is_truthy(const std::string & value) {
     return value == "on" || value == "enabled" || value == "true" || value == "1";
 }
@@ -1302,10 +1286,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         params.n_parallel = -1;     // auto by default
     } else if (ex == LLAMA_EXAMPLE_TOKENIZE) {
         params.parse_special = true; // parse special tokens by default, like the old tokenize tool
-    } else if (ex == LLAMA_EXAMPLE_TTS) {
-        params.out_file = "output.wav";
-        params.sampling.penalty_repeat = 1.05f;
-        params.sampling.penalty_last_n = -1;
     }
 
     params.use_color = tty_can_use_colors();
@@ -2856,37 +2836,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         // we define this arg on both COMMON and EXPORT_LORA, so when showing help message of export-lora, it will be categorized as "example-specific" arg
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
     add_opt(common_arg(
-        {"--control-vector"}, "FNAME",
-        "add a control vector\nnote: use comma-separated values to add multiple control vectors",
-        [](common_params & params, const std::string & value) {
-            for (const auto & item : parse_csv_row(value)) {
-                params.control_vectors.push_back({ 1.0f, item, });
-            }
-        }
-    ));
-    add_opt(common_arg(
-        {"--control-vector-scaled"}, "FNAME:SCALE,...",
-        "add a control vector with user defined scaling SCALE\n"
-        "note: use comma-separated values (format: FNAME:SCALE,...)",
-        [](common_params & params, const std::string & value) {
-            for (const auto & item : parse_csv_row(value)) {
-                auto parts = string_split<std::string>(item, ':');
-                if (parts.size() != 2) {
-                    throw std::invalid_argument("control-vector-scaled format: FNAME:SCALE");
-                }
-                params.control_vectors.push_back({ std::stof(parts[1]), parts[0] });
-            }
-        }
-    ));
-    add_opt(common_arg(
-        {"--control-vector-layer-range"}, "START", "END",
-        "layer range to apply the control vector(s) to, start and end inclusive",
-        [](common_params & params, const std::string & start, const std::string & end) {
-            params.control_vector_layer_start = std::stoi(start);
-            params.control_vector_layer_end = std::stoi(end);
-        }
-    ));
-    add_opt(common_arg(
         {"-a", "--alias"}, "STRING",
         "set model name aliases, comma-separated (to be used by API)",
         [](common_params & params, const std::string & value) {
@@ -3023,7 +2972,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.out_file = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_CVECTOR_GENERATOR, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_FINETUNE,
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_FINETUNE,
                     LLAMA_EXAMPLE_RESULTS, LLAMA_EXAMPLE_EXPORT_GRAPH_OPS, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-ofreq", "--output-frequency"}, "N",
@@ -3673,24 +3622,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PRESERVE"));
     add_opt(common_arg(
         {"--chat-template"}, "JINJA_TEMPLATE",
-        string_format(
-            "set custom jinja chat template (default: template taken from model's metadata)\n"
-            "if suffix/prefix are specified, template will be disabled\n"
-            "only commonly used templates are accepted (unless --jinja is set before this flag):\n"
-            "list of built-in templates:\n%s", list_builtin_chat_templates().c_str()
-        ),
+        "set custom jinja chat template (default: template taken from model's metadata)\n"
+        "if suffix/prefix are specified, template will be disabled\n"
+        "'chatml' selects a ChatML jinja template\n"
+        "needs --jinja (there are no built-in non-jinja templates)",
         [](common_params & params, const std::string & value) {
             params.chat_template = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
     add_opt(common_arg(
         {"--chat-template-file"}, "JINJA_TEMPLATE_FILE",
-        string_format(
-            "set custom jinja chat template file (default: template taken from model's metadata)\n"
-            "if suffix/prefix are specified, template will be disabled\n"
-            "only commonly used templates are accepted (unless --jinja is set before this flag):\n"
-            "list of built-in templates:\n%s", list_builtin_chat_templates().c_str()
-        ),
+        "set custom jinja chat template file (default: template taken from model's metadata)\n"
+        "if suffix/prefix are specified, template will be disabled\n"
+        "needs --jinja (there are no built-in non-jinja templates)",
         [](common_params & params, const std::string & value) {
             params.chat_template = read_file(value);
         }
@@ -3748,43 +3692,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.simple_io = true;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg(
-        {"--positive-file"}, "FNAME",
-        string_format("positive prompts file, one prompt per line (default: '%s')", params.cvector_positive_file.c_str()),
-        [](common_params & params, const std::string & value) {
-            params.cvector_positive_file = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
-    add_opt(common_arg(
-        {"--negative-file"}, "FNAME",
-        string_format("negative prompts file, one prompt per line (default: '%s')", params.cvector_negative_file.c_str()),
-        [](common_params & params, const std::string & value) {
-            params.cvector_negative_file = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
-    add_opt(common_arg(
-        {"--pca-batch"}, "N",
-        string_format("batch size used for PCA. Larger batch runs faster, but uses more memory (default: %d)", params.n_pca_batch),
-        [](common_params & params, int value) {
-            params.n_pca_batch = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
-    add_opt(common_arg(
-        {"--pca-iter"}, "N",
-        string_format("number of iterations used for PCA (default: %d)", params.n_pca_iterations),
-        [](common_params & params, int value) {
-            params.n_pca_iterations = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
-    add_opt(common_arg(
-        {"--method"}, "{pca, mean}",
-        "dimensionality reduction method to be used (default: pca)",
-        [](common_params & params, const std::string & value) {
-            /**/ if (value == "pca") { params.cvector_dimre_method = DIMRE_METHOD_PCA; }
-            else if (value == "mean") { params.cvector_dimre_method = DIMRE_METHOD_MEAN; }
-            else { throw std::invalid_argument("invalid value"); }
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
     add_opt(common_arg(
         {"--output-format"}, "{md,jsonl}",
         "output format for batched-bench results (default: md)",
@@ -4363,7 +4270,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.tts_lang = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--tts-voice"}, "VOICE",
         "voice for audio generation (model-dependent)\n"
@@ -4371,22 +4278,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.tts_voice = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--tts-speaker-file"}, "FNAME",
-        "speaker file path for audio generation",
-        [](common_params & params, const std::string & value) {
-            params.tts_speaker_file = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_TTS}));
-    add_opt(common_arg(
-        {"--tts-speaker-text"}, "TEXT",
-        "transcript of --tts-speaker-file, for models that need it to clone the voice\n"
-        "see docs/multimodal/tts.md for per-model usage notes",
-        [](common_params & params, const std::string & value) {
-            params.tts_speaker_text = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
 
     //
     // diffusion params

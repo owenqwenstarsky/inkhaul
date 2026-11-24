@@ -42,6 +42,9 @@ using json = common_json;
 
 using raw_buffer = std::vector<uint8_t>;
 
+// the instruction for a transcription when the request gives no prompt
+static constexpr const char * SERVER_ASR_DEFAULT_PROMPT = "Transcribe audio to text";
+
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
     // Fallback null to default value

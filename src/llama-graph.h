@@ -441,7 +441,6 @@ struct llm_graph_params {
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
-    const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_moe_cache        * moe_cache;
@@ -539,7 +538,6 @@ struct llm_graph_params {
             layer_inp_src == other.layer_inp_src &&
             model == other.model &&
             gtype == other.gtype &&
-            cvec  == other.cvec  &&
             loras == other.loras;
     }
 };
@@ -698,7 +696,6 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
-    const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_moe_cache        * moe_cache;

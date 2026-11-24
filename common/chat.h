@@ -95,8 +95,6 @@ struct common_chat_msg {
     std::string                               reasoning_content;
     std::string                               tool_name;
     std::string                               tool_call_id;
-    // non-OpenAI message keys as a JSON object string, only for templates that read them (DeepSeek V4.1)
-    std::string                               extra_json;
 
     common_json to_json_oaicompat(bool concat_typed_text = false) const;
 
@@ -244,8 +242,6 @@ enum common_chat_format {
     // These are intended to be parsed by the PEG parser
     COMMON_CHAT_FORMAT_PEG_SIMPLE,
     COMMON_CHAT_FORMAT_PEG_NATIVE,
-    COMMON_CHAT_FORMAT_PEG_GEMMA4,
-    COMMON_CHAT_FORMAT_PEG_MINIMAX_M3,
 
     COMMON_CHAT_FORMAT_COUNT,  // Not a format, just the # formats
 };
@@ -491,30 +487,3 @@ std::string common_chat_template_generation_prompt(
 std::optional<common_chat_params> common_chat_try_specialized_template(
         const common_chat_template &          tmpl,
         const autoparser::generation_params & params);
-
-
-// specialized per-task preset
-struct common_chat_prompt_preset {
-    std::string system;
-    std::string user;
-    bool has_language       = false; // the preset already names the requested language
-    bool has_context        = false; // the user text already holds the context
-    bool media_first        = false; // the media goes before the user text
-    bool needs_audio_length = false; // the user text depends on the audio length, call again with it
-};
-
-// audio_length: in seconds, 0 if unknown
-// context: extra info from the user (e.g. names, hotwords), only used by some presets, see has_context
-common_chat_prompt_preset common_chat_get_asr_prompt(const common_chat_templates * chat_templates, const std::string & language = "",
-                                                     double audio_length = 0.0, const std::string & context = "");
-
-// prompt of the model's "tts" chat template for the text to speak, empty if the model has none
-// language and voice are optional, the template defines their defaults
-// g2p (optional): the letter-to-sound model of the template's tts_g2p(), e.g. mtmd_gen_audio_g2p()
-std::string common_chat_get_tts_prompt(const common_chat_templates * chat_templates, const std::string & text,
-                                       const std::string & language = "", const std::string & voice = "",
-                                       const std::function<std::string(const std::string & word)> & g2p = nullptr);
-
-// system prompt line for the speech language and voice (e.g. LFM3-Audio), empty if not used
-std::string common_chat_get_speech_system_prompt(const common_chat_templates * chat_templates,
-                                                 const std::string & language, const std::string & voice);

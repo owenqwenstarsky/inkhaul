@@ -2,7 +2,7 @@
 
 Goal: run Inkling 2 Mini on an M5 MacBook (24 GB unified memory) by keeping the routed expert weights on disk and holding only a fixed-size expert cache in RAM (default 512 MiB, set with one flag, always on). Then strip the fork down to Inkling 2 on Apple Silicon.
 
-Status: approved. Phases 1 and 2 are committed (see 12, 13). Phase 3 is in progress and uncommitted (see 14). Phases 4-5 are open.
+Status: approved. Phases 1 and 2 are committed (see 12, 13). Phase 3 is in progress; its first part is committed (see 14). Phases 4-5 are open.
 
 Target: [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF). The model is not downloaded or run during this work.
 
@@ -317,9 +317,9 @@ Verified on Metal (code-level tests only, no real model):
 - Item 1 (parallel reads) is implemented: a persistent pool in `llama-moe-cache.cpp`, default 4 threads, `LLAMA_LONGHAUL_IO_THREADS` (1-64), one 8 MiB staging buffer per thread (32 MiB in total, as before). The uploads to the bank are serialized with a mutex. Tested for equal logits with 1, 4 and 16 threads, and the pool alone under ThreadSanitizer. **Not measured**: the default of 4 comes from the SSD's queue depth, not from a benchmark, since the model is not run here. Measure it with `llama-bench` and `LLAMA_LONGHAUL_IO_THREADS=1/2/4/8`.
 - Items 2-4 (direct reads into the Metal buffer, eviction tuning, prefill numbers) need profiles, traces or benchmarks of the real model, so they wait until you can run it.
 
-## 14. Phase 3 status (in progress, uncommitted)
+## 14. Phase 3 status (in progress)
 
-Done (steps 1-9 of section 7, and the speculative part of step 13):
+Committed in fe2a11a (steps 1-9 of section 7, and the speculative part of step 13):
 
 - Tests: `test-llama-archs` keeps Inkling2, Inkling2-loop and the LongHaul cases. `test-quant-type-selection` is build-only, because its snapshot needs `--generate`, which fetches the Mini header. `eval-callback` runs on the generated `inkling2-moe.gguf` on the GPU. The tokenizer tests are build-only. The FP8 KV test is dropped.
 - Tensor split mode: `LLAMA_SPLIT_MODE_TENSOR` stays in `llama.h` for ABI reasons but fails at load time. It is removed from `-sm`, fit and llama-bench.
@@ -340,14 +340,34 @@ Done (steps 1-9 of section 7, and the speculative part of step 13):
 - Public API kept for DSpark: `llama_set_embeddings_nextn`, `llama_get_embeddings_nextn[_ith]`, the layer input buffers and `llama_batch_ext_add_embd_row`.
 - mtmd: `inkling2v` is the only encoder left, and `mtmd-helper-gen.cpp` is a stub. Unlike step 14, the ffmpeg video helper is kept.
 
+Done, uncommitted:
+
+- Control vectors: `llama_set_adapter_cvec`, `llama_adapter_cvec`, `common_control_vector_*`, `--control-vector*` and `tools/cvector-generator` are removed.
+- Vocab: only the `gpt2` (BPE) and `test` tokenizer models load; the others throw "unknown tokenizer".
+  - Pre-tokenizers: empty and `default` map to DEFAULT, `inkling2` maps to GPT4O; anything else throws.
+  - A metaspace prepend scheme other than `never` is rejected at load time.
+  - The public `llama_vocab_type` enum is unchanged.
+- Legacy chat templates: `src/llama-chat.{h,cpp}` are gone.
+  - `llama_chat_apply_template` always returns -1, and `llama_chat_builtin_templates` returns 0.
+  - In common, `use_jinja = false` throws "try using --jinja", and `common_chat_verify_template(..., false)` returns false. Inkling's templates already returned -1 on the old path, so Inkling behaves the same.
+  - `--chat-template chatml` still selects the ChatML jinja template.
+  - `examples/simple-chat` is removed, since it only used `llama_chat_apply_template`.
+  - `test-chat-template` keeps its jinja cases and checks that the C API rejects every template.
+  - Not changed: `llama-completion` and `llama-mtmd-cli` still default to `use_jinja = false`, so Inkling needs `--jinja` there (as before).
+- Chat parsers: `common/parsers/` keeps `parsers.{h,cpp}` and `inkling.cpp`; the other 20 specialized parsers and their detection checks are gone. Every other template goes through the generic autoparser. Neither Inkling template matched an earlier check, so Inkling still gets its own parser.
+  - Also removed: the gemma4 and minimax-m3 PEG mappers and chat formats, the StepFun trim and DeepSeek V4.1 message rendering, `common_chat_msg::extra_json`, and the GPT-OSS template patch in `common_chat_templates_init`.
+  - `test-chat`: the blocks and tests for the removed parsers are gone, along with every reference to their templates. The autoparser and Inkling cases stay. `test_chat_session` and `test_chat_json_depth` now use `Qwen-QwQ-32B` (autoparser) instead of `Qwen3.5-4B`.
+- ASR/TTS helpers:
+  - `common/chat-tts-norm.{h,cpp}` are removed, along with the "tts" chat template and dictionaries, `common_chat_get_{asr,tts}_prompt` and `common_chat_get_speech_system_prompt`.
+  - The public `llama_model_meta_arr_{n,str}` API and `mtmd_gen_audio_g2p` (TTS dictionaries and g2p only) are removed.
+  - `tools/tts`, `LLAMA_EXAMPLE_TTS`, `--tts-speaker-{file,text}`, `scripts/chat_tts_norm.py` and `docs/tts-norm-patterns.md` are removed.
+  - The server's audio endpoints stay (generic, and already gated off because mtmd has no audio here). Transcription uses the generic "Transcribe audio to text" prompt, and `/tts` sends the input as is.
+
 Open: the rest of steps 9-16:
 
-- Control-vector API.
-- Vocab.
-- Legacy chat templates.
-- Other parsers and the ASR/TTS helpers.
-- mtmd: the optional tensors of other models in `mtmd-model.cpp` (deepstack, lfm3vl, MoE, sinks).
-- Python and gguf-py.
-- Templates and docs, including `docs/speculative.md`, `examples/speculative-simple/README.md` and `tools/server/tests/README.md`.
+- mtmd: the optional tensors of other models in `mtmd-model.cpp` (deepstack, lfm3vl, MoE, sinks), and the phonemizer fields (`mtmd-model.h`).
+- Python and gguf-py (including `conversion/tiny_voca.py`).
+- Templates and docs, including `docs/speculative.md`, `examples/speculative-simple/README.md`, `tools/server/tests/README.md`, `docs/multimodal/tts.md`, `tools/mtmd/README-dev.md` and the `*-tts.jinja` templates.
+- `tools/server/tests/unit/`: `test_template.py`, `test_compat_anthropic.py` and `test_tool_call.py` use templates of removed parsers (K2-Horizon, LFM3, gpt-oss). They are not run here.
 - `tools/server/tests/unit/test_spec_methods.py`. Its targets are other archs, so it goes.
 - The never-assigned hparams that remain in shared code.

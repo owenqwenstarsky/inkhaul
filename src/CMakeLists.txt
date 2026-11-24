@@ -13,7 +13,6 @@ set(LLAMA_CORE_SOURCES
     llama-adapter.cpp
     llama-arch.cpp
     llama-batch.cpp
-    llama-chat.cpp
     llama-context.cpp
     llama-cparams.cpp
     llama-grammar.cpp

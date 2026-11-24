@@ -39,48 +39,6 @@ std::string common_chat_template_generation_prompt_impl(
     const std::optional<json> & tools_override = std::nullopt,
     const std::optional<json> & additional_context = std::nullopt);
 
-bool is_lfm2_template(const std::string & src);
-
 bool is_inkling_template(const std::string & src);
 
-common_chat_params common_chat_params_init_cohere2moe(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_gemma4(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_gigachat_v3(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_harmony_xml(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
 common_chat_params common_chat_params_init_inkling(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_k2_horizon(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_kimi_k2(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_ling3(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-// tool_list_tokens preserves the LFM2 system tool-list markers; LFM2.5 renders without them
-common_chat_params common_chat_params_init_lfm2(const common_chat_template & tmpl, const autoparser::generation_params & inputs, bool tool_list_tokens);
-
-common_chat_params common_chat_params_init_llm_jp_harmony(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_minicpm5(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_minimax_m3(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_ministral_3(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_muse_glimmer(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-common_chat_params common_chat_params_init_muse_spark(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_qwen3_coder(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
-
-common_chat_params common_chat_params_init_translate_gemma(const common_chat_template & tmpl, const autoparser::generation_params & inputs);

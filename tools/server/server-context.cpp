@@ -6091,7 +6091,6 @@ void server_routes::init_routes() {
         std::vector<raw_buffer> files;
         json body = convert_transcriptions_to_chatcmpl(
             json::parse(req.body),
-            meta->chat_params.tmpls.get(),
             req.files,
             files);
         SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
@@ -7039,18 +7038,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const serve
     server_task task(SERVER_TASK_TYPE_TTS);
     server_schema::eval_tts_schema(params, task, body);
     const bool stream = task.params.stream;
-    // a model with a "tts" chat template (e.g. LFM3-Audio) speaks the prompt rendered from it
     const std::string lang       = json_value(body, "lang", params.tts_lang);
     // speaker_ref in the request overrides the default voice
     const bool has_speaker_ref   = req.files.count("speaker_ref") > 0 || !json_value(body, "speaker_ref_b64", std::string()).empty();
     const std::string voice      = json_value(body, "voice", has_speaker_ref ? std::string() : params.tts_voice);
-    // raw_prompt: the input goes to the model as is (e.g. phonemes), the "tts" chat template is skipped
-    const bool raw_prompt        = json_value(body, "raw_prompt", false);
-    const auto g2p = [this](const std::string & word) {
-        char buf[512];
-        return mtmd_gen_audio_g2p(ctx_server.mctx, word.c_str(), buf, sizeof(buf)) > 0 ? std::string(buf) : std::string();
-    };
-    const std::string tts_prompt = raw_prompt ? std::string() : common_chat_get_tts_prompt(meta->chat_params.tmpls.get(), prompt, lang, voice, g2p);
     // a model with predefined voices only speaks with one of them
     mtmd::bitmap_ptr voice_ref;
     if (!voice.empty() && info.n_voices > 0) {
@@ -7060,7 +7051,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const serve
             return res;
         }
     }
-    task.tts_inp.set_prompt(tts_prompt.empty() ? prompt : tts_prompt);
+    // the input goes to the model as is, there are no "tts" chat templates
+    task.tts_inp.set_prompt(prompt);
     task.tts_inp.set_lang(lang);
     task.tts_inp.set_speaker_ref_text(json_value(body, "speaker_ref_text", std::string()));
     task.tts_inp.data.stream    = stream;

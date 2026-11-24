@@ -405,20 +405,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
         gguf_type type = gguf_get_kv_type(ctx, i);
         if (type == GGUF_TYPE_ARRAY) {
-            // only the string arrays listed here are kept, see llama_model_meta_arr_str()
-            static const char * const kept_prefixes[] = { "tokenizer.tts_dict" };
-            const std::string arr_name = gguf_get_key(ctx, i);
-            const bool is_kept = std::any_of(std::begin(kept_prefixes), std::end(kept_prefixes), [&](const char * prefix) {
-                return arr_name.rfind(prefix, 0) == 0;
-            });
-            if (is_kept && gguf_get_arr_type(ctx, i) == GGUF_TYPE_STRING) {
-                auto & arr = gguf_kv_arr[arr_name];
-                const size_t n = gguf_get_arr_n(ctx, i);
-                arr.reserve(n);
-                for (size_t j = 0; j < n; j++) {
-                    arr.emplace_back(gguf_get_arr_str(ctx, i, j));
-                }
-            }
             continue;
         }
         const char * name = gguf_get_key(ctx, i);
@@ -1381,29 +1367,6 @@ static bool buft_supported(ggml_backend_buffer_type_t buft, ggml_backend_dev_t d
     return op_supported;
 }
 
-template<typename F>
-static ggml_backend_buffer_type_t select_buft(const buft_list_t & buft_list, const F & fn) {
-    for (const auto & cur : buft_list) {
-        ggml_backend_dev_t cur_dev = cur.first;
-        ggml_backend_buffer_type_t cur_buft = cur.second;
-        if (buft_supported(cur_buft, cur_dev, fn)) {
-            return cur_buft;
-        }
-    }
-
-    throw std::runtime_error(format("no suitable buffer type found"));
-}
-
-ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
-    return ::select_buft(
-            *pimpl->dev_layer.at(il).buft_list,
-            [&](ggml_context * ctx) {
-                ggml_tensor * cur = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
-                ggml_tensor * layer_dir = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
-                return ggml_add(ctx, cur, layer_dir);
-            });
-}
-
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
@@ -1729,22 +1692,6 @@ int32_t llama_model_meta_val_str_by_index(const llama_model * model, int32_t i, 
     auto it = model->gguf_kv.begin();
     std::advance(it, i);
     return snprintf(buf, buf_size, "%s", it->second.c_str());
-}
-
-int32_t llama_model_meta_arr_n(const llama_model * model, const char * key) {
-    const auto it = model->gguf_kv_arr.find(key);
-    if (it == model->gguf_kv_arr.end() || it->second.size() > (size_t) INT32_MAX) {
-        return -1;
-    }
-    return (int32_t) it->second.size();
-}
-
-const char * llama_model_meta_arr_str(const llama_model * model, const char * key, int32_t i) {
-    const auto it = model->gguf_kv_arr.find(key);
-    if (it == model->gguf_kv_arr.end() || i < 0 || (size_t) i >= it->second.size()) {
-        return nullptr;
-    }
-    return it->second[i].c_str();
 }
 
 int32_t llama_model_desc(const llama_model * model, char * buf, size_t buf_size) {

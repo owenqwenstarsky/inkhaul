@@ -133,13 +133,6 @@ struct llama_context {
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
-    bool set_adapter_cvec(
-            const float * data,
-                 size_t   len,
-                int32_t   n_embd,
-                int32_t   il_start,
-                int32_t   il_end);
-
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
@@ -310,7 +303,7 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
-    // TODO: read/write lora adapters and cvec
+    // TODO: read/write lora adapters
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
 
@@ -325,7 +318,6 @@ private:
 
     llama_cparams cparams;
 
-    llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 
 
