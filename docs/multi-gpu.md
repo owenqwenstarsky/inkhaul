@@ -46,8 +46,6 @@ Set with `--split-mode` / `-sm`.
 | `-ctv` | `--cache-type-v` | same as `-ctk` | `f16` | KV cache type for V. |
 | `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. |
 
-As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be used to control which GPUs to use for the CUDA backend: if you set it, llama.cpp only sees the specified GPUs. Use `--device` for selecting GPUs from among those visible to llama.cpp, this works for any backend.
-
 ---
 
 ## Recipes
@@ -73,20 +71,10 @@ Useful when GPUs have different memory: GPU 0 (3 parts) and GPU 1 (1 part). Prop
 
 ```bash
 llama-cli --list-devices
-llama-cli -m model.gguf -dev CUDA1
+llama-cli -m model.gguf -dev MTL0
 ```
 
-Use only the device listed as `CUDA1` when calling with `--list-devices`.
-
-### 4. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
-
-CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
-
-```bash
-GGML_CUDA_P2P=1 llama-cli -m model.gguf
-```
-
-P2P requires driver support (usually restricted to workstation/datacenter GPUs) and **may cause crashes or corrupted outputs on some motherboards or BIOS configurations** (e.g. when IOMMU is enabled). If you see instability after enabling it, unset the variable.
+Use only the device listed as `MTL0` when calling with `--list-devices`.
 
 ---
 
@@ -95,5 +83,4 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 | Symptom | How to fix |
 |---|---|
 | Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. Try `--split-mode layer` (less communication than `row`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
-| GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
-| Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |
+| GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or your build doesn't include support for the relevant backend. |

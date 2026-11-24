@@ -2,7 +2,7 @@
 
 Goal: run Inkling 2 Mini on an M5 MacBook (24 GB unified memory) by keeping the routed expert weights on disk and holding only a fixed-size expert cache in RAM (default 512 MiB, set with one flag, always on). Then strip the fork down to Inkling 2 on Apple Silicon.
 
-Status: approved. Phases 1, 2 and 3 are committed (see 12, 13, 14). Phases 4-5 are open.
+Status: approved. Phases 1-4 are committed (see 12-15). Phase 5 is open.
 
 Target: [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF). The model is not downloaded or run during this work.
 
@@ -392,3 +392,34 @@ Phase 3 follow-ups (not blocking):
   - The generic `defer_loading`/`tool_reference` path has no test template.
 - The server python suite still uses LLaMA presets this fork cannot load (not run here).
 - `mtmd-cli` prints llava/MobileVLM hints, `arg.cpp` has the `--vision-gemma-*` presets, and the `/tts` README section lists model-specific params.
+
+---
+
+## 15. Phase 4 status (done)
+
+Done by three parallel worktree agents (backends, ggml-cpu, build/CI), each reviewed, then merged and checked together:
+
+- Backends:
+  - Removed cuda, hip, musa, vulkan, sycl, opencl, cann, webgpu, zdnn, zendnn, hexagon, openvino, et, virtgpu and rpc, with their headers, CMake options, registry entries, `FindNCCL` and the CUDA/HIP/SYCL sections of `ggml-common.h`. Kept: CPU, Metal and BLAS (Accelerate).
+  - `GGML_CPU_ALL_VARIANTS` builds only `apple_m1`, `apple_m2_m3` and `apple_m4`. The x86, LoongArch, RISC-V and s390x ISA options are gone.
+  - RPC: `--rpc` is gone from common and llama-bench, along with `tools/rpc` and its tests. `llama_supports_rpc()` stays in `llama.h` for ABI reasons and returns false.
+  - Generic multi-device code (`--device`, `--split-mode`, `GGML_BACKEND_DL`) stays.
+  - `test-backend-ops`, `test-backend-sampler` and `test-llama-archs` lose their removed-backend branches. Tolerances on Metal, CPU and BLAS are unchanged.
+  - Docs: `docs/build.md` covers only the macOS arm64 build, `docs/backend/` is deleted, and `docs/ops.md` has BLAS, CPU and Metal columns.
+- ggml-cpu: only `arch/arm` is left. `amx/`, `spacemit/` and the x86/spacemit CMake helpers are deleted. kleidiai, llamafile, tiled and the shared headers are unchanged. A full `test-backend-ops -b CPU` run passed 25162/25162.
+- Tools, examples, build and CI:
+  - Removed `tools/connect` and the 11 examples listed in section 8, plus `pocs/`.
+  - `CMakePresets.json` keeps the arm64-apple presets only, `build-xcframework.sh` builds a single macOS arm64 slice, and `flake.nix` is aarch64-darwin only.
+  - Removed the `.devops` Dockerfiles and specs, `docs/docker.md`, the non-Apple toolchains, and the Android, s390x and RISC-V docs.
+  - `.github/workflows` keeps build-apple, code-style, editorconfig, the python checks and the 8 UI workflows. build-apple loses its leak check, which needed a Gemma model. The release scripts, the labeler config and the composite actions that only deleted workflows used are removed.
+  - `ci/run.sh`: Metal and CPU only. The upstream model runs (Qwen3, BGE, reranker) are removed because this fork cannot load those archs.
+  - README: a fork notice and a quick start for Inkling 2 Mini (done here instead of in Phase 5).
+- Checks: fresh configure and build with no compiler warnings. `ctest -L behavior -LE 'model|python'` passed 40/40 and `ctest -L main` passed 22/22. `test-llama-archs`, `test-batch-alloc`, `test-model-resolution`, `test-arg-parser` and `test-backend-ops -o MUL_MAT` (Metal and BLAS) passed. `llama-gen-docs` output is in sync.
+
+Phase 4 follow-ups (not blocking):
+
+- Not run: the KleidiAI build (FetchContent needs the network), nix evaluation, the kept GitHub workflows (only the files they reference were checked; no YAML parser is installed) and a full Metal `test-backend-ops` run.
+- `tools/quantize/tests.sh` and `tools/gguf-split/tests.sh` still download Qwen3. They are no longer called from CI.
+- The diffusion params in common (`LLAMA_EXAMPLE_DIFFUSION`, `--diffusion-*`) and `llama_model_is_diffusion` are dead now that `examples/diffusion` is gone.
+- `ui-publish.yml` has no caller left (`release-publish.yml` is deleted). It is kept with the UI workflows.
+- `tools/fit-params/README.md` shows sample output from a CUDA machine.

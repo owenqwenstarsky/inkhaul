@@ -1004,9 +1004,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-bench",
         "llama-cli",
         "llama-completion",
-        "llama-convert-llama2c-to-ggml",
         "llama-debug",
-        "llama-diffusion-cli",
         "llama-embedding",
         "llama-eval-callback",
         "llama-export-lora",
@@ -1030,7 +1028,6 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-parallel",
         "llama-passkey",
         "llama-perplexity",
-        "llama-q8dot",
         "llama-quantize",
         "llama-qwen2vl-cli",
         "llama-retrieval",
@@ -1039,8 +1036,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-simple",
         "llama-speculative",
         "llama-speculative-simple",
-        "llama-tokenize",
-        "llama-vdot"
+        "llama-tokenize"
     };
 
     for (const auto& exe : executables) {
@@ -1092,27 +1088,6 @@ void common_print_available_devices() {
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
         printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / MiB, free / MiB);
-    }
-}
-
-static void add_rpc_devices(const std::string & servers) {
-    auto rpc_servers = string_split<std::string>(servers, ',');
-    if (rpc_servers.empty()) {
-        throw std::invalid_argument("no RPC servers specified");
-    }
-    ggml_backend_load_all();
-    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
-    if (!rpc_reg) {
-        throw std::invalid_argument("failed to find RPC backend");
-    }
-    typedef ggml_backend_reg_t (*ggml_backend_rpc_add_server_t)(const char * endpoint);
-    ggml_backend_rpc_add_server_t ggml_backend_rpc_add_server_fn = (ggml_backend_rpc_add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
-    if (!ggml_backend_rpc_add_server_fn) {
-        throw std::invalid_argument("failed to find RPC add server function");
-    }
-    for (const auto & server : rpc_servers) {
-        auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
-        ggml_backend_register(reg);
     }
 }
 
@@ -2477,7 +2452,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
-        // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",
@@ -2547,17 +2521,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.video_ffmpeg_bin_dir = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FFMPEG_DIR"));
-    add_opt(common_arg(
-        {"--rpc"}, "SERVERS",
-        "comma-separated list of RPC servers (host:port)",
-        [](common_params & params, const std::string & value) {
-            if (!llama_supports_rpc()) {
-                throw std::invalid_argument("RPC not supported in this build");
-            }
-            add_rpc_devices(value);
-            GGML_UNUSED(params);
-        }
-    ).set_env("LLAMA_ARG_RPC"));
     add_opt(common_arg(
         {"-lm", "--load-mode"}, "MODE",
         "model loading mode (default: auto)\n"

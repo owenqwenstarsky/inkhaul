@@ -13,51 +13,19 @@
 # Cf. https://jade.fyi/blog/flakes-arent-real/ for a more detailed exposition
 # of the relation between Nix and the Nix Flakes.
 {
-  description = "Port of Facebook's LLaMA model in C/C++";
+  description = "llama.cpp fork for Inkling 2 Mini on Apple Silicon (Metal, CPU, BLAS)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
 
-  # There's an optional binary cache available. The details are below, but they're commented out.
-  #
-  # Why? The terrible experience of being prompted to accept them on every single Nix command run.
-  # Plus, there are warnings shown about not being a trusted user on a default Nix install
-  # if you *do* say yes to the prompts.
-  #
-  # This experience makes having `nixConfig` in a flake a persistent UX problem.
-  #
-  # To make use of the binary cache, please add the relevant settings to your `nix.conf`.
-  # It's located at `/etc/nix/nix.conf` on non-NixOS systems. On NixOS, adjust the `nix.settings`
-  # option in your NixOS configuration to add `extra-substituters` and `extra-trusted-public-keys`,
-  # as shown below.
-  #
-  # ```
-  # nixConfig = {
-  #   extra-substituters = [
-  #     # A development cache for nixpkgs imported with `config.cudaSupport = true`.
-  #     # Populated by https://hercules-ci.com/github/SomeoneSerge/nixpkgs-cuda-ci.
-  #     # This lets one skip building e.g. the CUDA-enabled openmpi.
-  #     # TODO: Replace once nix-community obtains an official one.
-  #     "https://cuda-maintainers.cachix.org"
-  #   ];
-  #
-  #   # Verify these are the same keys as published on
-  #   # - https://app.cachix.org/cache/cuda-maintainers
-  #   extra-trusted-public-keys = [
-  #     "cuda-maintainers.cachix.org-1:0dq3bujKpuEPMCX6U4WylrUDZ9JyUG0VpVZa7CNfq5E="
-  #   ];
-  # };
-  # ```
-
-  # For inspection, use `nix flake show github:ggml-org/llama.cpp` or the nix repl:
+  # For inspection, use `nix flake show` or the nix repl:
   #
   # ```bash
-  # ❯ nix repl
-  # nix-repl> :lf github:ggml-org/llama.cpp
-  # Added 13 variables.
-  # nix-repl> outputs.apps.x86_64-linux.quantize
+  # $ nix repl
+  # nix-repl> :lf .
+  # nix-repl> outputs.apps.aarch64-darwin.llama-quantize
   # { program = "/nix/store/00000000000000000000000000000000-llama.cpp/bin/llama-quantize"; type = "app"; }
   # ```
   outputs =
@@ -76,10 +44,8 @@
       {
 
         imports = [
-          .devops/nix/nixpkgs-instances.nix
           .devops/nix/apps.nix
           .devops/nix/devshells.nix
-          .devops/nix/jetson-support.nix
         ];
 
         # An overlay can be used to have a more granular control over llama-cpp's
@@ -91,13 +57,9 @@
         # { nixpkgs, llama-cpp, ... }:
         # let pkgs = import nixpkgs {
         #     overlays = [ (llama-cpp.overlays.default) ];
-        #     system = "aarch64-linux";
-        #     config.allowUnfree = true;
-        #     config.cudaSupport = true;
-        #     config.cudaCapabilities = [ "7.2" ];
-        #     config.cudaEnableForwardCompat = false;
+        #     system = "aarch64-darwin";
         # }; in {
-        #     packages.aarch64-linux.llamaJetsonXavier = pkgs.llamaPackages.llama-cpp;
+        #     packages.aarch64-darwin.llama = pkgs.llamaPackages.llama-cpp;
         # }
         # ```
         #
@@ -109,21 +71,15 @@
           }
         );
 
+        # this fork targets Apple Silicon Macs only
         systems = [
           "aarch64-darwin"
-          "aarch64-linux"
-          "x86_64-darwin" # x86_64-darwin isn't tested (and likely isn't relevant)
-          "x86_64-linux"
         ];
 
         perSystem =
           {
             config,
-            lib,
-            system,
             pkgs,
-            pkgsCuda,
-            pkgsRocm,
             ...
           }:
           {
@@ -140,45 +96,19 @@
             # the same path you would with an overlay.
             legacyPackages = {
               llamaPackages = pkgs.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
-              llamaPackagesWindows = pkgs.pkgsCross.mingwW64.callPackage .devops/nix/scope.nix {
-                inherit llamaVersion;
-              };
-              llamaPackagesCuda = pkgsCuda.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
-              llamaPackagesRocm = pkgsRocm.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
             };
 
             # We don't use the overlay here so as to avoid making too many instances of nixpkgs,
             # cf. https://zimbatm.com/notes/1000-instances-of-nixpkgs
-            packages =
-              {
-                default = config.legacyPackages.llamaPackages.llama-cpp;
-                vulkan = config.packages.default.override { useVulkan = true; };
-                windows = config.legacyPackages.llamaPackagesWindows.llama-cpp;
-                python-scripts = config.legacyPackages.llamaPackages.python-scripts;
-              }
-              // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-                cuda = config.legacyPackages.llamaPackagesCuda.llama-cpp;
-
-                mpi-cpu = config.packages.default.override { useMpi = true; };
-                mpi-cuda = config.packages.default.override { useMpi = true; };
-              }
-              // lib.optionalAttrs (system == "x86_64-linux") {
-                rocm = config.legacyPackages.llamaPackagesRocm.llama-cpp;
-
-                sycl = config.packages.default.override {
-                  useSycl = true;
-                  syclToolkit = pkgs.intel-oneapi-toolkit;
-                };
-              };
+            packages = {
+              default = config.legacyPackages.llamaPackages.llama-cpp;
+              python-scripts = config.legacyPackages.llamaPackages.python-scripts;
+            };
 
             # Packages exposed in `.#checks` will be built by the CI and by
             # `nix flake check`.
-            #
-            # We could test all outputs e.g. as `checks = confg.packages`.
-            #
-            # TODO: Build more once https://github.com/ggml-org/llama.cpp/issues/6346 has been addressed
             checks = {
-              inherit (config.packages) default vulkan;
+              inherit (config.packages) default;
             };
           };
       };

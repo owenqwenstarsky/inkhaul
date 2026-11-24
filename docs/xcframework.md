@@ -1,8 +1,17 @@
 # XCFramework
 
-The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
-and macOS. It can be used in Swift projects without the need to compile the
-library from source. For example:
+This fork builds the XCFramework for macOS on Apple Silicon (arm64) only. The
+iOS, visionOS and tvOS slices are not built.
+
+To build it from source, run the script from the repository root:
+
+```bash
+./build-xcframework.sh
+```
+
+The result is `build-apple/llama.xcframework`. It contains `libllama`, `ggml`
+(CPU, Metal and BLAS backends) and `libmtmd`, with the public headers. It can be
+used in a Swift package as a local binary target. For example:
 
 ```swift
 // swift-tools-version: 5.10
@@ -12,6 +21,9 @@ import PackageDescription
 
 let package = Package(
     name: "MyLlamaPackage",
+    platforms: [
+        .macOS(.v13)
+    ],
     targets: [
         .executableTarget(
             name: "MyLlamaPackage",
@@ -20,12 +32,8 @@ let package = Package(
             ]),
         .binaryTarget(
             name: "LlamaFramework",
-            url: "https://github.com/ggml-org/llama.cpp/releases/download/b5046/llama-b5046-xcframework.zip",
-            checksum: "c19be78b5f00d8d29a25da41042cb7afa094cbf6280a225abe614b03b20029ab"
+            path: "path/to/llama.xcframework"
         )
     ]
 )
 ```
-
-The above example is using an intermediate build `b5046` of the library. This can be modified
-to use a different version by changing the URL and checksum.

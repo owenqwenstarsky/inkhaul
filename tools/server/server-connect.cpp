@@ -180,8 +180,7 @@ std::string server_connect::unavailable_reason(const common_params & params) {
 
     if (find_binary().empty()) {
         return "could not find '" + CONNECT_EXE_NAME + "' next to llama-server or in PATH.\n"
-               "    it is a separate binary: download it from https://github.com/ggml-org/llama-connect/releases\n"
-               "    or build llama.cpp with -DLLAMA_CONNECT=ON to have it fetched automatically";
+               "    it is a separate binary: download it from https://github.com/ggml-org/llama-connect/releases";
     }
 
     return "";

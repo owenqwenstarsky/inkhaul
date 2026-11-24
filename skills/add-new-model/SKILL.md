@@ -81,11 +81,9 @@ These recur often enough in review comments on past add-model PRs that they're w
 
 ## Validation checklist
 
-Reference: `examples/model-conversion/README.md`.
-
 1. Convert to GGUF, then inspect/run both the original and converted tensors.
 2. If the model adds a new pre-tokenizer, compare the token ids of `llama-tokenize -f <file> --ids --no-escape` with the HF tokenizer on whole files of prose, code and multilingual text (e.g. wikitext-2 and a few source files).
-3. Run logits verification (original vs converted). If this model is a new version of an already-supported family, verify the *previous* version still passes logits verification first - numerical differences may be pre-existing, not caused by the new work. The tools to perform full logits validation are available in `examples/model-conversion`.
+3. Run logits verification (original vs converted). If this model is a new version of an already-supported family, verify the *previous* version still passes logits verification first - numerical differences may be pre-existing, not caused by the new work.
 4. Quantize (including QAT variants if relevant) and re-verify.
 5. Run perplexity evaluation (simple and full).
 6. Sanity-check across `tools/cli`, `tools/completion`, `tools/imatrix`, `tools/quantize`, and `tools/server`.

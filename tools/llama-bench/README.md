@@ -36,7 +36,6 @@ options:
   --no-warmup                               skip warmup runs before benchmarking
   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
   -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 0)
-  -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
 
 test parameters:
   -m, --model <filename>                    (default: models/7B/ggml-model-q4_0.gguf)

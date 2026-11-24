@@ -683,15 +683,6 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_CLIP || arch == LLM_ARCH_UNKNOWN) {
         return false; // These models don't have usable implementations.
     }
-    // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
-#ifdef GGML_USE_WEBGPU
-#endif // GGML_USE_WEBGPU
-
-    // FIXME: jamba produces incorrect output (~0.55 NMSE vs CPU) on the HIP
-    // backend on RDNA3.5 (gfx1151); the SSM kernels need investigation.
-#ifdef GGML_USE_HIP
-#endif // GGML_USE_HIP
-
     return true;
 }
 

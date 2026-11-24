@@ -12,7 +12,7 @@ description: Build a small test "slice" of a HF model (fewer layers/experts) by 
 1. Ask the user for the repo, what the slice must exercise (e.g. a MoE layer, each layer type of a hybrid model, MTP, the vision encoder), the size budget and the output dir.
 2. Inspect the model: run the script with `--inspect`, read `config.json`, and read the HF modeling code if anything is unclear. Check the plan against the pitfalls below.
 3. Build the slice, then read the config patches in the log and check each one.
-4. Verify: load the slice in transformers (no missing/unexpected weight warnings, no NaN logits), then convert it with `convert_hf_to_gguf.py` and run it. For numerical checks, see `examples/model-conversion/`.
+4. Verify: load the slice in transformers (no missing/unexpected weight warnings, no NaN logits), then convert it with `convert_hf_to_gguf.py` and run it.
 
 ## Pitfalls
 
