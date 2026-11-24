@@ -368,8 +368,7 @@ struct local_model {
     std::string path_draft;
 };
 
-// TODO @ngxson: handle "eagle3-" when it's supported by common_speculative_types_from_gguf()
-static const char * draft_prefixes[] = { "mtp-", "dspark-", "dflash-" };
+static const char * draft_prefixes[] = { "dspark-", "dflash-" };
 
 static bool is_mmproj_file(const std::string & fname) {
     return fname.find("mmproj") != std::string::npos;

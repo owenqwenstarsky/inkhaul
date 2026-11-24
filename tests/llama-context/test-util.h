@@ -130,12 +130,6 @@ llama_context_ptr make_ctx(llama_model * model, const common_params & params, co
 
 llama_sampler_ptr make_dist_sampler(uint32_t seed);
 
-// these archs reserve the final pp graph with n_seqs = 1, so any multi-seq graph has a
-// different layout and re-reserves by design - they must not be run with a multi-seq batch
-// when GGML_SCHED_DEBUG_REALLOC is enabled
-// see [TAG_RESERVE_DIAG_DECAY] in llama-context.cpp
-bool arch_reserves_single_seq(const llama_model * model);
-
 //
 // the state of a single model run, handed to every case
 //

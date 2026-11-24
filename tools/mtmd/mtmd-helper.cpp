@@ -574,15 +574,9 @@ static char * mtmd_strdup(const std::string & s) {
 
 mtmd_helper_video_seq::~mtmd_helper_video_seq() {
     mtmd_bitmap_free(pending_frame);
-    mtmd_bitmap_free(pending_audio);
-}
-
-int32_t mtmd_helper_video_seq::ts_per_n_frames() const {
-    return tmpl == MTMD_VIDEO_TEMPLATE_LFM3 || tmpl == MTMD_VIDEO_TEMPLATE_LFM3_OMNI || tmpl == MTMD_VIDEO_TEMPLATE_QWEN3VL ? 2 : 0;
 }
 
 void mtmd_helper_video_seq::configure(const mtmd_video_config & cfg, const mtmd_helper_video_stream_info & src, float fps_target_arg) {
-    tmpl = cfg.tmpl;
     uint32_t width  = src.width;
     uint32_t height = src.height;
     float duration  = src.duration;
@@ -605,8 +599,7 @@ void mtmd_helper_video_seq::configure(const mtmd_video_config & cfg, const mtmd_
         for (int32_t i = 0; i < n; i++) {
             frame_indices[i] = (int32_t) std::nearbyint(i * step);
         }
-        src_fps      = src.fps;
-        n_src_frames = src.n_frames;
+        src_fps = src.fps;
 
         if (cfg.frame_width > 0 && cfg.frame_height > 0 &&
                 (cfg.frame_width != (int32_t) width || cfg.frame_height != (int32_t) height)) {
@@ -646,40 +639,7 @@ void mtmd_helper_video_seq::sample_by_index(const mtmd_helper_video_stream_info 
     for (int32_t i = 0; i < info.n_frames; i++) {
         frame_indices[i] = std::min(n_src - 1, (int32_t) ((double) i * src.fps / fps_target));
     }
-    src_fps      = src.fps;
-    n_src_frames = n_src;
-}
-
-void mtmd_helper_video_seq::set_soundtrack(const float * pcm, size_t n, int rate) {
-    if (!pcm || n == 0) {
-        LOG_WRN("%s: the video has no soundtrack\n", __func__);
-        return;
-    }
-    // keep only the span of the video stream: n_frames / fps seconds from its first frame
-    const size_t len = (size_t) std::nearbyint((double) n_src_frames / src_fps * rate);
-    audio_rate = rate;
-    soundtrack.assign(pcm, pcm + std::min(n, len));
-}
-
-// the soundtrack of the group of frames that ends with frame idx, nullptr if the soundtrack has ended
-mtmd_bitmap * mtmd_helper_video_seq::soundtrack_slice(int32_t idx) const {
-    const int32_t ts_per_n_frames = this->ts_per_n_frames();
-    const int32_t group    = idx / ts_per_n_frames;
-    const int32_t n_groups = ((int32_t) frame_indices.size() + ts_per_n_frames - 1) / ts_per_n_frames;
-    auto group_start = [&](int32_t g) {
-        const double t = frame_indices[g * ts_per_n_frames] / src_fps;
-        return std::min(soundtrack.size(), (size_t) std::nearbyint(t * audio_rate));
-    };
-    const size_t begin = group == 0 ? 0 : group_start(group);
-    const size_t end   = group == n_groups - 1 ? soundtrack.size() : group_start(group + 1);
-    if (begin >= end) {
-        return nullptr;
-    }
-    mtmd_bitmap * slice = mtmd_bitmap_init_from_audio(end - begin, soundtrack.data() + begin);
-    if (!id.empty()) {
-        mtmd_bitmap_set_id(slice, (id + "+audio" + std::to_string(group)).c_str());
-    }
-    return slice;
+    src_fps = src.fps;
 }
 
 mtmd_bitmap * mtmd_helper_video_seq::read_next_frame() {
@@ -733,12 +693,6 @@ int32_t mtmd_helper_video_seq::read_next(mtmd_bitmap ** out_bitmap, char ** out_
         return 0;
     }
 
-    if (pending_audio) {
-        *out_bitmap   = pending_audio;
-        pending_audio = nullptr;
-        return 0;
-    }
-
     LOG_DBG("%s: proc_alive=%d start_emitted=%d current_frame=%d\n",
             __func__, (int)src_alive, (int)start_emitted, current_frame);
 
@@ -748,8 +702,7 @@ int32_t mtmd_helper_video_seq::read_next(mtmd_bitmap ** out_bitmap, char ** out_
 
     if (!start_emitted) {
         start_emitted = true;
-        // model templates have no prompt prefix, the video begin/end tokens are added by mtmd_tokenize
-        if (tmpl == MTMD_VIDEO_TEMPLATE_DEFAULT && !prompt_start.empty()) {
+        if (!prompt_start.empty()) {
             *out_text = mtmd_strdup(prompt_start);
             return *out_text ? 0 : -2;
         }
@@ -758,34 +711,6 @@ int32_t mtmd_helper_video_seq::read_next(mtmd_bitmap ** out_bitmap, char ** out_
     mtmd_bitmap * frame = read_next_frame();
     if (!frame) {
         return -1;
-    }
-
-    const int32_t ts_per_n_frames = this->ts_per_n_frames();
-    if (ts_per_n_frames > 0) {
-        // emit the group timestamp before the group's first frame; the value is the
-        // midpoint time of the group, matching HF processors that stamp each temporal group
-        const int32_t idx = current_frame - 1; // read_next_frame() already incremented
-        // the soundtrack of a group follows its last frame
-        const bool group_ends = idx % ts_per_n_frames == ts_per_n_frames - 1 || idx + 1 == (int32_t) frame_indices.size();
-        if (!soundtrack.empty() && !frame_indices.empty() && group_ends) {
-            pending_audio = soundtrack_slice(idx);
-        }
-        if (idx % ts_per_n_frames == 0) {
-            char ts_buf[64];
-            double ts_s = ((double)idx + 0.5*(double)(ts_per_n_frames - 1)) / info.fps;
-            if (!frame_indices.empty()) {
-                // stamp from the source frames; a short last group repeats its last frame
-                const size_t first = idx;
-                const size_t last  = std::min(first + ts_per_n_frames - 1, frame_indices.size() - 1);
-                ts_s = (frame_indices[first] / src_fps + frame_indices[last] / src_fps) / 2.0;
-            }
-            snprintf(ts_buf, sizeof(ts_buf), "<%.1f seconds>", ts_s);
-            pending_frame = frame;
-            *out_text = mtmd_strdup(ts_buf);
-            return *out_text ? 0 : -2;
-        }
-        *out_bitmap = frame;
-        return 0;
     }
 
     *out_bitmap = frame;
@@ -837,15 +762,6 @@ struct mtmd_helper_video : mtmd_helper_video_seq {
         return true;
     }
 
-    void load_soundtrack(const mtmd_context * mctx) {
-        const int rate = mtmd_get_audio_sample_rate(mctx);
-        if (tmpl != MTMD_VIDEO_TEMPLATE_LFM3_OMNI || frame_indices.empty() || rate <= 0 || !dec.read_audio) {
-            return;
-        }
-        size_t n = 0;
-        const float * pcm = dec.read_audio(state, rate, &n);
-        set_soundtrack(pcm, n, rate);
-    }
 };
 
 static const mtmd_helper_video_decoder * video_builtin_decoder() {
@@ -899,9 +815,6 @@ static mtmd_helper_video * video_init(const mtmd_context * mctx, const char * pa
     ctx->configure(mtmd_get_video_config(mctx, src.width, src.height, src.n_frames, src.fps), src, params.fps_target);
     if (!ctx->start(src, ctx->frame_indices.empty() ? ctx->fps_target : 0.0f)) {
         return nullptr;
-    }
-    if (!params.no_soundtrack) {
-        ctx->load_soundtrack(mctx);
     }
     ctx->src_alive = true;
     return ctx.release();
@@ -993,7 +906,6 @@ mtmd_helper_video_init_params mtmd_helper_video_init_params_default() {
         /* fps_target             */ 4.0f,
         /* ffmpeg_bin_dir         */ nullptr,
         /* timestamp_interval_ms  */ 5000,
-        /* no_soundtrack          */ false,
         /* decoder                */ nullptr,
     };
 }

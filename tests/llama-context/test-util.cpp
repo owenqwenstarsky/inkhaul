@@ -2,7 +2,7 @@
 
 #include "test-log.h"
 
-#include "../../src/llama-ext.h" // llama_memory_get_buffers, llama_memory_get_tensors, llama_arch_from_string
+#include "../../src/llama-ext.h" // llama_memory_get_buffers, llama_memory_get_tensors
 
 #include "common.h"
 
@@ -391,14 +391,6 @@ llama_sampler_ptr make_dist_sampler(uint32_t seed) {
     llama_sampler_ptr smpl{llama_sampler_chain_init(sparams)};
     llama_sampler_chain_add(smpl.get(), llama_sampler_init_dist(seed));
     return smpl;
-}
-
-bool arch_reserves_single_seq(const llama_model * model) {
-    char arch_name[64] = {};
-    llama_model_meta_val_str(model, "general.architecture", arch_name, sizeof(arch_name));
-    const llm_arch arch = llama_arch_from_string(arch_name);
-
-    return arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_MINIMAX_01;
 }
 
 //

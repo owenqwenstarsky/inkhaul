@@ -21,22 +21,6 @@ void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
     }
 }
 
-void llama_hparams::set_recr_pattern(uint32_t n_pattern, bool dense_first) {
-    if (dense_first) {
-        for (uint32_t il = 0; il < n_layer(); ++il) {
-            is_recr_impl[il] = n_pattern == 0 || (il % n_pattern != 0);
-        }
-    } else {
-        for (uint32_t il = 0; il < n_layer(); ++il) {
-            is_recr_impl[il] = n_pattern == 0 || (il % n_pattern < (n_pattern - 1));
-        }
-    }
-
-    for (uint32_t il = n_layer(); il < n_layer_all; ++il) {
-        is_recr_impl[il] = false;
-    }
-}
-
 bool llama_hparams::is_swa_any() const {
     for (uint32_t il = 0; il < n_layer_all; ++il) {
         if (is_swa_impl[il]) {
@@ -116,17 +100,7 @@ uint32_t llama_hparams::n_rot(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_embd_inp() const {
-    if (n_embd_inp_impl > 0) {
-        return n_embd_inp_impl;
-    }
-
-    uint32_t n_embd_inp = n_embd;
-
-    if (n_deepstack_layers > 0) {
-        n_embd_inp += n_embd * n_deepstack_layers;
-    }
-
-    return n_embd_inp;
+    return n_embd;
 }
 
 uint32_t llama_hparams::n_embd_inp_enc() const {
@@ -165,17 +139,6 @@ uint32_t llama_hparams::n_embd_v_gqa(uint32_t il) const {
     return n_embd_head_v(il) * n_head_kv;
 }
 
-bool llama_hparams::is_n_embd_k_gqa_variable() const {
-    const uint32_t val = n_embd_k_gqa();
-    for (uint32_t il = 0; il < n_layer_all; ++il) {
-        if (val != n_embd_k_gqa(il)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 bool llama_hparams::is_n_embd_v_gqa_variable() const {
     const uint32_t val = n_embd_v_gqa();
     for (uint32_t il = 0; il < n_layer_all; ++il) {
@@ -206,92 +169,28 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
 }
 
 uint32_t llama_hparams::n_embd_r() const {
-    if (wkv_head_size != 0) {
-        // for RWKV models
-        return token_shift_count * n_embd;
-    }
-
+    // Inkling 2 short convolutions: d_conv - 1 columns of history per channel
     if (n_sconv_channels != 0) {
-        // for Inkling2 models, checked before LFM2 as they set n_shortconv_l_cache too
         return n_sconv_channels * (n_shortconv_l_cache - 1);
-    }
-
-    if (n_shortconv_l_cache != 0) {
-        // for LFM2 models
-        return n_embd * (n_shortconv_l_cache - 1);
-    }
-
-    if (n_cca_qk != 0) {
-        // for ZAYA1 CCA layers: depthwise + grouped conv, each with d_conv - 1 columns of history
-        return 2 * (ssm_d_conv - 1) * n_cca_qk;
-    }
-
-    if (n_embd_head_kda != 0) {
-        // for Kimi KDA layers
-        // Conv state for Q, K, V: 3 * (d_conv - 1) * n_head * head_dim
-        const uint32_t d_inner = n_head() * n_embd_head_kda;  // 32 * 128 = 4096
-        return 3 * (ssm_d_conv > 0 ? ssm_d_conv - 1 : 3) * d_inner;
     }
 
     // TODO: maybe support other convolution strides than 1
     // NOTE: since the first column of the conv_state is shifted out each time, it's not actually needed
-    // Corresponds to Mamba's conv_states size
-    const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
-
-    // PLE conv history needs its own row: Meta splits cache_r_l by head, so a history packed behind the first is unaddressable
-    // it lives in cache_ple_r_l instead, mirrored like the rest of the PLE module
-    return n_conv;
+    return (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
 }
 
 uint32_t llama_hparams::n_embd_s() const {
-    if (wkv_head_size != 0) {
-        // corresponds to RWKV's wkv_states size
-        return n_embd * wkv_head_size;
-    }
-
-    if (n_cca_qk != 0) {
-        // for ZAYA CCA layers: the delayed value of the previous token
-        return n_embd_v_gqa() / 2;
-    }
-
     if (n_embd_head_kda != 0) {
-        // for Kimi KDA layers
         // Full recurrent state: head_dim * head_dim * n_head
-        // h tensor shape for delta attention: [head_dim, head_dim, n_head]
-        return n_embd_head_kda * n_embd_head_kda * n_head();  // 128 * 128 * 32 = 524288
+        return n_embd_head_kda * n_embd_head_kda * n_head();
     }
 
-    if (n_embd_head_la != 0) {
-        // for MiniMax-Text-01 linear attention layers
-        // Full recurrent state: head_dim * head_dim * n_head
-        // tensor shape for linear attention: [head_dim, head_dim, n_head]
-        return n_embd_head_la * n_embd_head_la * n_head();  // 128 * 128 * 64 = 1048576
-    }
-
-    // corresponds to Mamba's ssm_states size
     return ssm_d_state * ssm_d_inner;
 }
 
 bool llama_hparams::is_recr(uint32_t il) const {
     if (il < n_layer_all) {
         return is_recr_impl[il];
-    }
-
-    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
-}
-
-uint32_t llama_hparams::ple_conv_state() const {
-    if (ple_n_heads == 0 || ple_conv_kernel == 0) {
-        return 0;
-    }
-
-    // dilation equals the n-gram size, matching the reference module
-    return (ple_conv_kernel - 1) * ple_ngram_size * dsv4_hc_mult * n_embd;
-}
-
-bool llama_hparams::is_ple(uint32_t il) const {
-    if (il < n_layer_all) {
-        return is_ple_impl[il];
     }
 
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
@@ -310,29 +209,6 @@ bool llama_hparams::is_swa(uint32_t il) const {
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
-bool llama_hparams::is_mla() const {
-    assert((n_embd_head_k_mla_impl == 0 && n_embd_head_v_mla_impl == 0) ||
-           (n_embd_head_k_mla_impl != 0 && n_embd_head_v_mla_impl != 0));
-
-    return n_embd_head_k_mla_impl != 0 && n_embd_head_v_mla_impl != 0;
-}
-
-bool llama_hparams::is_indexer_full(uint32_t il) const {
-    if (il < n_layer()) {
-        return is_indexer_full_impl[il];
-    }
-
-    GGML_ABORT("%s: il (%u) out of bounds (n_layer: %u)\n", __func__, il, n_layer());
-}
-
-uint32_t llama_hparams::n_embd_head_k_mla() const {
-    return is_mla() ? n_embd_head_k_mla_impl : n_embd_head_k();
-}
-
-uint32_t llama_hparams::n_embd_head_v_mla() const {
-    return is_mla() ? n_embd_head_v_mla_impl : n_embd_head_v();
-}
-
 bool llama_hparams::has_kv(uint32_t il) const {
     return kv_source(il) == il;
 }
@@ -346,12 +222,6 @@ uint32_t llama_hparams::kv_source(uint32_t il) const {
 }
 
 bool llama_hparams::has_rope(uint32_t il) const {
-    // the router layer stores adapter routing signal, not positional info,
-    // so it must not be RoPE-shifted
-    if (router_layer >= 0 && (int32_t) il == router_layer) {
-        return false;
-    }
-
     if (il < n_layer_all) {
         return rope_pattern[il] != 0;
     }
@@ -360,9 +230,5 @@ bool llama_hparams::has_rope(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_layer() const {
-    return n_layer_all - n_layer_nextn;
-}
-
-bool llama_hparams::use_mrope() const {
-    return rope_sections[0] > 0 && rope_sections[1] > 0;
+    return n_layer_all;
 }

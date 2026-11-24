@@ -21,9 +21,8 @@ import gguf
 class TestKVCacheScales(unittest.TestCase):
     def test_projection_names(self):
         cases = (
-            (gguf.MODEL_ARCH.PHI3, "model.layers.2.self_attn.qkv_proj", "model.layers.2.self_attn.qkv_proj"),
-            (gguf.MODEL_ARCH.GPT2, "transformer.h.2.attn.c_attn", "transformer.h.2.attn.c_attn"),
-            (gguf.MODEL_ARCH.LLAMA, "model.layers.2.self_attn.k_proj", "model.layers.2.self_attn.v_proj"),
+            (gguf.MODEL_ARCH.INKLING2, "model.layers.2.self_attn.k_proj", "model.layers.2.self_attn.v_proj"),
+            (gguf.MODEL_ARCH.DFLASH, "model.layers.2.self_attn.k_proj", "model.layers.2.self_attn.v_proj"),
         )
         for arch, k_name, v_name in cases:
             for dtype in (torch.float32, torch.bfloat16):

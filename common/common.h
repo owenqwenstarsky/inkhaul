@@ -64,7 +64,6 @@ struct common_adapter_lora_info {
 
 using llama_tokens = std::vector<llama_token>;
 
-struct common_control_vector_load_info;
 
 //
 // CPU utils
@@ -100,12 +99,10 @@ enum llama_example {
     LLAMA_EXAMPLE_IMATRIX,
     LLAMA_EXAMPLE_BENCH,
     LLAMA_EXAMPLE_SERVER,
-    LLAMA_EXAMPLE_CVECTOR_GENERATOR,
     LLAMA_EXAMPLE_EXPORT_LORA,
     LLAMA_EXAMPLE_MTMD,
     LLAMA_EXAMPLE_LOOKUP,
     LLAMA_EXAMPLE_PARALLEL,
-    LLAMA_EXAMPLE_TTS,
     LLAMA_EXAMPLE_DIFFUSION,
     LLAMA_EXAMPLE_FINETUNE,
     LLAMA_EXAMPLE_FIT_PARAMS,
@@ -131,12 +128,6 @@ enum common_sampler_type {
     COMMON_SAMPLER_TYPE_PENALTIES   = 10,
     COMMON_SAMPLER_TYPE_TOP_N_SIGMA = 11,
     COMMON_SAMPLER_TYPE_ADAPTIVE_P  = 12,
-};
-
-// dimensionality reduction methods, used by cvector-generator
-enum dimre_method {
-    DIMRE_METHOD_PCA,
-    DIMRE_METHOD_MEAN,
 };
 
 enum common_conversation_mode {
@@ -176,12 +167,8 @@ enum common_params_sampling_config : uint64_t {
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,           // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,   // standalone draft model speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,   // Eagle3 speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,      // Multi-token prediction
-    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,   // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,   // DFlash family draft, runs the DSpark draft
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,   // DSpark speculative decoding (DFlash + Markov head)
-    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,  // DFlash2 speculative decoding (DFlash + selector)
-    COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR, // LiliCorr speculative decoding (DFlash + scorer)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,   // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,    // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,  // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -396,7 +383,7 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
-    // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
+    // used by Simple and DSpark - the methods that require a draft model
     common_params_speculative_draft draft;
 
     common_params_speculative_ngram_mod ngram_mod;
@@ -416,12 +403,8 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3  ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK  ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -557,12 +540,8 @@ struct common_params {
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
-    std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
-
-    int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
-    int32_t control_vector_layer_start = -1; // layer range for control vector
-    int32_t control_vector_layer_end   = -1; // layer range for control vector
-    bool    offline                    = false;
+    int32_t verbosity = 3;  // LOG_LEVEL_INFO
+    bool    offline   = false;
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
     int32_t ppl_output_type = 0;     // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line
@@ -609,15 +588,13 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
-    bool load_mtp          = false; // load MTP/NextN layers
 
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
-    size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
-    float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
+    size_t longhaul_cache_size = 512ull*1024*1024; // LongHaul: cache size in bytes for the experts kept on disk
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -766,13 +743,6 @@ struct common_params {
     bool activation_statistics  = false; // generate data to calculate activation based statistics
     bool parse_special          = false; // whether to parse special tokens during imatrix tokenization
 
-    // cvector-generator params
-    int n_pca_batch = 100;
-    int n_pca_iterations = 1000;
-    dimre_method cvector_dimre_method = DIMRE_METHOD_PCA;
-    std::string cvector_positive_file = "tools/cvector-generator/positive.txt";
-    std::string cvector_negative_file = "tools/cvector-generator/negative.txt";
-
     bool spm_infill = false; // suffix/prefix/middle pattern for infill
 
     // batched-bench params
@@ -796,8 +766,6 @@ struct common_params {
     // TTS params
     std::string tts_lang = "";
     std::string tts_voice = "";
-    std::string tts_speaker_file = "";
-    std::string tts_speaker_text = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
@@ -917,6 +885,11 @@ inline size_t string_find_partial_stop(std::string_view str, std::string_view st
 }
 
 bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_override> & overrides);
+
+// a memory size in bytes: a number in MiB, or with a K, M or G suffix (base 1024, "512M", "1G", "2GiB")
+// throws std::invalid_argument on 0, an unknown suffix or an overflow
+size_t string_parse_mem_size(const std::string & value);
+
 void string_process_escapes(std::string & input);
 
 std::string string_from(bool value);
@@ -1118,12 +1091,10 @@ struct common_batch {
         llama_seq_id seq_id; // the first sequence id, see add_seq()
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
-        llama_embd   state; // non-owning view of the data passed to set_embd_state(), data == NULL if none
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         int32_t      decision_group = 0; // see llama_batch_ext_set_decision_group()
         int32_t      embd_row = -1; // see add_embd_row(), -1 if none
-        int32_t      state_row = -1; // see set_embd_state_row(), -1 if none
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
@@ -1158,12 +1129,6 @@ struct common_batch {
 
     // attach a token embedding to the entry at idx, can only be set once per entry
     bool set_embd(int32_t idx, llama_embd embd);
-
-    // attach a state embedding (e.g. the target hidden state for MTP) to the entry at idx, can only be set once per entry
-    bool set_embd_state(int32_t idx, llama_embd state);
-
-    // the state of entry idx is row `row` of the h_nextn device buffer of the state source context, see llama_set_ctx_state_src()
-    bool set_embd_state_row(int32_t idx, int32_t row);
 
     // add an embedding-only entry (no token id)
     // pos points to n_pos positions
@@ -1252,28 +1217,6 @@ void common_embd_normalize(const float * inp, float * out, int n, int embd_norm)
 float common_embd_similarity_cos(const float * embd1, const float * embd2, int n);
 
 //
-// Control vector utils
-//
-
-struct common_control_vector_data {
-    int n_embd;
-
-    // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
-    std::vector<float> data;
-};
-
-struct common_control_vector_load_info {
-    float strength;
-
-    std::string fname;
-};
-
-// Load control vectors, scale each by strength, and add them together.
-// Direction layer indices must be in [1, n_layer].
-// On error, returns {-1, empty}
-common_control_vector_data common_control_vector_load(const std::vector<common_control_vector_load_info> & load_infos, int32_t n_layer);
-
-//
 // Split utils
 //
 
@@ -1350,7 +1293,6 @@ struct common_prompt_checkpoint {
     common_state_data data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
-    // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
     size_t size() const;

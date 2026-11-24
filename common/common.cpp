@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cstdint>
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
@@ -672,6 +673,38 @@ void string_process_escapes(std::string & input) {
     input.resize(output_idx);
 }
 
+size_t string_parse_mem_size(const std::string & value) {
+    size_t n_digits = 0;
+    while (n_digits < value.size() && value[n_digits] >= '0' && value[n_digits] <= '9') {
+        n_digits++;
+    }
+    if (n_digits == 0 || n_digits > 19) {
+        throw std::invalid_argument("invalid size: " + value);
+    }
+    const uint64_t n = std::stoull(value.substr(0, n_digits));
+
+    std::string unit = value.substr(n_digits);
+    std::transform(unit.begin(), unit.end(), unit.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    int shift;
+    if (unit.empty() || unit == "m" || unit == "mb" || unit == "mib") {
+        shift = 20;
+    } else if (unit == "k" || unit == "kb" || unit == "kib") {
+        shift = 10;
+    } else if (unit == "g" || unit == "gb" || unit == "gib") {
+        shift = 30;
+    } else {
+        throw std::invalid_argument("invalid size unit: " + value);
+    }
+    if (n == 0) {
+        throw std::invalid_argument("size must be > 0: " + value);
+    }
+    if (n > (SIZE_MAX >> shift)) {
+        throw std::invalid_argument("size is too large: " + value);
+    }
+    return (size_t) n << shift;
+}
+
 bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_override> & overrides) {
     const char * sep = strchr(data, '=');
     if (sep == nullptr || sep - data >= 128) {
@@ -1245,23 +1278,17 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 
     // the draft context is created from the same base params and follows the main context, fit both together
     const bool has_draft = params.speculative.has_dft();
-    const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     common_params params_dft = common_base_params_to_speculative(params);
 
     auto mparams_dft = common_model_params_to_llama(params_dft);
     auto cparams_dft = common_context_params_to_llama(params_dft);
-    if (spec_mtp) {
-        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-    }
     cparams_dft.n_rs_seq = 0;
 
     const common_fit_extra_model extra = {
         /*.paths_model  =*/ params_dft.model.get_paths(),
         /*.mparams      =*/ &mparams_dft,
         /*.cparams      =*/ &cparams_dft,
-        /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
     };
 
     common_fit_params(params.model.get_paths(), &mparams, &cparams,
@@ -1269,7 +1296,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.tensor_buft_overrides.data(),
         params.fit_params_target.data(),
         params.fit_params_min_ctx,
-        has_draft || spec_mtp ? &extra : nullptr,
+        has_draft ? &extra : nullptr,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 }
 
@@ -1426,14 +1453,6 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-// only for warmup and probe decodes, fill zeros as dummy input
-static void common_batch_set_zero_state(common_batch & batch, const llama_model * model, std::vector<float> & zeros) {
-    zeros.assign(llama_model_n_embd_out(model), 0.0f);
-    for (int32_t i = 0; i < batch.size(); ++i) {
-        batch.set_embd_state(i, { zeros.data(), 1, zeros.size() });
-    }
-}
-
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
     common_init_result_ptr res(new common_init_result(params, model_only));
 
@@ -1458,27 +1477,6 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");
         params.ctx_shift = false;
-    }
-
-    if (!params.control_vectors.empty()) {
-        if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
-        if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);
-
-        const auto cvec = common_control_vector_load(params.control_vectors, llama_model_n_layer(model));
-        if (cvec.n_embd == -1) {
-            return res;
-        }
-
-        int err = llama_set_adapter_cvec(
-                lctx,
-                cvec.data.data(),
-                cvec.data.size(),
-                cvec.n_embd,
-                params.control_vector_layer_start,
-                params.control_vector_layer_end);
-        if (err) {
-            return res;
-        }
     }
 
     if (llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_RANK) {
@@ -1540,8 +1538,6 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (llama_model_has_decoder(model)) {
             tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
             common_batch batch = common_batch_get_one(lctx, tmp);
-            std::vector<float> zeros;
-            common_batch_set_zero_state(batch, model, zeros);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         }
         llama_memory_clear(llama_get_memory(lctx), true);
@@ -1609,8 +1605,6 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     int ret;
     {
         common_batch batch = common_batch_get_one(ctx, tmp);
-        std::vector<float> zeros;
-        common_batch_set_zero_state(batch, llama_get_model(ctx), zeros);
         ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
     }
     if (ret != 0) {
@@ -1722,7 +1716,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
 }
@@ -1776,8 +1769,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    cparams.moe_cache_size      = params.moe_cache_size;
-    cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+    cparams.longhaul_cache_size = params.longhaul_cache_size;
 
     return cparams;
 }
@@ -1996,133 +1988,6 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
     return sum / (sqrt(sum1) * sqrt(sum2));
 }
 
-//
-// Control vector utils
-//
-
-static common_control_vector_data common_control_vector_load_one(const common_control_vector_load_info & load_info, int32_t n_layer) {
-    common_control_vector_data result = { -1, {} };
-
-    ggml_context * ctx = nullptr;
-    struct gguf_init_params meta_gguf_params = {
-        /* .no_alloc = */ false,
-        /* .ctx      = */ &ctx,
-    };
-    struct gguf_context * ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), meta_gguf_params);
-    if (!ctx_gguf) {
-        COM_ERR("failed to load control vector file from %s\n", load_info.fname.c_str());
-        return result;
-    }
-
-    int32_t n_tensors = gguf_get_n_tensors(ctx_gguf);
-    if (n_tensors == 0) {
-        COM_WRN("no direction tensors found in %s\n", load_info.fname.c_str());
-    }
-
-    for (int i = 0; i < n_tensors; i++) {
-        std::string name = gguf_get_tensor_name(ctx_gguf, i);
-
-        int layer_idx = -1;
-
-        // split on '.'
-        size_t dotpos = name.find('.');
-        if (dotpos != std::string::npos && name.substr(0, dotpos) == "direction") {
-            try {
-                layer_idx = std::stoi(name.substr(dotpos + 1));
-            } catch (...) {
-                layer_idx = -1;
-            }
-        }
-        if (layer_idx < 0) {
-            COM_ERR("invalid/unparsable direction tensor layer index in %s\n", load_info.fname.c_str());
-            result.n_embd = -1;
-            break;
-        } else if (layer_idx == 0) {
-            COM_ERR("invalid (zero) direction tensor layer index in %s\n", load_info.fname.c_str());
-            result.n_embd = -1;
-            break;
-        } else if (layer_idx > n_layer) {
-            COM_ERR("direction tensor layer index %d exceeds the model layer count %d in %s\n", layer_idx, n_layer, load_info.fname.c_str());
-            result.n_embd = -1;
-            break;
-        }
-
-        struct ggml_tensor * tensor = ggml_get_tensor(ctx, name.c_str());
-        if (tensor->type != GGML_TYPE_F32) {
-            COM_ERR("invalid (non-F32) direction tensor type in %s\n", load_info.fname.c_str());
-            result.n_embd = -1;
-            break;
-        }
-        if (ggml_n_dims(tensor) != 1) {
-            COM_ERR("invalid (non-1D) direction tensor shape in %s\n", load_info.fname.c_str());
-            result.n_embd = -1;
-            break;
-        }
-
-        if (result.n_embd == -1) {
-            result.n_embd = ggml_nelements(tensor);
-        } else if (ggml_nelements(tensor) != result.n_embd) {
-            COM_ERR("direction tensor in %s does not match previous dimensions\n", load_info.fname.c_str());
-            result.n_embd = -1;
-            break;
-        }
-
-        // extend if necessary - do not store data for layer 0 (it's not used)
-        result.data.resize(std::max(result.data.size(), (size_t) result.n_embd * layer_idx), 0.0f);
-
-        const float * src = (const float *) tensor->data;
-        float * dst = result.data.data() + (size_t) result.n_embd * (layer_idx - 1);  // layer 1 at [0]
-        for (int j = 0; j < result.n_embd; j++) {
-            dst[j] += src[j] * load_info.strength;  // allows multiple directions for same layer in same file
-        }
-
-    }
-
-    if (result.n_embd == -1) {
-        COM_WRN("skipping %s due to invalid direction tensors\n", load_info.fname.c_str());
-        result.data.clear();
-    }
-
-    gguf_free(ctx_gguf);
-    ggml_free(ctx);
-
-    return result;
-}
-
-common_control_vector_data common_control_vector_load(const std::vector<common_control_vector_load_info> & load_infos, int32_t n_layer) {
-    common_control_vector_data result = { -1, {} };
-
-    for (const auto & info : load_infos) {
-        auto cur = common_control_vector_load_one(info, n_layer);
-
-        if (cur.n_embd == -1) {
-            result.n_embd = -1;
-            break;
-        }
-        if (result.n_embd != -1 && result.n_embd != cur.n_embd) {
-            COM_ERR("control vectors in %s does not match previous dimensions\n", info.fname.c_str());
-            result.n_embd = -1;
-            break;
-        }
-
-        if (result.n_embd == -1) {
-            result = std::move(cur);
-        } else {
-            result.data.resize(std::max(result.data.size(), cur.data.size()), 0.0f);  // extend if necessary
-            for (size_t i = 0; i < cur.data.size(); i++) {
-                result.data[i] += cur.data[i];
-            }
-        }
-    }
-
-    if (result.n_embd == -1) {
-        COM_ERR("%s", "no valid control vector files passed\n");
-        result.data.clear();
-    }
-
-    return result;
-}
-
 ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std::vector<llama_token> & tokens, int64_t stride) {
     const int64_t ne_datapoint = llama_n_ctx(ctx);
     const int64_t ndata        = (tokens.size() - ne_datapoint - 1) / stride;
@@ -2214,7 +2079,7 @@ void common_batch::clear() {
 }
 
 int32_t common_batch::add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool output) {
-    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, { nullptr, 0, 0 }, {} });
+    tokens.push_back({ id, { pos, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, {} });
     return size() - 1;
 }
 
@@ -2252,24 +2117,8 @@ bool common_batch::set_embd(int32_t idx, llama_embd embd) {
     return true;
 }
 
-bool common_batch::set_embd_state(int32_t idx, llama_embd state) {
-    if (idx < 0 || idx >= size() || tokens[idx].state.data != nullptr) {
-        return false;
-    }
-    tokens[idx].state = state;
-    return true;
-}
-
-bool common_batch::set_embd_state_row(int32_t idx, int32_t row) {
-    if (idx < 0 || idx >= size() || row < 0 || tokens[idx].state.data != nullptr || tokens[idx].state_row >= 0) {
-        return false;
-    }
-    tokens[idx].state_row = row;
-    return true;
-}
-
 int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq_id seq_id, bool output) {
-    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, { nullptr, 0, 0 }, {} };
+    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, embd, {} };
     for (int32_t j = 0; j < n_pos; ++j) {
         t.pos[j] = pos[j];
     }
@@ -2278,7 +2127,7 @@ int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq
 }
 
 int32_t common_batch::add_embd_row(int32_t row, const llama_pos * pos, llama_seq_id seq_id, bool output) {
-    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, { nullptr, 0, 0 }, {} };
+    token t = { LLAMA_TOKEN_NULL, { 0, 0, 0, 0 }, seq_id, output, { nullptr, 0, 0 }, {} };
     t.embd_row = row;
     for (int32_t j = 0; j < n_pos; ++j) {
         t.pos[j] = pos[j];
@@ -2329,12 +2178,6 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         }
         if (t.output) {
             llama_batch_ext_set_output_logits(res, idx, true);
-        }
-        if (t.state.data) {
-            llama_batch_ext_set_embd_state(res, idx, t.state); // contexts without a state input ignore it
-        }
-        if (t.state_row >= 0 && !llama_batch_ext_set_embd_state_row(res, idx, t.state_row)) {
-            GGML_ABORT("%s: failed to set the state row of the entry at index %d\n", __func__, i);
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);

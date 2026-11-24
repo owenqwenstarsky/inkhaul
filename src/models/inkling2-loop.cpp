@@ -17,7 +17,7 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
     const uint32_t block = hparams.attn_res_block_size;
     // a fixed loop needs at least 2 passes, a variable loop at least 1
     if (n_passes < (varying ? 1u : 2u) || !gate_rank || !core_start || core_start >= core_end || core_end > (uint32_t) n_phys ||
-        core_start % block || core_end % block || hparams.n_layer_nextn) {
+        core_start % block || core_end % block) {
         throw std::runtime_error(format("inkling2_loop: invalid loop core [%u, %u) with block size %u, %u passes or gate rank %u for %d layers",
                 core_start, core_end, block, n_passes, gate_rank, n_phys));
     }

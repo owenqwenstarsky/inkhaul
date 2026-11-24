@@ -627,7 +627,7 @@ static hf_cache::hf_files get_split_files(const hf_cache::hf_files & files,
     return result;
 }
 
-// pick the best sibling GGUF whose filename contains `keyword` (e.g. "mmproj" / "mtp"),
+// pick the best sibling GGUF whose filename contains `keyword` (e.g. "mmproj" / "dspark"),
 // preferring deeper shared directory prefix with the model, then exact `tag` match,
 // then closest quantization to the tag when given, or to the model otherwise
 static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
@@ -695,9 +695,7 @@ static hf_cache::hf_file find_best_sibling(const hf_cache::hf_files & files,
 
 static const std::vector<common_download_sidecar> sidecars = {
     { "mmproj", "mmproj",  false, &common_download_opts::download_mmproj, &common_download_hf_plan::mmproj },
-    { "mtp",    "mtp-",    true,  &common_download_opts::download_mtp,    &common_download_hf_plan::mtp    },
     { "dflash", "dflash-", true,  &common_download_opts::download_dflash, &common_download_hf_plan::dflash },
-    { "eagle3", "eagle3-", true,  &common_download_opts::download_eagle3, &common_download_hf_plan::eagle3 },
     { "dspark", "dspark-", true,  &common_download_opts::download_dspark, &common_download_hf_plan::dspark },
 };
 
@@ -744,10 +742,18 @@ std::vector<common_download_partial> common_download_plan_partials(const common_
     return out;
 }
 
+// draft heads repos may ship that this fork does not run: never downloaded, never a model
+static const char * const unsupported_sidecar_keywords[] = { "mtp-", "eagle3-" };
+
 // true when `name` carries the keyword of a sidecar kind
 static bool name_is_sidecar(const std::string & name) {
     for (const auto & s : sidecars) {
         if (name.find(s.keyword) != std::string::npos) {
+            return true;
+        }
+    }
+    for (const char * keyword : unsupported_sidecar_keywords) {
+        if (name.find(keyword) != std::string::npos) {
             return true;
         }
     }

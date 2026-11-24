@@ -8,123 +8,36 @@ llama.cpp supports speculative decoding, a technique that can significantly acce
 
 The `llama-server` application supports several implementations of speculative decoding. An implementation with draft model can be mixed with an implementation without draft model.
 
-### Draft Model (`draft`)
+### Draft Model (`draft-simple`)
 
-A much smaller model (called the _draft model_) generates drafts.
-A draft model is the most used approach in speculative decoding.
+A much smaller model (called the _draft model_) generates drafts, one token at a time.
 
-### EAGLE-3 (`draft-eagle3`)
+### DSpark (`draft-dspark`, alias `draft-dflash`)
 
-EAGLE-3 uses a small draft model that reads the target model's hidden states to predict the next tokens, so it
-reaches higher acceptance than a standalone draft model of the same size. The draft is a one-layer transformer
-trained for a specific target model; it shares the target model's tokenizer and, optionally, uses a reduced draft
-vocabulary with its own `lm_head`, which is mapped back using a `d2t` table.
+[DSpark](https://arxiv.org/pdf/2607.05147) extends DFlash with a semi-autoregressive _Markov head_. DFlash produces an entire block of draft
+tokens in a single forward pass (block diffusion) and injects the target model's hidden states into the draft model's attention.
+The Markov head biases the logits of each block position by a low-rank term keyed on the previous token, chained in-graph across
+the block. This keeps drafting at one decode per block while recovering some of the left-to-right signal that pure block diffusion loses.
 
-Convert the EAGLE-3 checkpoint with `--target-model-dir` so it inherits the target's tokenizer and the layer
-indices to read. Both the SpecForge `LlamaForCausalLMEagle3` and the vLLM/AngelSlim `Eagle3LlamaForCausalLM`
-checkpoint formats are supported (for example [`AngelSlim/Qwen3-4B_eagle3`](https://huggingface.co/AngelSlim/Qwen3-4B_eagle3)
-for `Qwen/Qwen3-4B`):
+The draft is a small model (`dflash` architecture with a DSpark head) trained for a specific target.
+Inkling 2 Mini ships one next to the model, as `dspark-Inkling-2-Mini-Q8_0.gguf` in [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF).
+With `-hf`, `--spec-type draft-dspark` downloads it together with the target:
 
 ```bash
-python convert_hf_to_gguf.py AngelSlim/Qwen3-4B_eagle3 \
-    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-eagle3.gguf
-
-llama-server -m Qwen3-4B.gguf -md Qwen3-4B-eagle3.gguf --spec-type draft-eagle3
-```
-
-Supported EAGLE-3 draft models include:
-
-- [yuhuili/EAGLE3-LLaMA3.1-Instruct-8B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B)
-- [yuhuili/EAGLE3-LLaMA3.3-Instruct-70B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.3-Instruct-70B)
-- [RedHatAI/gemma-4-31B-it-speculator.eagle3](https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.eagle3)
-- [RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3](https://huggingface.co/RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3)
-- [Tengyunw/qwen3_8b_eagle3](https://huggingface.co/Tengyunw/qwen3_8b_eagle3)
-- [Tengyunw/qwen3_30b_moe_eagle3](https://huggingface.co/Tengyunw/qwen3_30b_moe_eagle3)
-- [AngelSlim/Qwen3-1.7B_eagle3](https://huggingface.co/AngelSlim/Qwen3-1.7B_eagle3)
-- [AngelSlim/Qwen3-4B_eagle3](https://huggingface.co/AngelSlim/Qwen3-4B_eagle3)
-- [AngelSlim/Qwen3-8B_eagle3](https://huggingface.co/AngelSlim/Qwen3-8B_eagle3)
-- [AngelSlim/Qwen3-14B_eagle3](https://huggingface.co/AngelSlim/Qwen3-14B_eagle3)
-- [AngelSlim/Qwen3-32B_eagle3](https://huggingface.co/AngelSlim/Qwen3-32B_eagle3)
-- [AngelSlim/Qwen3-a3B_eagle3](https://huggingface.co/AngelSlim/Qwen3-a3B_eagle3)
-- [RedHatAI/gpt-oss-20b-speculator.eagle3](https://huggingface.co/RedHatAI/gpt-oss-20b-speculator.eagle3)
-- [lmsys/EAGLE3-gpt-oss-120b-bf16](https://huggingface.co/lmsys/EAGLE3-gpt-oss-120b-bf16)
-- [nvidia/gpt-oss-120b-Eagle3-long-context](https://huggingface.co/nvidia/gpt-oss-120b-Eagle3-long-context)
-
-For the full and up-to-date list of supported models, see #18039.
-
-### DFlash (`draft-dflash`)
-
-DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and
-injects the target model's hidden states into the draft model's attention, instead of drafting one
-token at a time. This keeps the draft model small while making drafting GPU-friendly. Unlike EAGLE-3
-(a single-layer autoregressive draft), the DFlash draft uses several transformer layers but emits a
-whole block per draft step.
-
-The draft is a small block-diffusion model trained for a specific target (for example
-`z-lab/Qwen3-4B-DFlash` for `Qwen/Qwen3-4B`). Convert it with `--target-model-dir` so it inherits the
-target's tokenizer and token embeddings:
-
-```bash
-python convert_hf_to_gguf.py z-lab/Qwen3-4B-DFlash \
-    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-DFlash.gguf
-
-llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
-    --spec-type draft-dflash --spec-draft-n-max 15 -fa on --jinja
-```
-
-`--spec-draft-n-max` is clamped to the draft model's trained block size.
-
-DFlash2, DSpark and LiliCorr drafts are DFlash backbones with a head on the block, and the head is read from the draft model.
-`draft-dflash` runs each of them with the driver of its head.
-The other spec types must match the head of the draft model: `draft-dspark` needs the Markov head, `draft-dflash2` the candidate selector and `draft-lilicorr` the candidate scorer. On a mismatch, speculative decoding is not initialized.
-Without `--spec-type`, the type is detected from the draft model.
-
-See:
-
-- #22105
-
-### DFlash2 (`draft-dflash2`)
-
-[DFlash2](https://inco.ai/blog/dflash2/) adds a local convolution to the DFlash layers and a _candidate selector_ on the block.
-
-DFlash2 drafts convert like DFlash drafts, with `--target-model-dir`:
-
-```bash
-python convert_hf_to_gguf.py <dflash2-draft-dir> \
-    --target-model-dir <target-model-dir> --outtype bf16 --outfile DFlash2.gguf
-
-llama-server -m target.gguf -md DFlash2.gguf \
-    --spec-type draft-dflash2 --spec-draft-n-max 7 -fa on --jinja
-```
-
-`--spec-draft-p-min P` truncates the draft at the first step whose selector probability falls below `P`.
-
-With `--spec-draft-sampling probabilistic`, the draft samples the path at the request's temperature
-and the target verifies it by rejection sampling.
-
-See:
-
-- #27816, #30663
-
-### DSpark (`draft-dspark`)
-
-[DSpark](https://arxiv.org/pdf/2607.05147) extends DFlash with a semi-autoregressive _Markov head_: the draft still emits a whole
-block per forward pass, but each block position's logits are biased by a low-rank term keyed on
-the previous token, chained in-graph across the block. This keeps drafting at one decode per
-block while recovering some of the left-to-right signal that pure block diffusion loses.
-
-The draft is a small DeepSpec checkpoint trained for a specific target (for example
-[`deepseek-ai/dspark_qwen3_4b_block7`](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7)
-for `Qwen/Qwen3-4B`). Convert it with `--target-model-dir` so it inherits the target's tokenizer
-and token embeddings:
-
-```bash
-python convert_hf_to_gguf.py deepseek-ai/dspark_qwen3_4b_block7 \
-    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-DSpark.gguf
-
-llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
+llama-server -hf AtomicChat/Inkling-2-Mini-GGUF \
     --spec-type draft-dspark --spec-draft-n-max 7 -fa on --jinja
 ```
+
+With local files, pass the draft with `-md`:
+
+```bash
+llama-server -m Inkling-2-Mini-AD-Q4_K.gguf -md dspark-Inkling-2-Mini-Q8_0.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 7 -fa on --jinja
+```
+
+Only DSpark drafts are supported. A DFlash draft without the Markov head (no `markov_w1.weight` tensor) fails to load.
+`draft-dflash` is an alias that runs the DSpark draft. Without `--spec-type`, a draft model with the `dflash` architecture is detected as `draft-dflash`.
+`draft-dflash` and `draft-dspark` cannot be combined.
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
@@ -132,36 +45,9 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 acceptance (from the draft's confidence head) falls below `P` (default 0 = disabled).
 Values above 0 require a draft with a confidence head.
 
-Currently only drafts with a Qwen3 backbone are supported; support for other backbones
-(e.g. Gemma4) is planned.
-
-DSpark drafts exported in the [speculators](https://github.com/vllm-project/speculators) format
-(for example [`RedHatAI/gemma-4-31B-it-speculator.dspark`](https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.dspark))
-convert the same way.
-
 See:
 
 - #25173
-
-### LiliCorr (`draft-lilicorr`)
-
-[LiliCorr](https://arxiv.org/pdf/2608.20530) puts a _candidate scorer_ on the DFlash block: a small transformer over the top-k candidates
-of each block position, conditioned on the target's hidden state at the last position, scores the paths through the block like the DFlash2 selector.
-
-LiliCorr drafts (`LiLiCorrDraftModel`) convert with `--target-model-dir`:
-
-```bash
-python convert_hf_to_gguf.py <lilicorr-draft-dir> \
-    --target-model-dir <target-model-dir> --outtype bf16 --outfile LiliCorr.gguf
-
-llama-server -m target.gguf -md LiliCorr.gguf --spec-type draft-lilicorr -fa on --jinja
-```
-
-`--spec-draft-p-min P` truncates the draft at the first step whose scorer probability falls below `P`.
-
-See:
-
-- #30506
 
 ### n-gram Cache (`ngram-cache`)
 
@@ -259,7 +145,7 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 
 Use `--backend-sampling` to run supported target-model samplers on the model backend. Draft-model sampling uses the backend by default and can be controlled with `--spec-draft-backend-sampling` and `--no-spec-draft-backend-sampling`.
 
-Unsupported samplers and device layouts fall back to CPU sampling. Tensor split mode does not support backend sampling. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
+Unsupported samplers and device layouts fall back to CPU sampling. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
 
 ### Synthetic Acceptance
 
@@ -273,7 +159,7 @@ Use exactly one of these options:
 ### General Speculative Parameters
 
 ```
---spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dflash2|draft-dspark|draft-lilicorr|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+--spec-type [none|draft-simple|draft-dflash|draft-dspark|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|ngram-cache]
                                         comma-separated list of types of speculative decoding to use
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -347,20 +233,14 @@ Use exactly one of these options:
 ```
 --spec-draft-type-k, -ctkd, --cache-type-k-draft  TYPE
                                         KV cache data type for K for the draft model
-                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K)
 --spec-draft-type-v, -ctvd, --cache-type-v-draft  TYPE
                                         KV cache data type for V for the draft model
-                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
 --spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
                                         override tensor buffer type for draft model
---spec-draft-cpu-moe, -cmoed, --cpu-moe-draft
-                                        keep all Mixture of Experts (MoE) weights in the CPU for the draft model
-                                        (env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE)
---spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft  N
-                                        keep the MoE weights of the first N layers in the CPU for the draft model
-                                        (env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE)
 ```
 
 ### n-gram Mod Parameters
@@ -415,12 +295,8 @@ Specifies a comma-separated list of speculative decoding types to use.
 |------|-------------|
 | `none` | No speculative decoding (default) |
 | `draft-simple` | Use a simple draft model for speculation |
-| `draft-eagle3` | Use an EAGLE-3 draft model that reads the target's hidden states |
-| `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step (also DFlash2, DSpark and LiliCorr drafts, resolved from the model) |
-| `draft-dflash2` | Use a DFlash2 draft model (DFlash + local convolution + candidate selector) |
+| `draft-dflash` | Alias of `draft-dspark` |
 | `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
-| `draft-lilicorr` | Use a LiliCorr draft model (DFlash + candidate scorer conditioned on the target's hidden state) |
-| `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |
 | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |

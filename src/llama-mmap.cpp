@@ -673,6 +673,57 @@ void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsaf
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 
+void llama_file::read_raw_at(void * ptr, size_t len, size_t offset) const {
+    if (pimpl->has_direct_io()) {
+        throw std::runtime_error("positional reads are not supported with direct I/O");
+    }
+    if (offset > pimpl->size || len > pimpl->size - offset) {
+        throw std::runtime_error(format("read of %zu bytes at offset %zu is past the end of the file", len, offset));
+    }
+    uint8_t * dst = (uint8_t *) ptr;
+#ifdef _WIN32
+    // on a synchronous handle ReadFile with an offset also moves the file pointer, so the position is not kept here
+    for (size_t done = 0; done < len; ) {
+        const DWORD n_req = (DWORD) std::min<size_t>(len - done, 1u << 30);
+        const uint64_t pos = offset + done;
+        OVERLAPPED ov = {};
+        ov.Offset     = (DWORD) (pos & 0xffffffff);
+        ov.OffsetHigh = (DWORD) (pos >> 32);
+        DWORD n = 0;
+        if (!ReadFile(pimpl->fp_win32, dst + done, n_req, &n, &ov)) {
+            throw std::runtime_error(format("read error: %s", pimpl->GetErrorMessageWin32(GetLastError()).c_str()));
+        }
+        if (n == 0) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+        done += n;
+    }
+#else
+    const int fd = file_id();
+    for (size_t done = 0; done < len; ) {
+        const ssize_t n = pread(fd, dst + done, len - done, (off_t) (offset + done));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(format("read error: %s", strerror(errno)));
+        }
+        if (n == 0) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+        done += (size_t) n;
+    }
+#endif
+}
+
+void llama_file::set_no_cache() {
+#if defined(__APPLE__)
+    if (fcntl(file_id(), F_NOCACHE, 1) == -1) {
+        LLAMA_LOG_WARN("%s: fcntl(F_NOCACHE) failed: %s\n", __func__, strerror(errno));
+    }
+#endif
+}
+
 void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
 void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 

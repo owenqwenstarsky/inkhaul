@@ -241,7 +241,7 @@ common_chat_params (prompt, parser, grammar, triggers, preserved_tokens)
 
 ## Entry Point
 
-The auto-parser is invoked in [common/chat.cpp:1280-1310](common/chat.cpp#L1280-L1310) in `common_chat_templates_apply_jinja`. A few specialized templates are handled first (Ministral/Magistral Large 3, GPT-OSS with `<|channel|>`, Functionary v3.2 with `>>>all`), then the auto-parser handles everything else via `autoparser::autoparser` + `peg_generator::generate_parser`.
+The auto-parser is invoked in `common_chat_templates_apply_jinja` in [common/chat.cpp](../common/chat.cpp). `common_chat_template_detect_params_init` first checks for a template with a dedicated handler. In this fork the only one is Inkling (Inkling 1 and 2, [common/parsers/inkling.cpp](../common/parsers/inkling.cpp)). The auto-parser handles everything else via `autoparser::autoparser` + `peg_generator::generate_parser`.
 
 ## Algorithm Details
 
@@ -482,8 +482,6 @@ The following templates have active tests in `tests/test-chat.cpp`:
 
 | Template | Format | Notes |
 | -------- | ------ | ----- |
-| Ministral-3-14B-Reasoning | Reasoning | `[THINK]...[/THINK]` tags (specialized handler) |
-| NVIDIA-Nemotron-3-Nano-30B | TAG_WITH_TAGGED | Reasoning + tools |
 | CohereForAI Command-R7B | JSON_NATIVE | `<\|START_THINKING\|>`/`<\|START_RESPONSE\|>` markers |
 | Google Gemma 2 2B | Content only | No tool support |
 | Qwen-QwQ-32B | Reasoning | Forced-open thinking |
@@ -491,31 +489,24 @@ The following templates have active tests in `tests/test-chat.cpp`:
 | IBM Granite 3.3 | JSON_NATIVE | `<think></think>` + `<response></response>` |
 | IBM Granite 4.0 | JSON_NATIVE | `<tool_call>` wrapper (same template used by 4.1) |
 | ByteDance Seed-OSS | TAG_WITH_TAGGED | Custom `<seed:think>` and `<seed:tool_call>` tags |
-| Qwen3-Coder | TAG_WITH_TAGGED | XML-style tool format |
 | DeepSeek V3.1 | JSON_NATIVE | Forced thinking mode |
 | GLM-4.6 | TAG_WITH_TAGGED | `<tool_call>name\n<arg_key>...<arg_value>...` format |
 | GLM-4.7-Flash | TAG_WITH_TAGGED | Updated GLM format |
-| Kimi-K2-Thinking | JSON_NATIVE | Reasoning + JSON tools |
 | Apertus-8B-Instruct | JSON_NATIVE | Function name as JSON key |
 | MiniMax-M2 | TAG_WITH_JSON | XML invoke with JSON args |
 | NVIDIA-Nemotron-Nano-v2 | JSON_NATIVE | `<TOOLCALL>` wrapper (nested) |
 | CohereForAI Command-R Plus | JSON_NATIVE | Markdown code block format |
 | Mistral-Nemo-Instruct-2407 | JSON_NATIVE | `[TOOL_CALLS]` wrapper with ID field |
 | Functionary v3.1 | TAG_WITH_JSON | `<function=X>` format |
-| Functionary v3.2 | Specialized | `>>>` recipient delimiter (dedicated handler) |
 | Fireworks Firefunction v2 | TAG_WITH_JSON | Fireworks tool format |
 | DeepSeek R1 Distill (Llama/Qwen) | Reasoning | Forced-open thinking |
 | llama-cpp-deepseek-r1 | Reasoning | Forced-open thinking |
-| Kimi-K2 / Kimi-K2-Instruct | JSON_NATIVE | JSON tools with special markers |
 | Llama 3.1/3.2/3.3 | JSON_NATIVE | Standard Llama tool format |
-| OpenAI GPT-OSS | Specialized | Channel-based (dedicated handler) |
-| LLM-jp-4.1 | Specialized | GPT-OSS dialect (dedicated handler) |
 | Apriel 1.5 | JSON_NATIVE | `<tool_calls>` wrapper with JSON array |
 | Apriel 1.6 Thinker | Reasoning | Implicit reasoning start |
 | Mistral Small 3.2 | JSON_NATIVE | `[TOOL_CALLS]func[ARGS]{...}` with call ID |
-| Devstral | JSON_NATIVE | `[TOOL_CALLS]func[ARGS]{...}` without call ID |
-| StepFun 3.5 Flash | TAG_WITH_TAGGED | `<function=X><parameter=Y>` format |
 | Spark2.5 | TAG_WITH_TAGGED | `<tool_call>name<arg_key>...<arg_value>...` format |
+| Inkling / Inkling 2 | Specialized | Dedicated handler (`common/parsers/inkling.cpp`) |
 
 ## Adding Support for New Templates
 
@@ -523,7 +514,7 @@ To support a new template format:
 
 1. **If it follows standard patterns** — The auto-parser should detect it automatically. Run `test-chat-auto-parser <template_path>` to verify markers are correctly extracted.
 2. **If differential analysis extracts incorrect markers** — Add a workaround lambda to the `workarounds` vector in `common/chat-diff-analyzer.cpp`. Inspect the template source for a unique identifying substring.
-3. **If it needs fundamentally different handling** — Add a dedicated handler function in `chat.cpp` before the auto-parser block (as done for GPT-OSS, Functionary v3.2, and Ministral).
+3. **If it needs fundamentally different handling** — Add a dedicated handler in `common/parsers/` and detect its template in `common_chat_template_detect_params_init` in `chat.cpp`, before the auto-parser (as done for Inkling).
 
 ## Edge Cases and Quirks
 

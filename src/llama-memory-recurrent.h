@@ -124,8 +124,6 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
-    // a second conv history that must stay replicated across devices, so it cannot share the r row
-    std::vector<ggml_tensor *> p_l;
     // rs_replay pending gdn inputs: k, v, and the gates then the betas
     std::vector<ggml_tensor *> spk_l;
     std::vector<ggml_tensor *> spv_l;
@@ -147,7 +145,6 @@ private:
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
-    size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
@@ -195,7 +192,6 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
-    ggml_tensor * get_p_l(int32_t il) const;
     ggml_tensor * get_spk_l (int32_t il) const;
     ggml_tensor * get_spv_l (int32_t il) const;
     ggml_tensor * get_spgb_l(int32_t il) const;

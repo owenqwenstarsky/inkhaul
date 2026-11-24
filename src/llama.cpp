@@ -3,7 +3,6 @@
 #include "llama-impl.h"
 #include "llama-version.h"
 
-#include "llama-chat.h"
 #include "llama-context.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
@@ -104,15 +103,11 @@ bool llama_supports_gpu_offload(void) {
         ggml_backend_load_all();
     }
     return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
-           ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr ||
-           llama_supports_rpc();
+           ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr;
 }
 
 bool llama_supports_rpc(void) {
-    if (!ggml_backend_reg_count()) {
-        ggml_backend_load_all();
-    }
-    return ggml_backend_reg_by_name("RPC") != nullptr;
+    return false;
 }
 
 const char * llama_version(void) {
@@ -157,30 +152,13 @@ int64_t llama_time_us(void) {
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR is not supported\n", __func__);
+        return false;
+    }
     if (params.devices) {
-        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            size_t n_devs = 0;
-            while (params.devices[n_devs]) {
-                n_devs++;
-            }
-            if (n_devs == 0) {
-                LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
-                return false;
-            }
-            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
-            for (size_t i = 0; i < n_devs; ++i) {
-                LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
-            }
-            model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
-            model->devices.push_back({
-                true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
-        } else {
-            for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
-                model->devices.push_back({false, *dev});
-            }
+        for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+            model->devices.push_back({false, *dev});
         }
     } else {
         // default device selection
@@ -188,98 +166,58 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         // build list of available devices
         std::vector<llama_device> gpus;
         std::vector<llama_device> igpus;
-        std::vector<llama_device> rpc_servers;
 
-        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            std::vector<ggml_backend_dev_t> devs;
-            devs.reserve(ggml_backend_dev_count());
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                auto * dev = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
-                    LLAMA_LOG_INFO("%s: skipping %s (%s) for tensor parallelism\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
-                    continue;
-                }
-                devs.push_back(dev);
-            }
-            if (devs.empty()) {
-                LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
-                return false;
-            }
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            switch (ggml_backend_dev_type(dev)) {
+                case GGML_BACKEND_DEVICE_TYPE_CPU:
+                case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+                    // skip CPU backends since they are handled separately
+                    break;
 
-            LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
-            for (size_t i = 0; i < devs.size(); ++i) {
-                LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
-            }
-
-            GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
-            gpus.push_back({
-                true, ggml_backend_meta_device(
-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
-        } else {
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                switch (ggml_backend_dev_type(dev)) {
-                    case GGML_BACKEND_DEVICE_TYPE_CPU:
-                    case GGML_BACKEND_DEVICE_TYPE_ACCEL:
-                        // skip CPU backends since they are handled separately
-                        break;
-
-                    case GGML_BACKEND_DEVICE_TYPE_GPU: {
-                        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                        if (ggml_backend_reg_name(reg) == std::string("RPC")) {
-                            rpc_servers.push_back({false, dev});
-                        } else {
-                            // check if there is already a GPU with the same device id
-                            ggml_backend_dev_props props;
-                            ggml_backend_dev_get_props(dev, &props);
-                            auto it = std::find_if(gpus.begin(), gpus.end(), [&props](const llama_device & d) {
-                                ggml_backend_dev_props d_props;
-                                ggml_backend_dev_get_props(d.dev, &d_props);
-                                if (props.device_id && d_props.device_id) {
-                                    return strcmp(props.device_id, d_props.device_id) == 0;
-                                }
-                                return false;
-                            });
-
-                            if (it != gpus.end()) {
-                                LLAMA_LOG_INFO("%s: skipping device %s (%s) with id %s - already using device %s (%s) with the same id\n",
-                                        __func__,
-                                        ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-                                        props.device_id ? props.device_id : "unknown id",
-                                        ggml_backend_dev_name(it->dev), ggml_backend_dev_description(it->dev));
-                            } else {
-                                gpus.push_back({false, dev});
-                            }
+                case GGML_BACKEND_DEVICE_TYPE_GPU: {
+                    // check if there is already a GPU with the same device id
+                    ggml_backend_dev_props props;
+                    ggml_backend_dev_get_props(dev, &props);
+                    auto it = std::find_if(gpus.begin(), gpus.end(), [&props](const llama_device & d) {
+                        ggml_backend_dev_props d_props;
+                        ggml_backend_dev_get_props(d.dev, &d_props);
+                        if (props.device_id && d_props.device_id) {
+                            return strcmp(props.device_id, d_props.device_id) == 0;
                         }
-                        break;
+                        return false;
+                    });
+
+                    if (it != gpus.end()) {
+                        LLAMA_LOG_INFO("%s: skipping device %s (%s) with id %s - already using device %s (%s) with the same id\n",
+                                __func__,
+                                ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                                props.device_id ? props.device_id : "unknown id",
+                                ggml_backend_dev_name(it->dev), ggml_backend_dev_description(it->dev));
+                    } else {
+                        gpus.push_back({false, dev});
                     }
-
-                    case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        // igpus.empty() - workaround for integrated devices seen by multiple backends
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897
-                        // ggml_backend_dev_backend_reg - allow devices of the same backend regardless if integrated
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897#issuecomment-5264222997
-                        if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back().dev)) {
-                            igpus.push_back({false, dev});
-                        }
-                        break;
-                    case GGML_BACKEND_DEVICE_TYPE_META:
-                        GGML_ABORT("fatal error");
+                    break;
                 }
+
+                case GGML_BACKEND_DEVICE_TYPE_IGPU:
+                    // igpus.empty() - workaround for integrated devices seen by multiple backends
+                    // ref: https://github.com/ggml-org/llama.cpp/pull/23897
+                    // ggml_backend_dev_backend_reg - allow devices of the same backend regardless if integrated
+                    // ref: https://github.com/ggml-org/llama.cpp/pull/23897#issuecomment-5264222997
+                    if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back().dev)) {
+                        igpus.push_back({false, dev});
+                    }
+                    break;
+                case GGML_BACKEND_DEVICE_TYPE_META:
+                    GGML_ABORT("fatal error");
             }
         }
-
-        // add RPC servers at the front of the list to minimize network transfers
-        model->devices.insert(model->devices.begin(), rpc_servers.begin(), rpc_servers.end());
 
         // add GPUs
         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
 
         // add integrated GPUs only if no discrete GPUs were found
-        // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
         if (gpus.empty()) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
@@ -317,7 +255,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.lazy.mode = params.lazy_mode;
 
@@ -496,10 +434,22 @@ void llama_model_save_to_file(const struct llama_model * model, const char * pat
     ms.save(path_model);
 }
 
+void llama_model_save_with_meta(const struct llama_model * model, const struct gguf_context * meta, const char * path_model) {
+    gguf_context_ptr ctx(gguf_init_empty());
+    gguf_set_kv(ctx.get(), meta);
+    for (const auto & [name, t] : model->tensors_by_name) {
+        if (gguf_find_tensor(ctx.get(), name.c_str()) < 0) {
+            gguf_add_tensor(ctx.get(), t);
+        }
+    }
+    gguf_write_to_file(ctx.get(), path_model, false);
+}
+
 //
 // chat templates
 //
 
+// the built-in (non-jinja) templates are removed, chat templates go through the jinja engine in common
 int32_t llama_chat_apply_template(
                               const char * tmpl,
          const struct llama_chat_message * chat,
@@ -507,28 +457,19 @@ int32_t llama_chat_apply_template(
                                     bool   add_ass,
                                     char * buf,
                                  int32_t   length) {
-    const std::string curr_tmpl(tmpl == nullptr ? "chatml" : tmpl);
+    GGML_UNUSED(tmpl);
+    GGML_UNUSED(chat);
+    GGML_UNUSED(n_msg);
+    GGML_UNUSED(add_ass);
+    GGML_UNUSED(buf);
+    GGML_UNUSED(length);
+    return -1;
+}
 
-    // format the chat to string
-    std::vector<const llama_chat_message *> chat_vec;
-    chat_vec.resize(n_msg);
-    for (size_t i = 0; i < n_msg; i++) {
-        chat_vec[i] = &chat[i];
-    }
-
-    std::string formatted_chat;
-    llm_chat_template detected_tmpl = llm_chat_detect_template(curr_tmpl);
-    if (detected_tmpl == LLM_CHAT_TEMPLATE_UNKNOWN) {
-        return -1;
-    }
-    int32_t res = llm_chat_apply_template(detected_tmpl, chat_vec, formatted_chat, add_ass);
-    if (res < 0) {
-        return res;
-    }
-    if (buf && length > 0) {
-        strncpy(buf, formatted_chat.c_str(), length);
-    }
-    return res;
+int32_t llama_chat_builtin_templates(const char ** output, size_t len) {
+    GGML_UNUSED(output);
+    GGML_UNUSED(len);
+    return 0;
 }
 
 //

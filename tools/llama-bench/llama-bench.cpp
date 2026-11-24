@@ -173,28 +173,6 @@ static std::vector<ggml_backend_dev_t> parse_devices_arg(const std::string & val
     return devices;
 }
 
-static void register_rpc_server_list(const std::string & servers) {
-    auto rpc_servers = string_split<std::string>(servers, ',');
-    if (rpc_servers.empty()) {
-        throw std::invalid_argument("no RPC servers specified");
-    }
-
-    auto * rpc_reg = ggml_backend_reg_by_name("RPC");
-    if (!rpc_reg) {
-        throw std::invalid_argument("failed to find RPC backend");
-    }
-
-    using add_rpc_server_fn = ggml_backend_reg_t (*)(const char * endpoint);
-    auto * ggml_backend_rpc_add_server_fn = (add_rpc_server_fn) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
-    if (!ggml_backend_rpc_add_server_fn) {
-        throw std::invalid_argument("failed to find RPC add server function");
-    }
-    for (const auto & server : rpc_servers) {
-        auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
-        ggml_backend_register(reg);
-    }
-}
-
 static std::string devices_to_string(const std::vector<ggml_backend_dev_t> & devices) {
     if (devices.empty()) {
         return "auto";
@@ -264,8 +242,6 @@ static const char * split_mode_str(llama_split_mode mode) {
             return "layer";
         case LLAMA_SPLIT_MODE_ROW:
             return "row";
-        case LLAMA_SPLIT_MODE_TENSOR:
-            return "tensor";
         default:
             GGML_ABORT("invalid split mode");
     }
@@ -344,6 +320,7 @@ struct cmd_params {
     std::vector<int>                 n_depth;
     std::vector<int>                 n_batch;
     std::vector<int>                 n_ubatch;
+    std::vector<int>                 lh_cache; // LongHaul cache in MiB
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
     std::vector<int>                 n_threads;
@@ -390,6 +367,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_depth              */ { 0 },
     /* n_batch              */ { 2048 },
     /* n_ubatch             */ { 512 },
+    /* lh_cache             */ { 512 },
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { common_cpu_get_num_math() },
@@ -442,9 +420,6 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 0)\n");
-    if (llama_supports_rpc()) {
-        printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
-    }
     printf("\n");
     printf("test parameters:\n");
     printf("  -m, --model <filename>                            (default: %s)\n", join(cmd_params_defaults.model, ",").c_str());
@@ -464,6 +439,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+    printf("  -lhc, --longhaul-cache <size>                     LongHaul expert cache, e.g. 512M,1G (default: %sM)\n", join(cmd_params_defaults.lh_cache, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -472,7 +448,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+    printf("  -sm, --split-mode <none|layer|row>                (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
@@ -635,6 +611,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_ubatch.insert(params.n_ubatch.end(), p.begin(), p.end());
+            } else if (arg == "-lhc" || arg == "--longhaul-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                for (const auto & v : string_split<std::string>(argv[i], split_delim)) {
+                    const size_t bytes = string_parse_mem_size(v);
+                    if (bytes < 1024*1024 || bytes/(1024*1024) > INT_MAX) {
+                        throw std::invalid_argument("LongHaul cache size must be from 1 MiB: " + v);
+                    }
+                    params.lh_cache.push_back((int) (bytes/(1024*1024)));
+                }
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -738,18 +726,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
-            } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
-                if (++i >= argc) {
-                    invalid_param = true;
-                    break;
-                }
-                try {
-                    register_rpc_server_list(argv[i]);
-                } catch (const std::exception & e) {
-                    fprintf(stderr, "error: %s\n", e.what());
-                    invalid_param = true;
-                    break;
-                }
             } else if (arg == "-sm" || arg == "--split-mode") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -766,8 +742,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_SPLIT_MODE_LAYER;
                     } else if (m == "row") {
                         mode = LLAMA_SPLIT_MODE_ROW;
-                    } else if (m == "tensor") {
-                        mode = LLAMA_SPLIT_MODE_TENSOR;
                     } else {
                         invalid_param = true;
                         break;
@@ -1138,6 +1112,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_ubatch.empty()) {
         params.n_ubatch = cmd_params_defaults.n_ubatch;
     }
+    if (params.lh_cache.empty()) {
+        params.lh_cache = cmd_params_defaults.lh_cache;
+    }
     if (params.type_k.empty()) {
         params.type_k = cmd_params_defaults.type_k;
     }
@@ -1218,6 +1195,7 @@ struct cmd_params_instance {
     int                n_depth;
     int                n_batch;
     int                n_ubatch;
+    int                lh_cache;
     ggml_type          type_k;
     ggml_type          type_v;
     int                n_threads;
@@ -1311,6 +1289,7 @@ struct cmd_params_instance {
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
+        cparams.longhaul_cache_size = (size_t) lh_cache*1024*1024;
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
@@ -1346,6 +1325,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nopo : params.no_op_offload)
     for (const auto & nb : params.n_batch)
     for (const auto & nub : params.n_ubatch)
+    for (const auto & lhc : params.lh_cache)
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
@@ -1366,6 +1346,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
+                /* .lh_cache              = */ lhc,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1404,6 +1385,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
+                /* .lh_cache              = */ lhc,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1442,6 +1424,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
+                /* .lh_cache              = */ lhc,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1485,6 +1468,7 @@ struct test {
     uint64_t                 model_n_params;
     int                      n_batch;
     int                      n_ubatch;
+    int                      lh_cache;
     int                      n_threads;
     std::string              cpu_mask;
     bool                     cpu_strict;
@@ -1526,6 +1510,7 @@ struct test {
         model_n_params = llama_model_n_params(lmodel);
         n_batch        = inst.n_batch;
         n_ubatch       = inst.n_ubatch;
+        lh_cache       = inst.lh_cache;
         n_threads      = inst.n_threads;
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;
@@ -1578,22 +1563,12 @@ struct test {
 
     static std::string get_backend() {
         std::vector<std::string> backends;
-        bool                     rpc_used = false;
         for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
             auto *      reg  = ggml_backend_reg_get(i);
             std::string name = ggml_backend_reg_name(reg);
-            if (string_starts_with(name, "RPC")) {
-                if (ggml_backend_reg_dev_count(reg) > 0) {
-                    rpc_used = true;
-                }
-            } else {
-                if (name != "CPU") {
-                    backends.push_back(ggml_backend_reg_name(reg));
-                }
+            if (name != "CPU") {
+                backends.push_back(name);
             }
-        }
-        if (rpc_used) {
-            backends.push_back("RPC");
         }
         return backends.empty() ? "CPU" : join(backends, ",");
     }
@@ -1602,7 +1577,7 @@ struct test {
         static const std::vector<std::string> fields = {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
-            "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
+            "n_ubatch",       "lh_cache",       "n_threads",     "cpu_mask",       "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
@@ -1617,7 +1592,7 @@ struct test {
     enum field_type { STRING, BOOL, INT, FLOAT };
 
     static field_type get_field_type(const std::string & field) {
-        if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
+        if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "lh_cache" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
@@ -1685,6 +1660,7 @@ struct test {
                                             std::to_string(model_n_params),
                                             std::to_string(n_batch),
                                             std::to_string(n_ubatch),
+                                            std::to_string(lh_cache),
                                             std::to_string(n_threads),
                                             cpu_mask,
                                             std::to_string(cpu_strict),
@@ -1875,6 +1851,9 @@ struct markdown_printer : public printer {
         if (field == "n_ubatch") {
             return 8;
         }
+        if (field == "lh_cache") {
+            return 8;
+        }
         if (field == "type_k" || field == "type_v") {
             return 6;
         }
@@ -1967,8 +1946,7 @@ struct markdown_printer : public printer {
         fields.emplace_back("params");
         fields.emplace_back("backend");
         bool is_cpu_backend = test::get_backend().find("CPU") != std::string::npos ||
-                              test::get_backend().find("BLAS") != std::string::npos ||
-                              test::get_backend().find("ZenDNN") != std::string::npos;
+                              test::get_backend().find("BLAS") != std::string::npos;
         if (!is_cpu_backend) {
             fields.emplace_back("n_gpu_layers");
         }
@@ -1992,6 +1970,9 @@ struct markdown_printer : public printer {
         }
         if (params.n_ubatch.size() > 1 || params.n_ubatch != cmd_params_defaults.n_ubatch) {
             fields.emplace_back("n_ubatch");
+        }
+        if (params.lh_cache.size() > 1 || params.lh_cache != cmd_params_defaults.lh_cache) {
+            fields.emplace_back("lh_cache");
         }
         if (params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {
             fields.emplace_back("type_k");

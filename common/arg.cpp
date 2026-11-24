@@ -38,7 +38,6 @@ static std::initializer_list<enum llama_example> mmproj_examples = {
     LLAMA_EXAMPLE_MTMD,
     LLAMA_EXAMPLE_SERVER,
     LLAMA_EXAMPLE_CLI,
-    LLAMA_EXAMPLE_TTS,
 };
 
 static std::string read_file(const std::string & fname) {
@@ -267,17 +266,6 @@ static std::string clean_file_name(const std::string & fname) {
     return clean_fname;
 }
 
-struct handle_model_result {
-    bool found_mmproj = false;
-    common_params_model mmproj;
-
-    bool found_mtp = false;
-    common_params_model mtp;
-
-    bool found_preset = false;
-    std::string preset_path;
-};
-
 const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_F32,
     GGML_TYPE_F16,
@@ -341,25 +329,9 @@ common_models_handler common_models_handler_init(const common_params & params, l
     common_download_hf_plan plan_spec;
     common_download_opts opts;
 
-    const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
-                                        params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-
     const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
-
-    const bool spec_type_draft_dflash2 = std::find(params.speculative.types.begin(),
-                                            params.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2) != params.speculative.types.end();
-
-    const bool spec_type_draft_lilicorr = std::find(params.speculative.types.begin(),
-                                             params.speculative.types.end(),
-                                             COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR) != params.speculative.types.end();
-
-    const bool spec_type_draft_eagle3 = std::find(params.speculative.types.begin(),
-                                           params.speculative.types.end(),
-                                           COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params.speculative.types.end();
 
     const bool spec_type_draft_dspark = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -379,9 +351,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
 
     opts.bearer_token    = params.hf_token;
     opts.offline         = params.offline;
-    opts.download_mtp    = spec_type_draft_mtp;
-    opts.download_eagle3 = spec_type_draft_eagle3;
-    opts.download_dflash = spec_type_draft_dflash || spec_type_draft_dflash2 || spec_type_draft_lilicorr;
+    opts.download_dflash = spec_type_draft_dflash;
     opts.download_dspark = spec_type_draft_dspark;
     opts.download_mmproj = use_mmproj && !params.no_mmproj
                         && params.mmproj.path.empty() && params.mmproj.url.empty();
@@ -394,9 +364,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
         // without a requested type, discover every sidecar the draft repo ships to infer the type later
         auto opts_spec = opts;
         if (spec_types_is_default(params)) {
-            opts_spec.download_mtp    = true;
             opts_spec.download_dflash = true;
-            opts_spec.download_eagle3 = true;
             opts_spec.download_dspark = true;
         }
         plan_spec = common_download_get_hf_plan(params.speculative.draft.mparams, opts_spec);
@@ -550,29 +518,18 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 
     // an explicit draft file selection (e.g. -md with -hfd) disables the sidecar resolution of the draft repo
     if (!params.speculative.draft.mparams.hf_file.empty()) {
-        plan_spec.mtp    = {};
         plan_spec.dflash = {};
-        plan_spec.eagle3 = {};
         plan_spec.dspark = {};
     }
 
     // infer the speculative type from the sidecar shipped by the draft repo when none is requested
     if (spec_types_is_default(params)) {
-        if (!plan_spec.mtp.local_path.empty()) {
-            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-            plan_spec.dspark = {};
-            plan_spec.dflash = {};
-            plan_spec.eagle3 = {};
-        } else if (!plan_spec.dspark.local_path.empty()) {
+        if (!plan_spec.dspark.local_path.empty()) {
             // dspark outranks dflash, its sidecar carries the extra Markov head
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
             plan_spec.dflash = {};
-            plan_spec.eagle3 = {};
         } else if (!plan_spec.dflash.local_path.empty()) {
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
-            plan_spec.eagle3 = {};
-        } else if (!plan_spec.eagle3.local_path.empty()) {
-            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 };
         }
     }
 
@@ -586,20 +543,8 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     }
 
     // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
-    const bool spec_sidecar_found = !plan_spec.mtp.local_path.empty() ||
-                                    !plan_spec.dflash.local_path.empty() ||
-                                    !plan_spec.eagle3.local_path.empty() ||
+    const bool spec_sidecar_found = !plan_spec.dflash.local_path.empty() ||
                                     !plan_spec.dspark.local_path.empty();
-    if (!plan_spec.mtp.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan_spec.mtp, opts, [&]() {
-            // only use the discovered MTP head when no draft path is set yet
-            if (params.speculative.draft.mparams.path.empty()) {
-                params.speculative.draft.mparams.path = finalize(plan_spec.mtp);
-            } else {
-                finalize(plan_spec.mtp);
-            }
-        });
-    }
     if (!plan_spec.dflash.local_path.empty() && !had_spec_url) {
         tasks.emplace_back(plan_spec.dflash, opts, [&]() {
             // only use the discovered DFlash sidecar when no draft path is set yet
@@ -607,16 +552,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
                 params.speculative.draft.mparams.path = finalize(plan_spec.dflash);
             } else {
                 finalize(plan_spec.dflash);
-            }
-        });
-    }
-    if (!plan_spec.eagle3.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan_spec.eagle3, opts, [&]() {
-            // only use the discovered Eagle3 sidecar when no draft path is set yet
-            if (params.speculative.draft.mparams.path.empty()) {
-                params.speculative.draft.mparams.path = finalize(plan_spec.eagle3);
-            } else {
-                finalize(plan_spec.eagle3);
             }
         });
     }
@@ -650,16 +585,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             params.mmproj.path = finalize(plan.mmproj);
         });
     }
-    if (!plan.mtp.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan.mtp, opts, [&]() {
-            // only fall back to the discovered MTP head when no draft was explicitly provided
-            if (params.speculative.draft.mparams.empty()) {
-                params.speculative.draft.mparams.path = finalize(plan.mtp);
-            } else {
-                finalize(plan.mtp);
-            }
-        });
-    }
     if (!plan.dflash.local_path.empty() && !had_spec_url) {
         tasks.emplace_back(plan.dflash, opts, [&]() {
             // only fall back to the discovered DFlash sidecar when no draft was explicitly provided
@@ -667,16 +592,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
                 params.speculative.draft.mparams.path = finalize(plan.dflash);
             } else {
                 finalize(plan.dflash);
-            }
-        });
-    }
-    if (!plan.eagle3.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan.eagle3, opts, [&]() {
-            // only fall back to the discovered Eagle3 sidecar when no draft was explicitly provided
-            if (params.speculative.draft.mparams.empty()) {
-                params.speculative.draft.mparams.path = finalize(plan.eagle3);
-            } else {
-                finalize(plan.eagle3);
             }
         });
     }
@@ -974,7 +889,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::runtime_error(string_format(
             "error: the supplied chat template is not supported: %s%s\n",
             params.chat_template.c_str(),
-            params.use_jinja ? "" : "\nnote: llama.cpp was started without --jinja, we only support commonly used templates"
+            params.use_jinja ? "" : "\nnote: llama.cpp was started without --jinja, chat templates need --jinja"
         ));
     }
 
@@ -1089,10 +1004,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-bench",
         "llama-cli",
         "llama-completion",
-        "llama-convert-llama2c-to-ggml",
-        "llama-cvector-generator",
         "llama-debug",
-        "llama-diffusion-cli",
         "llama-embedding",
         "llama-eval-callback",
         "llama-export-lora",
@@ -1116,19 +1028,15 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-parallel",
         "llama-passkey",
         "llama-perplexity",
-        "llama-q8dot",
         "llama-quantize",
         "llama-qwen2vl-cli",
         "llama-retrieval",
         "llama-save-load-state",
         "llama-server",
         "llama-simple",
-        "llama-simple-chat",
         "llama-speculative",
         "llama-speculative-simple",
-        "llama-tokenize",
-        "llama-tts",
-        "llama-vdot"
+        "llama-tokenize"
     };
 
     for (const auto& exe : executables) {
@@ -1180,27 +1088,6 @@ void common_print_available_devices() {
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
         printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / MiB, free / MiB);
-    }
-}
-
-static void add_rpc_devices(const std::string & servers) {
-    auto rpc_servers = string_split<std::string>(servers, ',');
-    if (rpc_servers.empty()) {
-        throw std::invalid_argument("no RPC servers specified");
-    }
-    ggml_backend_load_all();
-    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
-    if (!rpc_reg) {
-        throw std::invalid_argument("failed to find RPC backend");
-    }
-    typedef ggml_backend_reg_t (*ggml_backend_rpc_add_server_t)(const char * endpoint);
-    ggml_backend_rpc_add_server_t ggml_backend_rpc_add_server_fn = (ggml_backend_rpc_add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
-    if (!ggml_backend_rpc_add_server_fn) {
-        throw std::invalid_argument("failed to find RPC add server function");
-    }
-    for (const auto & server : rpc_servers) {
-        auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
-        ggml_backend_register(reg);
     }
 }
 
@@ -1302,18 +1189,6 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
     return true;
 }
 
-static std::string list_builtin_chat_templates() {
-    std::vector<const char *> supported_tmpl;
-    int32_t res = llama_chat_builtin_templates(nullptr, 0);
-    supported_tmpl.resize(res);
-    res = llama_chat_builtin_templates(supported_tmpl.data(), supported_tmpl.size());
-    std::ostringstream msg;
-    for (auto & tmpl : supported_tmpl) {
-        msg << tmpl << (&tmpl == &supported_tmpl.back() ? "" : ", ");
-    }
-    return msg.str();
-}
-
 bool common_arg_utils::is_truthy(const std::string & value) {
     return value == "on" || value == "enabled" || value == "true" || value == "1";
 }
@@ -1386,10 +1261,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         params.n_parallel = -1;     // auto by default
     } else if (ex == LLAMA_EXAMPLE_TOKENIZE) {
         params.parse_special = true; // parse special tokens by default, like the old tokenize tool
-    } else if (ex == LLAMA_EXAMPLE_TTS) {
-        params.out_file = "output.wav";
-        params.sampling.penalty_repeat = 1.05f;
-        params.sampling.penalty_last_n = -1;
     }
 
     params.use_color = tty_can_use_colors();
@@ -2581,7 +2452,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
-        // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",
@@ -2652,17 +2522,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FFMPEG_DIR"));
     add_opt(common_arg(
-        {"--rpc"}, "SERVERS",
-        "comma-separated list of RPC servers (host:port)",
-        [](common_params & params, const std::string & value) {
-            if (!llama_supports_rpc()) {
-                throw std::invalid_argument("RPC not supported in this build");
-            }
-            add_rpc_devices(value);
-            GGML_UNUSED(params);
-        }
-    ).set_env("LLAMA_ARG_RPC"));
-    add_opt(common_arg(
         {"-lm", "--load-mode"}, "MODE",
         "model loading mode (default: auto)\n"
         "- auto: mmap, unless a device does not support it\n"
@@ -2732,47 +2591,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
-        {"-cmoe", "--cpu-moe"},
-        "keep all Mixture of Experts (MoE) weights in the CPU",
-        [](common_params & params) {
-            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
-        }
-    ).set_env("LLAMA_ARG_CPU_MOE"));
-    add_opt(common_arg(
-        {"-ncmoe", "--n-cpu-moe"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
-            llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
-        }
-    ).set_env("LLAMA_ARG_N_CPU_MOE"));
-    add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
-            params.moe_cache_size = (size_t) value*1024*1024;
-        }
-    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
-    add_opt(common_arg(
-        {"--moe-cache-cpu-share"}, "F",
-        string_format("share of the MoE cache misses that the CPU computes from the host experts instead of uploading them to the GPU once the cache is full, from 0 to 1 (default: %.2f)", (double) params.moe_cache_cpu_share),
+        {"-lhc", "--longhaul-cache"}, "SIZE",
+        string_format("LongHaul: RAM cache for the MoE experts, which stay on disk; a number in MiB or with a K, M or G suffix, e.g. 512M, 1G, 2G (default: %zuM)\n"
+        "a larger cache gives faster generation and prompt processing", params.longhaul_cache_size/(1024*1024)),
         [](common_params & params, const std::string & value) {
-            const float share = std::stof(value);
-            if (share < 0.0f || share > 1.0f) {
-                throw std::invalid_argument("invalid value");
-            }
-            params.moe_cache_cpu_share = share;
+            params.longhaul_cache_size = string_parse_mem_size(value);
         }
-    ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
+    ).set_env("LLAMA_ARG_LONGHAUL_CACHE"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
-        "(dense models; for MoE expert weights use --n-cpu-moe)",
+        "(dense models; MoE experts always stay on disk, see --longhaul-cache)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -2800,12 +2629,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
+        {"-sm", "--split-mode"}, "{none,layer,row}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
-        "- row: split weight across GPUs by rows (parallelized)\n"
-        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
+        "- row: split weight across GPUs by rows (parallelized)",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -2813,8 +2641,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_LAYER;
             } else if (value == "row") {
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
-            } else if (value == "tensor") {
-                params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
             } else {
                 throw std::invalid_argument("invalid value");
             }
@@ -2973,37 +2799,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         // we define this arg on both COMMON and EXPORT_LORA, so when showing help message of export-lora, it will be categorized as "example-specific" arg
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
     add_opt(common_arg(
-        {"--control-vector"}, "FNAME",
-        "add a control vector\nnote: use comma-separated values to add multiple control vectors",
-        [](common_params & params, const std::string & value) {
-            for (const auto & item : parse_csv_row(value)) {
-                params.control_vectors.push_back({ 1.0f, item, });
-            }
-        }
-    ));
-    add_opt(common_arg(
-        {"--control-vector-scaled"}, "FNAME:SCALE,...",
-        "add a control vector with user defined scaling SCALE\n"
-        "note: use comma-separated values (format: FNAME:SCALE,...)",
-        [](common_params & params, const std::string & value) {
-            for (const auto & item : parse_csv_row(value)) {
-                auto parts = string_split<std::string>(item, ':');
-                if (parts.size() != 2) {
-                    throw std::invalid_argument("control-vector-scaled format: FNAME:SCALE");
-                }
-                params.control_vectors.push_back({ std::stof(parts[1]), parts[0] });
-            }
-        }
-    ));
-    add_opt(common_arg(
-        {"--control-vector-layer-range"}, "START", "END",
-        "layer range to apply the control vector(s) to, start and end inclusive",
-        [](common_params & params, const std::string & start, const std::string & end) {
-            params.control_vector_layer_start = std::stoi(start);
-            params.control_vector_layer_end = std::stoi(end);
-        }
-    ));
-    add_opt(common_arg(
         {"-a", "--alias"}, "STRING",
         "set model name aliases, comma-separated (to be used by API)",
         [](common_params & params, const std::string & value) {
@@ -3087,24 +2882,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("HF_TOKEN"));
     add_opt(common_arg(
-        {"--mtp"},
-        "also download the multi-token prediction (MTP) head, if available (default: unused)",
-        [](common_params & params) {
-            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
-        }
-    ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
-    add_opt(common_arg(
         {"--dflash"},
         "also download the DFlash sidecar, if available (default: unused)",
         [](common_params & params) {
             params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
-        }
-    ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
-    add_opt(common_arg(
-        {"--eagle3"},
-        "also download the Eagle3 sidecar, if available (default: unused)",
-        [](common_params & params) {
-            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3);
         }
     ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
     add_opt(common_arg(
@@ -3154,7 +2935,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.out_file = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_CVECTOR_GENERATOR, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_FINETUNE,
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_FINETUNE,
                     LLAMA_EXAMPLE_RESULTS, LLAMA_EXAMPLE_EXPORT_GRAPH_OPS, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-ofreq", "--output-frequency"}, "N",
@@ -3184,13 +2965,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("collect data for the output tensor (default: %s)", params.process_output ? "true" : "false"),
         [](common_params & params) {
             params.process_output = true;
-        }
-    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
-    add_opt(common_arg(
-        {"--nextn"},
-        string_format("collect data for MTP/NextN layers (default: %s)", params.load_mtp ? "true" : "false"),
-        [](common_params & params) {
-            params.load_mtp = true;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
@@ -3811,24 +3585,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PRESERVE"));
     add_opt(common_arg(
         {"--chat-template"}, "JINJA_TEMPLATE",
-        string_format(
-            "set custom jinja chat template (default: template taken from model's metadata)\n"
-            "if suffix/prefix are specified, template will be disabled\n"
-            "only commonly used templates are accepted (unless --jinja is set before this flag):\n"
-            "list of built-in templates:\n%s", list_builtin_chat_templates().c_str()
-        ),
+        "set custom jinja chat template (default: template taken from model's metadata)\n"
+        "if suffix/prefix are specified, template will be disabled\n"
+        "'chatml' selects a ChatML jinja template\n"
+        "needs --jinja (there are no built-in non-jinja templates)",
         [](common_params & params, const std::string & value) {
             params.chat_template = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
     add_opt(common_arg(
         {"--chat-template-file"}, "JINJA_TEMPLATE_FILE",
-        string_format(
-            "set custom jinja chat template file (default: template taken from model's metadata)\n"
-            "if suffix/prefix are specified, template will be disabled\n"
-            "only commonly used templates are accepted (unless --jinja is set before this flag):\n"
-            "list of built-in templates:\n%s", list_builtin_chat_templates().c_str()
-        ),
+        "set custom jinja chat template file (default: template taken from model's metadata)\n"
+        "if suffix/prefix are specified, template will be disabled\n"
+        "needs --jinja (there are no built-in non-jinja templates)",
         [](common_params & params, const std::string & value) {
             params.chat_template = read_file(value);
         }
@@ -3886,43 +3655,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.simple_io = true;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg(
-        {"--positive-file"}, "FNAME",
-        string_format("positive prompts file, one prompt per line (default: '%s')", params.cvector_positive_file.c_str()),
-        [](common_params & params, const std::string & value) {
-            params.cvector_positive_file = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
-    add_opt(common_arg(
-        {"--negative-file"}, "FNAME",
-        string_format("negative prompts file, one prompt per line (default: '%s')", params.cvector_negative_file.c_str()),
-        [](common_params & params, const std::string & value) {
-            params.cvector_negative_file = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
-    add_opt(common_arg(
-        {"--pca-batch"}, "N",
-        string_format("batch size used for PCA. Larger batch runs faster, but uses more memory (default: %d)", params.n_pca_batch),
-        [](common_params & params, int value) {
-            params.n_pca_batch = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
-    add_opt(common_arg(
-        {"--pca-iter"}, "N",
-        string_format("number of iterations used for PCA (default: %d)", params.n_pca_iterations),
-        [](common_params & params, int value) {
-            params.n_pca_iterations = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
-    add_opt(common_arg(
-        {"--method"}, "{pca, mean}",
-        "dimensionality reduction method to be used (default: pca)",
-        [](common_params & params, const std::string & value) {
-            /**/ if (value == "pca") { params.cvector_dimre_method = DIMRE_METHOD_PCA; }
-            else if (value == "mean") { params.cvector_dimre_method = DIMRE_METHOD_MEAN; }
-            else { throw std::invalid_argument("invalid value"); }
-        }
-    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
     add_opt(common_arg(
         {"--output-format"}, "{md,jsonl}",
         "output format for batched-bench results (default: md)",
@@ -4181,23 +3913,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.speculative.draft.tensor_buft_overrides);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg(
-        {"--spec-draft-cpu-moe", "-cmoed", "--cpu-moe-draft"},
-        "keep all Mixture of Experts (MoE) weights in the CPU for the draft model",
-        [](common_params & params) {
-            params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
-    add_opt(common_arg(
-        {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
-            llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
@@ -4332,7 +4047,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.path = value;
             params.speculative.draft.mparams.hf_file = value; // will be used if --spec-draft-hf is set
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_IMATRIX}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
@@ -4513,35 +4228,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--tts-lang"}, "FNAME",
-        "language (ISO 639-1) for audio generation\n"
-        "see docs/multimodal/tts.md for per-model usage notes",
+        "language (ISO 639-1) for audio generation",
         [](common_params & params, const std::string & value) {
             params.tts_lang = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--tts-voice"}, "VOICE",
-        "voice for audio generation (model-dependent)\n"
-        "see docs/multimodal/tts.md for per-model usage notes",
+        "voice for audio generation (model-dependent)",
         [](common_params & params, const std::string & value) {
             params.tts_voice = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--tts-speaker-file"}, "FNAME",
-        "speaker file path for audio generation",
-        [](common_params & params, const std::string & value) {
-            params.tts_speaker_file = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_TTS}));
-    add_opt(common_arg(
-        {"--tts-speaker-text"}, "TEXT",
-        "transcript of --tts-speaker-file, for models that need it to clone the voice\n"
-        "see docs/multimodal/tts.md for per-model usage notes",
-        [](common_params & params, const std::string & value) {
-            params.tts_speaker_text = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
 
     //
     // diffusion params

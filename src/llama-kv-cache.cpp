@@ -160,8 +160,6 @@ llama_kv_cache::llama_kv_cache(
                 __func__, hparams.n_embd_v_gqa_max());
     }
 
-    const bool is_mla = hparams.is_mla();
-
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -197,12 +195,10 @@ llama_kv_cache::llama_kv_cache(
             n_embd_head_k_all = -1;
         }
 
-        if (!is_mla) {
-            if (n_embd_head_v_all == 0) {
-                n_embd_head_v_all = (int32_t) hparams.n_embd_head_v(il);
-            } else if (n_embd_head_v_all > 0 && n_embd_head_v_all != (int32_t) hparams.n_embd_head_v(il)) {
-                n_embd_head_v_all = -1;
-            }
+        if (n_embd_head_v_all == 0) {
+            n_embd_head_v_all = (int32_t) hparams.n_embd_head_v(il);
+        } else if (n_embd_head_v_all > 0 && n_embd_head_v_all != (int32_t) hparams.n_embd_head_v(il)) {
+            n_embd_head_v_all = -1;
         }
 
         // [TAG_V_CACHE_VARIABLE]
@@ -228,7 +224,7 @@ llama_kv_cache::llama_kv_cache(
         }
 
         const bool has_k = true;
-        const bool has_v = !is_mla;
+        const bool has_v = true;
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
@@ -308,16 +304,11 @@ llama_kv_cache::llama_kv_cache(
                     model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
         }
 
-        bool attn_rot_k =
+        const bool attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
-
-        // always create Hadamard rotation tensors for lightning indexer keys
-        if (model.lid_k_hdmd() && hparams.n_embd_head_k_full == hparams.indexer_head_size) {
-            attn_rot_k = true;
-        }
 
         const bool attn_rot_v =
             !attn_rot_disable &&
@@ -1167,7 +1158,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             cells.pos_set(idx, ubatch.pos[i]);
 
-            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
+            if (ubatch.is_pos_2d() || ubatch.token) {
                 llama_kv_cell_ext ext;
 
                 if (ubatch.is_pos_2d()) {
@@ -1179,10 +1170,6 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 if (!is_embd) {
                     ext.tok = ubatch.token[i];
-                } else if (hparams.ple_n_heads > 0) {
-                    // embd batch (multimodal input) has no token ids, need to pad it with the correct ID for PLE layers
-                    // TODO @ngxson : check if we can do the same as gemma 3n / gemma 4
-                    ext.tok = hparams.ple_embd_token;
                 }
 
                 cells.ext_set(idx, ext);
@@ -1223,10 +1210,6 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
-    if (model.arch == LLM_ARCH_STEP35) {
-        return false;
-    }
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
@@ -1698,7 +1681,7 @@ struct args_set_input_attn_mask {
     bool block_uniform;
 };
 
-template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
+template<typename T, bool causal, bool swa, bool is_2d>
 static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * data) {
   //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
@@ -1763,27 +1746,24 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
             // the only cells that could change are the ones that are with similar positions as the
             //   ones in the batch (i.e. due to causal masking, SWA, etc.)
             // keep track of those cells and shortcut the loop to save time
-            // note: this optimization is not compatible with Alibi position encoding
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
             bool prev = false;
 
             auto & idxs = seq_idxs[seq_id];
 
-            if (!alibi) {
-                if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
+            if (seq_srct.find(seq_id) != seq_srct.end()) {
+                const uint32_t srct = seq_srct[seq_id];
 
-                    const uint64_t idst_prev = n_kv*srct;
+                const uint64_t idst_prev = n_kv*srct;
 
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
+                std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
 
-                    prev = true;
-                } else {
-                    idxs.clear();
-                    idxs.reserve(ubatch->n_tokens + n_swa + 32);
+                prev = true;
+            } else {
+                idxs.clear();
+                idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
-                    seq_srct[seq_id] = i;
-                }
+                seq_srct[seq_id] = i;
             }
 
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
@@ -1791,14 +1771,12 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
                 uint32_t c = jj;
 
                 // we have an exiting mask for this sequence -> update just seq_idxs
-                if (!alibi) {
-                    if (prev) {
-                        if (jj >= idxs.size()) {
-                            break;
-                        }
-
-                        c = idxs[jj];
+                if (prev) {
+                    if (jj >= idxs.size()) {
+                        break;
                     }
+
+                    c = idxs[jj];
                 }
 
                 // cell of the column, negative for padding
@@ -1815,12 +1793,10 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
 
                 p0 = cells.pos_get(j);
 
-                if (!alibi) {
-                    if (!prev) {
-                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
-                            idxs.push_back(c);
-                        }
+                if (!prev) {
+                    // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
+                    if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                        idxs.push_back(c);
                     }
                 }
 
@@ -1844,34 +1820,18 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
 
                 // apply SWA if any
                 if (swa) {
-                    // see llama_non_causal_type
-                    const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
-                    if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
                         goto skip;
                     }
                 }
 
-                if (alibi) {
-                    data[idst + c] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
-                } else {
-                    data[idst + c] = mask_keep;
-                }
+                data[idst + c] = mask_keep;
 
                 continue;
 skip:
                 data[idst + c] = mask_drop;
             }
         }
-    }
-}
-
-template<typename T, bool causal, bool swa, bool is_2d>
-static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * data) {
-    const bool alibi = args.hparams.use_alibi;
-    if (alibi) {
-        set_input_attn_mask_impl<T, causal, swa, is_2d, true> (args, data);
-    } else {
-        set_input_attn_mask_impl<T, causal, swa, is_2d, false>(args, data);
     }
 }
 
@@ -1940,15 +1900,6 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
         // n_tps == n_tokens_per_stream
         const int64_t n_tps = n_tokens/n_stream;
 
-        // see llama_non_causal_type
-        // only the SWA cache (or the SWA layers of a single cache) become non-causal
-        if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
-            causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
-        }
-        if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY) {
-            causal_attn = swa_type != LLAMA_SWA_TYPE_NONE;
-        }
-
         //const int64_t t_start = ggml_time_us();
 
         const args_set_input_attn_mask args = {
@@ -1977,34 +1928,9 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
     }
 }
 
-void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    const int64_t n_tokens = ubatch->n_tokens;
-
-    GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
-    const auto & cells = v_cells[0];
-
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
-
-    int32_t * data = (int32_t *) dst->data;
-
-    const int32_t n_kv = dst->ne[0];
-
-    for (int h = 0; h < 1; ++h) {
-        for (int i = 0; i < n_tokens; ++i) {
-            for (int j = 0; j < n_kv; ++j) {
-                // the position when the cells is empty is irrelevant - it will be masked out later in the attention
-                const llama_pos p0 = cells.is_empty(j) ? -1 : cells.pos_get(j);
-
-                data[h*(n_kv*n_tokens) + i*n_kv + j] = llama_relative_position_bucket(p0, ubatch->pos[i], hparams.n_rel_attn_bkts, false);
-            }
-        }
-    }
-}
-
 bool llama_kv_cache::has_cell_ext() const {
-    // M-RoPE needs the 2D position, the PLE / Engram n-gram hashes need the token id
-    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+    // M-RoPE needs the 2D position
+    return hparams.n_pos_per_embd() > 1;
 }
 
 void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
@@ -3118,10 +3044,6 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_attn_mask(attn_mask, ubatch, causal_attn);
-}
-
-void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    kv->set_input_pos_bucket(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {

@@ -68,6 +68,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_LONGHAUL        = 1 << 6; // keep on disk, the LongHaul expert cache reads it; requires mmap
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -80,7 +81,6 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool no_alloc;
-    bool load_mtp;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -90,7 +90,8 @@ struct llama_model_loader {
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+        // a LongHaul tensor is always mapped, whatever the mode and size
+        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool longhaul = false);
 
         bool any() const {
             return !ranges.empty();
@@ -98,6 +99,10 @@ struct llama_model_loader {
 
         bool has(const ggml_tensor * t) const {
             return tensors.count(ggml_get_name(t)) > 0;
+        }
+
+        bool is_longhaul(const ggml_tensor * t) const {
+            return longhaul.count(ggml_get_name(t)) > 0;
         }
 
         const llama_mmap::ranges & for_file(uint32_t idx) const {
@@ -113,6 +118,7 @@ struct llama_model_loader {
     private:
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
+        std::set<std::string>                  longhaul;
     } lazy;
 
     llama_files files;
@@ -179,7 +185,6 @@ struct llama_model_loader {
         llama_load_mode load_mode,
         bool check_tensors,
         bool no_alloc,
-        bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 

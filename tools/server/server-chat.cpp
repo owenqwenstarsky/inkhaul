@@ -719,7 +719,6 @@ json server_chat_msg_diff_to_json_oaicompat(const common_chat_msg_diff & diff) {
 
 json convert_transcriptions_to_chatcmpl(
         const json & inp_body,
-        const common_chat_templates * tmpls,
         const std::map<std::string, uploaded_file> & in_files,
         std::vector<raw_buffer> & out_files) {
     // TODO @ngxson : this function may need to be improved in the future
@@ -739,27 +738,15 @@ json convert_transcriptions_to_chatcmpl(
     if (response_format != "json") {
         throw std::invalid_argument("Only 'json' response_format is supported for transcription");
     }
-    common_chat_prompt_preset preset = common_chat_get_asr_prompt(tmpls, language, 0.0, prompt);
-    if (preset.needs_audio_length) {
-        mtmd_helper_media_meta meta;
-        if (mtmd_helper_get_media_meta(out_files[0].data(), out_files[0].size(), mtmd_helper_init_opt_default(), &meta) != 0 ||
-                meta.type != MTMD_HELPER_MEDIA_TYPE_AUDIO || meta.duration < 0) {
-            throw std::invalid_argument("the input file is not a supported audio file");
-        }
-        preset = common_chat_get_asr_prompt(tmpls, language, meta.duration, prompt);
+    if (prompt.empty()) {
+        prompt = SERVER_ASR_DEFAULT_PROMPT;
     }
-    if (prompt.empty() || preset.has_context) {
-        prompt = preset.user;
-    }
-    if (!language.empty() && !preset.has_language) {
+    if (!language.empty()) {
         prompt += string_format(" (language: %s)", language.c_str());
     }
-    prompt = preset.media_first ? get_media_marker() + prompt : prompt + get_media_marker();
+    prompt += get_media_marker();
 
     json messages = json::array();
-    if (!preset.system.empty()) {
-        messages.push_back({{"role", "system"}, {"content", preset.system}});
-    }
     messages.push_back({{"role", "user"}, {"content", prompt}});
 
     json chatcmpl_body = inp_body; // copy all fields

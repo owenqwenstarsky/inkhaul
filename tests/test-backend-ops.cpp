@@ -504,28 +504,6 @@ static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
-static bool backend_has_feature(ggml_backend_t backend, const char * feature_name) {
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-
-    auto get_features = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
-    if (!get_features) {
-        return false;
-    }
-
-    const ggml_backend_feature * features = get_features(reg);
-    if (!features) {
-        return false;
-    }
-
-    for (const ggml_backend_feature * f = features; f->name; ++f) {
-        if (strcmp(f->name, feature_name) == 0 && strcmp(f->value, "1") == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 enum test_mode {
     MODE_TEST,
     MODE_PERF,
@@ -1223,29 +1201,6 @@ static bool op_filter_entry_matches(std::string_view entry, std::string_view op_
     return std::regex_search(op_name.data(), op_name.data() + op_name.size(), re);
 }
 
-// TODO: [TAG_MUL_MAT_ID_SKIP] see https://github.com/ggml-org/llama.cpp/pull/26631
-static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) {
-    const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
-    if (strcmp(name, "CUDA") != 0 && strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0) {
-        return false;
-    }
-    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-        const ggml_tensor * node = ggml_graph_node(gf, i);
-        if (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_ADD_ID) {
-            continue;
-        }
-        const ggml_tensor * ids = node->src[2];
-        std::vector<int32_t> row(ids->ne[0]);
-        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
-            ggml_backend_tensor_get(ids, row.data(), i1*ids->nb[1], ids->ne[0]*sizeof(int32_t));
-            if (std::find(row.begin(), row.end(), -1) != row.end()) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 struct test_case {
     virtual ~test_case() {}
 
@@ -1268,11 +1223,7 @@ struct test_case {
     }
 
     virtual double max_nmse_err(ggml_backend_t backend) {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        // See https://github.com/ggml-org/llama.cpp/pull/22976 for explanation.
-        if (contains_f16 && strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
-            return std::max(max_nmse_err(), 1e-6);
-        }
+        GGML_UNUSED(backend);
         return max_nmse_err();
     }
 
@@ -1367,19 +1318,6 @@ struct test_case {
     std::vector<ggml_tensor *> sentinels;
 
     std::string current_op_name;
-    bool contains_f16 = false;
-
-    // Used by the WebGPU backend to relax error thresholds on ops on f16 tensors
-    void check_for_f16_tensor(ggml_context * ctx) {
-        contains_f16 = false;
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_F16) {
-                contains_f16 = true;
-                break;
-            }
-        }
-    }
-
     void add_sentinel(ggml_context * ctx) {
         if (mode == MODE_PERF || mode == MODE_GRAD || mode == MODE_SUPPORT) {
             return;
@@ -1469,7 +1407,6 @@ struct test_case {
 
         ggml_tensor * out = build_graph(ctx.get(), ctx_weights.get());
         current_op_name   = op_desc(out);
-        check_for_f16_tensor(ctx.get());
 
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
@@ -1537,13 +1474,6 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
-        }
-
-        // TODO: [TAG_MUL_MAT_ID_SKIP] @ngxson : remove this once CUDA implements mul_mat_id with -1 = skipped
-        if (backend_lacks_skipped_ids(backend1, gf)) {
-            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", false, false, "not supported");
-            print_test_result_locked(output_printer, result);
-            return test_status_t::NOT_SUPPORTED;
         }
 
         // compare
@@ -2871,19 +2801,6 @@ struct test_set_rows : public test_case {
         return 1e-7;
     }
 
-    // See dicussion here: https://github.com/ggml-org/llama.cpp/pull/23760#issuecomment-4566312209
-    double max_nmse_err(ggml_backend_t backend) override {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        if (type_dst == GGML_TYPE_Q8_0) {
-            if (strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
-                return std::max(test_case::max_nmse_err(backend), 2e-7);
-            }
-            if (strcmp(ggml_backend_reg_name(reg), "HTP") == 0) {
-                return std::max(test_case::max_nmse_err(backend), 5e-6);
-            }
-        }
-        return test_case::max_nmse_err(backend);
-    }
 };
 
 // GGML_OP_ROPE + GGML_OP_VIEW + GGML_OP_SET_ROWS
@@ -5761,27 +5678,6 @@ struct test_rwkv_wkv7 : public test_case {
     }
 };
 
-static int32_t test_get_op_params_i32(const ggml_tensor * tensor, uint32_t i) {
-    GGML_ASSERT(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
-    return tensor->op_params[i];
-}
-
-// true if any node of the given op requests 8-bit src1 (GGML_PREC_Q8)
-static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
-    if (gf == nullptr) {
-        return false;
-    }
-
-    ggml_tensor ** nodes = ggml_graph_nodes(gf);
-    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-        if (nodes[i]->op == op && test_get_op_params_i32(nodes[i], 3) == GGML_PREC_Q8) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -5810,19 +5706,6 @@ struct test_mul_mat : public test_case {
 
     double max_nmse_err() override {
         return 5e-4;
-    }
-
-    double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
-                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
-        }
-        if (type_a == GGML_TYPE_F8_E4M3 && backend_has_feature(backend, "NATIVE_FP8")) {
-            return 5e-3;
-        }
-        return max_nmse_err();
     }
 
     int64_t grad_nmax() override {
@@ -6171,19 +6054,6 @@ struct test_mul_mat_id : public test_case {
 
     double max_nmse_err() override {
         return 5e-4;
-    }
-
-    double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
-                !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
-        }
-        if (type_a == GGML_TYPE_F8_E4M3 && backend_has_feature(backend, "NATIVE_FP8")) {
-            return 5e-3;
-        }
-        return max_nmse_err();
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -7872,16 +7742,10 @@ struct test_top_k : public test_case {
 
     // the backends may break ties in different ways, but each backend must break them in the same way in each run
     bool deterministic(ggml_backend_t backend) override {
-        // TODO: SYCL is not deterministic yet, it gathers the ties with an atomic counter
         const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
-        // ROCm and Vulkan have no cub::DeviceTopK, every row goes through their own deterministic paths
-        if (strcmp(name, "ROCm") == 0 || strcmp(name, "Vulkan") == 0) {
-            return ties;
-        }
-        if (strcmp(name, "CUDA") != 0 && strcmp(name, "MTL") != 0) {
+        if (strcmp(name, "MTL") != 0) {
             return false;
         }
-        // CUDA uses cub::DeviceTopK for 1 or 2 rows, which does not guarantee deterministic ties (CCCL <= 3.5)
         return ties && ne[1]*ne[2]*ne[3] > 2;
     }
 
@@ -8701,15 +8565,6 @@ struct test_mul_mat_fusion : public test_case {
 
     double max_nmse_err() override {
         return 5e-3;
-    }
-
-    double max_nmse_err(ggml_backend_t backend) override {
-        // 4-bit activations on Blackwell, see test_mul_mat
-        if (type == GGML_TYPE_NVFP4 && !graph_mul_mat_hi_prec_act(gf, use_id ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
-            return 2e-2;
-        }
-        return max_nmse_err();
     }
 };
 
@@ -15455,7 +15310,7 @@ static void usage(char ** argv) {
     printf("Options:\n");
     printf("  -o <op|regex,..>            comma separated list of exact op names (as given by ggml_op_desc()),\n");
     printf("                              full test case strings, and/or regexes matched against the op name\n");
-    printf("  -b <backend>                run tests on the given backend (e.g. CPU, MTL0, CUDA0)\n");
+    printf("  -b <backend>                run tests on the given backend (e.g. CPU, MTL0)\n");
     printf("  -p <params regex>           filter test cases by a regex matched against their params\n");
     printf("  --output <console|sql|csv>  output format (default: console)\n");
     printf("  --list-ops                  list all available GGML operations\n");
@@ -15467,7 +15322,7 @@ static void usage(char ** argv) {
     printf("  %s -o ADD,MUL_MAT\n", argv[0]);
     printf("  %s -o ADD -p 'type=f16.*perm1=0'\n", argv[0]);
     printf("  %s -b MTL0 -o 'DSV4.*'\n", argv[0]);
-    printf("  %s -b CUDA0 -o 'ADD(type=f16,ne=[1,1,1,1],nr=[32,1,1,1],nf=1,perm1=0,src_overlap=0)'\n", argv[0]);
+    printf("  %s -b MTL0 -o 'ADD(type=f16,ne=[1,1,1,1],nr=[32,1,1,1],nf=1,perm1=0,src_overlap=0)'\n", argv[0]);
     printf("  %s perf -o 'MUL_MAT.*'\n", argv[0]);
 }
 

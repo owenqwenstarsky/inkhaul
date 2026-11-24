@@ -302,7 +302,7 @@ struct server_slot {
 
     llama_tokens spec_draft;
 
-    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+    // draft candidates per token in spec_draft; only draft-simple fills it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
@@ -517,7 +517,6 @@ struct server_slot {
         if (task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
             return false;
         }
-        // MTP supports splitting - uses task->need_embd() not need_embd()
         if (!task->need_embd()) {
             return true;
         }
@@ -1234,11 +1233,7 @@ private:
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
-        const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        const bool has_spec = params.speculative.has_dft();
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1315,7 +1310,7 @@ private:
             }
         }
 
-        // note: the draft / MTP context is fitted together with the target model, see common_fit_extra_model
+        // note: the draft context is fitted together with the target model, see common_fit_extra_model
 
         // attach a progress callback
         {
@@ -1352,7 +1347,6 @@ private:
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
         if (has_spec) {
-            // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
 
@@ -1363,17 +1357,17 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                spec_init = common_speculative_init_from_params(params_dft, ctx_tgt);
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
-                if (has_draft && model_dft == nullptr) {
+                if (model_dft == nullptr) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                     return false;
                 }
 
                 if (ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create MTP context\n");
+                    SRV_ERR("%s", "failed to create the draft context\n");
                     return false;
                 }
 
@@ -4445,9 +4439,7 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output;
-                        // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_nextn into ctx_dft.
+                        // embedding requires all tokens in the batch to be output
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
@@ -6099,7 +6091,6 @@ void server_routes::init_routes() {
         std::vector<raw_buffer> files;
         json body = convert_transcriptions_to_chatcmpl(
             json::parse(req.body),
-            meta->chat_params.tmpls.get(),
             req.files,
             files);
         SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
@@ -7047,18 +7038,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const serve
     server_task task(SERVER_TASK_TYPE_TTS);
     server_schema::eval_tts_schema(params, task, body);
     const bool stream = task.params.stream;
-    // a model with a "tts" chat template (e.g. LFM3-Audio) speaks the prompt rendered from it
     const std::string lang       = json_value(body, "lang", params.tts_lang);
     // speaker_ref in the request overrides the default voice
     const bool has_speaker_ref   = req.files.count("speaker_ref") > 0 || !json_value(body, "speaker_ref_b64", std::string()).empty();
     const std::string voice      = json_value(body, "voice", has_speaker_ref ? std::string() : params.tts_voice);
-    // raw_prompt: the input goes to the model as is (e.g. phonemes), the "tts" chat template is skipped
-    const bool raw_prompt        = json_value(body, "raw_prompt", false);
-    const auto g2p = [this](const std::string & word) {
-        char buf[512];
-        return mtmd_gen_audio_g2p(ctx_server.mctx, word.c_str(), buf, sizeof(buf)) > 0 ? std::string(buf) : std::string();
-    };
-    const std::string tts_prompt = raw_prompt ? std::string() : common_chat_get_tts_prompt(meta->chat_params.tmpls.get(), prompt, lang, voice, g2p);
     // a model with predefined voices only speaks with one of them
     mtmd::bitmap_ptr voice_ref;
     if (!voice.empty() && info.n_voices > 0) {
@@ -7068,7 +7051,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const serve
             return res;
         }
     }
-    task.tts_inp.set_prompt(tts_prompt.empty() ? prompt : tts_prompt);
+    // the input goes to the model as is, there are no "tts" chat templates
+    task.tts_inp.set_prompt(prompt);
     task.tts_inp.set_lang(lang);
     task.tts_inp.set_speaker_ref_text(json_value(body, "speaker_ref_text", std::string()));
     task.tts_inp.data.stream    = stream;

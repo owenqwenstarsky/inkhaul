@@ -36,7 +36,6 @@ options:
   --no-warmup                               skip warmup runs before benchmarking
   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
   -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 0)
-  -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
 
 test parameters:
   -m, --model <filename>                    (default: models/7B/ggml-model-q4_0.gguf)
@@ -54,6 +53,7 @@ test parameters:
   -d, --n-depth <n>                         (default: 0)
   -b, --batch-size <n>                      (default: 2048)
   -ub, --ubatch-size <n>                    (default: 512)
+  -lhc, --longhaul-cache <size>             LongHaul expert cache, e.g. 512M,1G (default: 512M)
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
   -t, --threads <n>                         (default: system dependent)
@@ -62,7 +62,7 @@ test parameters:
   --poll <0...100>                          (default: 50)
   -ngl, --n-gpu-layers <n>                  (default: -1)
   -ncmoe, --n-cpu-moe <n>                   (default: 0)
-  -sm, --split-mode <none|layer|row|tensor> (default: layer)
+  -sm, --split-mode <none|layer|row> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
   -nkvo, --no-kv-offload <0|1>              (default: 0)
   -fa, --flash-attn <on|off|auto>           (default: auto)

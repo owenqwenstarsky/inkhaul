@@ -1,19 +1,18 @@
 # Install pre-built version of llama.cpp
 
-| Install via | Windows | Mac  | Linux |
-|-------------|---------|------|-------|
-| conda-forge | ✅      | ✅   | ✅   |
-| Winget      | ✅      |      |      |
-| Homebrew    |         | ✅   | ✅   |
-| MacPorts    |         | ✅   |      |
-| Nix         |         | ✅   | ✅   |
+> [!NOTE]
+> These packages are builds of upstream llama.cpp, not of this fork. They do not include LongHaul or the Inkling 2 changes. To run Inkling 2 Mini with LongHaul, build this repository from source (see [build.md](build.md)).
 
-## conda-forge (Windows, Mac and Linux)
+| Install via | Mac  |
+|-------------|------|
+| conda-forge | yes  |
+| Homebrew    | yes  |
+| MacPorts    | yes  |
+| Nix         | yes  |
 
-conda-forge provides builds for:
- - CUDA (Windows and Linux)
- - Vulkan (Windows and Linux)
- - Apple Metal (macOS)
+## conda-forge (Mac)
+
+conda-forge provides builds for Apple Metal (macOS).
 
 ```sh
 conda install -c conda-forge llama.cpp
@@ -35,15 +34,7 @@ This distribution is managed on [`conda-forge/llama.cpp-feedstock`](https://gith
 
 Shall you have any problems, please open an issue on [its issue tracker](https://github.com/conda-forge/llama.cpp-feedstock/issues).
 
-## Winget (Windows)
-
-```sh
-winget install llama.cpp
-```
-
-The package is automatically updated with new `llama.cpp` releases. More info: https://github.com/ggml-org/llama.cpp/issues/8188
-
-## Homebrew (Mac and Linux)
+## Homebrew (Mac)
 
 ```sh
 brew install llama.cpp
@@ -59,7 +50,7 @@ sudo port install llama.cpp
 
 See also: https://ports.macports.org/port/llama.cpp/details/
 
-## Nix (Mac and Linux)
+## Nix (Mac)
 
 ```sh
 nix profile install nixpkgs#llama-cpp

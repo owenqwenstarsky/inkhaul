@@ -9,14 +9,14 @@ Function calling is supported for all models (see https://github.com/ggml-org/ll
 
 - Native tool call formats supported:
   - Llama 3.1 / 3.3 (including builtin tools support - tool names for `wolfram_alpha`, `web_search` / `brave_search`, `code_interpreter`), Llama 3.2
-  - Functionary v3.1 / v3.2
+  - Functionary v3.1
   - Hermes 2/3, Qwen 2.5
   - Qwen 2.5 Coder
   - Mistral Nemo
   - Firefunction v2
   - Command R7B
   - DeepSeek R1 (WIP / seems reluctant to call any tools?)
-  - GPT-OSS (Harmony), LLM-jp-4.1 (Harmony dialect)
+  - Inkling / Inkling 2 (dedicated parser, `common/parsers/inkling.cpp`)
 
 - Generic tool call is supported when the template isn't recognized by native format handlers (you'll see `Chat format: Generic` in the logs).
   - Use `--chat-template-file` to override the template when appropriate (see examples below)
@@ -178,7 +178,6 @@ Function calling is supported for all models (see https://github.com/ggml-org/ll
 | lightblue-DeepSeek-R1-Distill-Qwen-7B-Japanese.jinja | DeepSeek R1 (extract reasoning) |
 | mattshumer-Reflection-Llama-3.1-70B.jinja | Generic |
 | meetkai-functionary-medium-v3.1.jinja | Functionary v3.1 Llama 3.1 |
-| meetkai-functionary-medium-v3.2.jinja | Functionary v3.2 |
 | meta-llama-Llama-2-7b-chat-hf.jinja | Generic |
 | meta-llama-Llama-3.1-8B-Instruct.jinja | Llama 3.x |
 | meta-llama-Llama-3.2-11B-Vision-Instruct.jinja | Llama 3.x |
@@ -303,9 +302,6 @@ llama-server --jinja -fa -hf bartowski/DeepSeek-R1-Distill-Qwen-32B-GGUF:Q4_K_M 
     --chat-template-file models/templates/llama-cpp-deepseek-r1.jinja
 
 # Native support requires the right template for these GGUFs:
-
-llama-server --jinja -fa -hf bartowski/functionary-small-v3.2-GGUF:Q4_K_M
-    --chat-template-file models/templates/meetkai-functionary-medium-v3.2.jinja
 
 llama-server --jinja -fa -hf bartowski/Hermes-2-Pro-Llama-3-8B-GGUF:Q4_K_M \
     --chat-template-file models/templates/NousResearch-Hermes-2-Pro-Llama-3-8B-tool_use.jinja

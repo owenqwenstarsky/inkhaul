@@ -32,7 +32,7 @@ struct mtmd_helper_video_stream_info {
 };
 
 // Video decoder: the built-in one runs ffmpeg/ffprobe (MTMD_VIDEO), an application can provide its own.
-// Call order: open, start, read_audio, read_frame..., close
+// Call order: open, start, read_frame..., close
 struct mtmd_helper_video_decoder {
     // path and/or buf is set; buf is only valid during the call
     // returns the decoder state, NULL on failure
@@ -44,9 +44,6 @@ struct mtmd_helper_video_decoder {
     // next frame in presentation order, as RGB24 scaled to width x height (same on every call)
     // rgb == NULL skips the frame; returns false at the end of the stream or on error
     bool (*read_frame)(void * state, unsigned char * rgb, uint32_t width, uint32_t height);
-    // optional: the soundtrack as mono F32 PCM at sample_rate, starting at the first video frame
-    // the samples are valid until the next call to the decoder; NULL if there is no soundtrack
-    const float * (*read_audio)(void * state, int sample_rate, size_t * n_samples);
     void (*close)(void * state);
     void * user_data;
 };
@@ -55,7 +52,6 @@ struct mtmd_helper_video_init_params {
     float fps_target;            // desired output fps; <= 0 means use the video's native fps, defaulted to 4.0f
     const char * ffmpeg_bin_dir; // directory containing ffmpeg/ffprobe binaries; NULL means search PATH
     int64_t timestamp_interval_ms; // interval for adding timestamp as text chunk (example: "[10m50.5s]"); <= 0 means no timestamp, defaulted to 5000ms
-    bool no_soundtrack;          // frames only, also for models that hear the soundtrack of a video (LFM3-Omni)
     const struct mtmd_helper_video_decoder * decoder; // NULL means ffmpeg (requires MTMD_VIDEO)
     // TODO @ngxson : allow "placeholder" bitmap output for counting tokens
 };
@@ -527,8 +523,6 @@ struct mtmd_helper_video_seq {
     int32_t     timestamp_interval_ms = 5000;
     float       next_timestamp_ms     = 0.0f;
 
-    mtmd_video_template tmpl = MTMD_VIDEO_TEMPLATE_DEFAULT;
-
     int32_t     target_frames = 0;
     int32_t     out_width     = 0;
     int32_t     out_height    = 0;
@@ -542,10 +536,6 @@ struct mtmd_helper_video_seq {
     std::string   pending_text;
     mtmd_bitmap * pending_frame = nullptr;
 
-    int32_t            n_src_frames = 0;
-    int                audio_rate   = 0;
-    std::vector<float> soundtrack;
-    mtmd_bitmap *      pending_audio = nullptr;
     bool          start_emitted = false;
 
     mtmd_helper_video_seq() = default;
@@ -560,12 +550,6 @@ struct mtmd_helper_video_seq {
 
     // pick the frames of fps_target by index, for a source that yields every frame
     void sample_by_index(const mtmd_helper_video_stream_info & src);
-    // pcm: mono, starting at the first video frame
-    void set_soundtrack(const float * pcm, size_t n, int rate);
-
-    int32_t ts_per_n_frames() const;
-
-    mtmd_bitmap * soundtrack_slice(int32_t idx) const;
     mtmd_bitmap * read_next_frame();
     int32_t read_next(mtmd_bitmap ** out_bitmap, char ** out_text);
 };

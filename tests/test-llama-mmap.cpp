@@ -218,6 +218,36 @@ static void check_mmap(testing & t, const std::filesystem::path & path) {
     }
 }
 
+// positional reads do not depend on or move the file position
+static void check_read_at(testing & t, const std::filesystem::path & path) {
+    llama_file file(path.string().c_str(), "rb");
+    file.set_no_cache();
+    file.seek(7, SEEK_SET);
+
+    const std::vector<std::pair<size_t, size_t>> ranges = {
+        { 0, 1 },
+        { 1, 31 },
+        { 4095, 4099 },
+        { test_file_size - 31, 31 },
+        { 0, test_file_size },
+    };
+    for (const auto & range : ranges) {
+        std::vector<uint8_t> buffer(range.second);
+        file.read_raw_at(buffer.data(), buffer.size(), range.first);
+        t.assert_true("positional read expected bytes", matches(buffer.data(), range.first, buffer.size()));
+    }
+    t.assert_equal(size_t(7), file.tell());
+
+    uint8_t byte = 0;
+    bool threw = false;
+    try {
+        file.read_raw_at(&byte, 2, test_file_size - 1);
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    t.assert_true("positional read past the end throws", threw);
+}
+
 int main() {
     testing t;
     temporary_file test_file;
@@ -228,5 +258,6 @@ int main() {
     t.test("llama_file.direct", [&] (testing & t) { check_file(t, test_file.path, true); });
     t.test("llama_file.direct_fallback", [&] (testing & t) { check_direct_io_fallback(t, test_file.path); });
     t.test("llama_mmap", [&] (testing & t) { check_mmap(t, test_file.path); });
+    t.test("llama_file.read_at", [&] (testing & t) { check_read_at(t, test_file.path); });
     return t.summary();
 }

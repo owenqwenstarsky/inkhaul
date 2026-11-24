@@ -27,7 +27,7 @@ def test_reasoning_effort_rejected_by_template():
     global server
     server.jinja = True
     # the template raises on max, and high is one of its levels
-    server.chat_template_file = '../../../models/templates/IFM-K2-Horizon.jinja'
+    server.chat_template_file = '../../../models/templates/tencent-Hy3.jinja'
     server.start()
 
     messages = [{"role": "user", "content": "Hello"}]

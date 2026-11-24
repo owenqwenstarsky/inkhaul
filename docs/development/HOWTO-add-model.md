@@ -1,5 +1,10 @@
 # Add a new model architecture to `llama.cpp`
 
+> [!NOTE]
+>
+> This fork keeps only the Inkling 2 architectures (`inkling2`, `inkling2_loop`), the DSpark draft model (`dflash`), the `clip` stub for mmproj files and the `inkling2v` vision encoder.
+> The steps below describe where an architecture lives in the code. Use the Inkling 2 files as the reference: `conversion/inkling2.py`, `src/models/inkling2.cpp`, `src/models/inkling2-loop.cpp` and `tools/mtmd/models/inkling2v.cpp`.
+
 Adding a model requires few steps:
 
 1. Convert the model to GGUF
@@ -9,7 +14,7 @@ Adding a model requires few steps:
 
 After following these steps, you can open PR.
 
-Also, it is important to check that the examples and main ggml backends (CUDA, METAL, CPU) are working with the new architecture, especially:
+Also, it is important to check that the examples and the ggml backends of this fork (Metal, CPU) are working with the new architecture, especially:
 - [cli](/tools/cli/)
 - [completion](/tools/completion/)
 - [imatrix](/tools/imatrix/)
@@ -18,8 +23,7 @@ Also, it is important to check that the examples and main ggml backends (CUDA, M
 
 ### 1. Convert the model to GGUF
 
-This step is done in python with a `convert` script using the [gguf](https://pypi.org/project/gguf/) library.
-Depending on the model architecture, you can use either [convert_hf_to_gguf.py](/convert_hf_to_gguf.py) or [examples/convert_legacy_llama.py](/examples/convert_legacy_llama.py) (for `llama/llama2` models in `.pth` format).
+This step is done in python with the [convert_hf_to_gguf.py](/convert_hf_to_gguf.py) script using the [gguf](https://pypi.org/project/gguf/) library.
 
 The convert script reads the model configuration, tokenizer, tensor names+data and converts them to GGUF metadata and tensors.
 
@@ -51,18 +55,19 @@ Add an enum entry in `MODEL_ARCH`, the model human friendly name in `MODEL_ARCH_
 
 NOTE: Pick the GGUF arch string (and the matching `src/models/<name>.cpp` filename, see section 3) carefully up front, following existing naming conventions. Once GGUF files are published under a given arch string, renaming it later breaks the community's existing files, so this is not something to leave for cleanup in a follow-up PR.
 
-Example for `falcon` model:
+Example for the `inkling2` model (first entries):
 ```python
-    MODEL_ARCH.FALCON: [
+    MODEL_ARCH.INKLING2: [
         MODEL_TENSOR.TOKEN_EMBD,
-        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
         MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.ATTN_NORM,
-        MODEL_TENSOR.ATTN_NORM_2,
-        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
         MODEL_TENSOR.ATTN_OUT,
-        MODEL_TENSOR.FFN_DOWN,
-        MODEL_TENSOR.FFN_UP,
+        ...
     ]
 ```
 
@@ -113,11 +118,11 @@ NOTE: The dimensions in `ggml` are typically in the reverse order of the `pytorc
 
 ### 3. Build the GGML graph implementation
 
-This is the funniest part, you have to provide the inference graph implementation of the new model architecture in `src/llama-model.cpp`:
+This is the funniest part, you have to provide the inference graph implementation of the new model architecture in `src/models/<name>.cpp`, with its struct declared in `src/models/models.h`:
 1. Create a new struct that inherits from `llama_model_base`.
 2. Implement the graph-building logic in its `build_arch_graph` method.
-3. The `build_arch_graph` method should return a constructed graph (inherited from `llm_graph_context`). Have a look at existing implementations like `llama_model_llama`, `llama_model_dbrx` or `llama_model_bert`.
-4. Then, in the `llama_model_mapping` function, add a case for your architecture to instantiate your new graph-building struct.
+3. The `build_arch_graph` method should return a constructed graph (inherited from `llm_graph_context`). Have a look at the existing implementations `llama_model_inkling2` and `llama_model_inkling2_loop`.
+4. Then, in the `llama_model_mapping` function in `src/llama-model.cpp`, add a case for your architecture to instantiate your new graph-building struct.
 
 Some `ggml` backends do not support all operations. Backend implementations can be added in a separate PR.
 
@@ -130,14 +135,13 @@ If the new model supports multimodal inputs, you will need to add a new encoder 
 1. In the conversion script, make sure you add a subclass that extends `MmprojModel` or another class that inherits from the same base class.
 2. Add the encoder definition: hparams and tensor loading in `mtmd-model.cpp`, graph inputs in `mtmd-subcontext.cpp`.
 3. Implement the preprocessor in `mtmd.cpp`. In most cases, you can reuse an existing preprocessor.
-4. Implement the encoder GGML graph, either in a dedicated file if the model is truly different from existing ones, or by reusing an existing implementation (for example: siglip, pixtral, or qwen) and adding a model-specific projector.
+4. Implement the encoder GGML graph in `tools/mtmd/models`. Reuse the shared builders of `mtmd_graph` where you can, as `inkling2v` does with `build_vit`, `build_rope_2d`, `build_patch_merge_permute` and `build_ffn`.
 
 Note:
 - Many multimodal encoders are based on models that are already supported. Make sure to read the existing encoder definitions in `tools/mtmd/models` before adding a new one. In `libmtmd`, it is generally better to extend an existing model than to duplicate code.
-- To debug the multimodal preprocessor and encoder, you can use [llama-mtmd-debug](tools/mtmd/debug/mtmd-debug.cpp).
+- To debug the multimodal preprocessor and encoder, you can use [llama-mtmd-debug](/tools/mtmd/debug/mtmd-debug.cpp).
 - Adding a model-specific API or CLI is an anti-pattern in `libmtmd`. The goal of `libmtmd` is to provide an easy-to-use, model-agnostic library for multimodal pipeline.
 - In most cases, `llama-mtmd-cli` should not be modified. If a model requires a specific prompt, either let the user provide it or bake it into the Jinja chat template.
-- For audio generation models, see `tools/mtmd/README-dev.md`
 
 ## Add a decision model
 
@@ -162,7 +166,7 @@ For more information, see [PR #29818](https://github.com/ggml-org/llama.cpp/pull
 
 If the model contains constant modifications of tensors in the graph (for example, `norm(1 + weight)`) or performs tensor permutations/chunking, perform the modifications during conversion rather than in the graph code. This keeps the inference graph simpler and avoids extra runtime ops.
 
-Examples:
+Examples (from upstream llama.cpp, these models are not in this fork):
 - Gemma 3 folds the `1 +` of its `norm(1 + weight)` normalization into the weights at conversion time, so the graph just does a plain RMS norm.
 - Qwen3-Next applies its tensor permutation during conversion (in `modify_tensors`), so the graph can consume the already-permuted weights directly.
 
@@ -176,10 +180,10 @@ However, since `ggml_rope_ext` only provides a subset of the RoPE implementation
 
 For more information about `ggml_rope_ext`, please refer to the in-code documentation in `ggml.h`.
 
-Examples:
+Examples (the models named here are upstream llama.cpp models that are not in this fork):
 - `libmtmd` implements 2D RoPE with `GGML_ROPE_TYPE_NORMAL` ordering by splitting the input tensor in half, applying `ggml_rope_ext` separately to each half, then joining them back together using `ggml_concat`.
 - The [Kimi-K2.5](https://github.com/ggml-org/llama.cpp/pull/19170) vision encoder uses vision RoPE with interleaved frequencies. The weights must be permuted during conversion in order to reuse the `build_rope_2d()` function.
-- [Gemma 4](https://github.com/ggml-org/llama.cpp/pull/21309) uses "proportional" RoPE. We employ a trick where `rope_freqs` is set to a very large value in the last dimensions to prevent those dimensions from being rotated. See the `Gemma4Model` class in `convert_hf_to_gguf.py`.
+- [Gemma 4](https://github.com/ggml-org/llama.cpp/pull/21309) uses "proportional" RoPE. We employ a trick where `rope_freqs` is set to a very large value in the last dimensions to prevent those dimensions from being rotated.
 - Some models require scaling the input position. For example, `[0, 1, 2, ...]` becomes `[0, 0.5, 1, ...]`. In this case, you can provide the scaling via `freq_scale = 0.5f`.
 - Some models use learned RoPE frequencies instead of relying on `powf(freq_base, -2.0 * i / n_dims)`. In this case, you can provide the learned frequencies via the `rope_freqs` tensor (corresponding to the `c` argument in `ggml_rope_ext`), then set `freq_base = 1.0f`. An important note is that `rope_freqs` in GGML is the **inverse** (`theta = pos[i] / rope_freqs`), so you may need to invert `rope_freqs` during conversion.
 
@@ -192,9 +196,9 @@ Many models rotate only a part of each head and leave the rest untouched (often 
 
 `n_offs` must be even, `n_offs + n_dims` must fit in the row, and vision RoPE is not supported. Note that the frequencies are computed relative to the rotated window.
 
-Example: DeepSeek-V4 uses `[nope|rope]` for its query, key and compressed KV tensors, so `src/models/deepseek4.cpp` ropes the whole tensor and then calls `ggml_rope_set_offset(cur, n_embd_head_nope)`.
+Example: upstream DeepSeek-V4 uses `[nope|rope]` for its query, key and compressed KV tensors, so its graph ropes the whole tensor and then calls `ggml_rope_set_offset(cur, n_embd_head_nope)`.
 
-Exception: some models apply an extra op to the `nope` part, for example `deepseek32.cpp`, and may not use this optimization. While RoPE can be applied selectively to a part of the head, the extra op may not, so these models still need views plus `ggml_concat`.
+Exception: some models apply an extra op to the `nope` part, for example upstream DeepSeek V3.2, and may not use this optimization. While RoPE can be applied selectively to a part of the head, the extra op may not, so these models still need views plus `ggml_concat`.
 
 ## GGUF specification
 

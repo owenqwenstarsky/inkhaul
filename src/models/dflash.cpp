@@ -30,22 +30,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     // drafts for M-RoPE targets carry degenerate sections [n_rot/2, 0, 0, 0]
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
 
-    ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,       hparams.dflash_block_size,       false);
-    ml.get_key(LLM_KV_DFLASH_CONV_KERNEL_SIZE, hparams.dflash_conv_kernel_size, false);
-    ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
-    ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
-    ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
+    ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE, hparams.dflash_block_size, false);
 
-    const bool has_markov   = ml.get_tensor_meta("markov_w1.weight")       != nullptr;
-    const bool has_selector = ml.get_tensor_meta("selector_hidden.weight") != nullptr;
-    const bool has_lilicorr = ml.get_key(LLM_KV_LILICORR_HIDDEN_SIZE, hparams.lilicorr_hidden_size, false);
-    if (has_markov) {
-        variant = VARIANT_DSPARK;
-    } else if (has_selector) {
-        variant = VARIANT_DFLASH2;
-    } else if (has_lilicorr) {
-        variant = VARIANT_LILICORR;
-        load_hparams_lilicorr(ml);
+    // only DSpark drafts (DFlash + Markov head) with a dense backbone, as shipped for Inkling 2
+    if (ml.get_tensor_meta("markov_w1.weight") == nullptr) {
+        throw std::runtime_error("only DSpark draft models are supported (no markov_w1.weight)");
     }
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
@@ -63,14 +52,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     }
     LLAMA_LOG_INFO("%s: DFlash extract_layers = [%s]\n", __func__, layers.c_str());
 
-    ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
-    if (hparams.dsv4_hc_mult > 0) {
-        load_hparams_dsv4(ml);
-        backbone = hparams.dsv4_hc_single_pass ? BACKBONE_DSV41 : BACKBONE_DSV4;
-    } else if (ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK, hparams.n_lora_kv, false)) {
-        load_hparams_mistral_large4(ml);
-        backbone = BACKBONE_MISTRAL_LARGE4;
-    } else if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
+    if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
         // optional interleaved sliding-window attention with per-layer pattern array.
         // DFlash has a single rope, so the SWA rope == main rope.
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -100,12 +82,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         LLAMA_LOG_INFO("%s: DFlash using d2t mapping (draft_vocab_size = %lld)\n", __func__, (long long) n_vocab_draft);
     }
 
-    switch (variant) {
-        case VARIANT_DSPARK:   load_tensors_dspark(n_vocab_draft); break;
-        case VARIANT_DFLASH2:  load_tensors_dflash2();             break;
-        case VARIANT_LILICORR: load_tensors_lilicorr();            break;
-        case VARIANT_DFLASH:                                       break;
-    }
+    load_tensors_dspark(n_vocab_draft);
 
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
@@ -117,26 +94,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
 
-    switch (backbone) {
-        case BACKBONE_BASE:           load_tensors_layers_base();           break;
-        case BACKBONE_DSV4:
-        case BACKBONE_DSV41:          load_tensors_layers_dsv4();           break;
-        case BACKBONE_MISTRAL_LARGE4: load_tensors_layers_mistral_large4(); break;
-    }
-}
-
-uint32_t llama_model_dflash::graph_nodes_per_tensor() const {
-    if (hparams.dsv4_hc_mult > 0) {
-        return 32;
-    }
-    if (hparams.dflash_selector_rank > 0) {
-        // DFlash2's convolutions and selector are shape work rather than matmuls,
-        // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft.
-        // The selector lattice scales with the draft block size; 12u was calibrated
-        // on block-8 drafters, so scale the budget for larger blocks (e.g. Ripple's 16).
-        return 12u*std::max<uint32_t>(1u, hparams.dflash_block_size/8u);
-    }
-    return llama_model_base::graph_nodes_per_tensor();
+    load_tensors_layers_base();
 }
 
 void llama_model_dflash::load_tensors_layers_base() {
@@ -382,13 +340,6 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
         ggml_tensor * noise_norm = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
         cb(noise_norm, "noise_norm", il);
 
-        ggml_tensor * attn_dynamic = nullptr;
-        if (layer.dflash_attn_conv_proj) {
-            attn_dynamic = build_lora_mm(layer.dflash_attn_conv_proj, noise_norm);
-            noise_norm = build_dflash2_conv(*this, noise_norm, attn_dynamic, layer.dflash_attn_conv_base, 0);
-            cb(noise_norm, "attn_conv_in", il);
-        }
-
         ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm, layer.wq_s);
         ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm, layer.wk_s);
         const bool shared_kv = layer.wv == nullptr;
@@ -420,11 +371,6 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
             cb(cur, "attn_out_scaled", il);
         }
 
-        if (attn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
-            cb(cur, "attn_conv_out", il);
-        }
-
         if (layer.attn_post_norm) {
             cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "attn_post_norm", il);
@@ -436,13 +382,6 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
         cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        ggml_tensor * ffn_dynamic = nullptr;
-        if (layer.dflash_ffn_conv_proj) {
-            ffn_dynamic = build_lora_mm(layer.dflash_ffn_conv_proj, cur);
-            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 0);
-            cb(cur, "ffn_conv_in", il);
-        }
-
         cur = build_ffn(cur,
                 layer.ffn_up,   NULL, layer.ffn_up_s,
                 layer.ffn_gate, NULL, layer.ffn_gate_s,
@@ -450,11 +389,6 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
                 NULL,
                 hparams.llm_ffn_op, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
-
-        if (ffn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 1);
-            cb(cur, "ffn_conv_out", il);
-        }
 
         if (layer.ffn_post_norm) {
             cur = build_norm(cur, layer.ffn_post_norm, NULL, LLM_NORM_RMS, il);
@@ -482,19 +416,7 @@ ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
     const auto [output, output_s] = get_lm_head(*this, model);
     cur = build_lora_mm(output, cur, output_s);
 
-    // DFlash2 feeds these logits to the selector, so they need the target's output
-    // transforms; DFlash1 and DSpark read them through the sampler instead
-    if (model.dflash_selector_hidden) {
-        if (hparams.f_logit_scale != 0.0f) {
-            cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
-        }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
-            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
-            cur = ggml_tanh(ctx0, cur);
-            cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
-        }
-    }
-
+    // the sampler applies the logit scale and softcap of the target
     // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
     if (model.d2t) {
         const int64_t n_draft_vocab = cur->ne[0];
@@ -516,38 +438,13 @@ ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
     return cur;
 }
 
-llama_model_dflash::graph_dflash::graph_dflash(const llm_graph_params & params) : graph_base(params) {
-    ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd || ubatch.embd_row) {
-        build_inject();
-        return;
-    }
-
-    ggml_tensor * inp_tokens = build_inp_tokens();
-    ggml_tensor * cur        = build_layers(inp_tokens);
-
-    build_logits(cur);
-}
-
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
     switch (params.gtype) {
         case LLM_GRAPH_TYPE_ENCODER:
             return std::make_unique<graph<true>>(params);
         case LLM_GRAPH_TYPE_DEFAULT:
         case LLM_GRAPH_TYPE_DECODER:
-            switch (backbone) {
-                case BACKBONE_BASE:           break;
-                case BACKBONE_DSV4:           return std::make_unique<graph_dsv4>(params);
-                case BACKBONE_DSV41:          return std::make_unique<graph_dsv41>(params);
-                case BACKBONE_MISTRAL_LARGE4: return std::make_unique<graph_mistral_large4>(params);
-            }
-            switch (variant) {
-                case VARIANT_DFLASH:   return std::make_unique<graph_dflash>(params);
-                case VARIANT_DFLASH2:  return std::make_unique<graph_dflash2>(params);
-                case VARIANT_DSPARK:   return std::make_unique<graph_dspark>(params);
-                case VARIANT_LILICORR: return std::make_unique<graph_lilicorr>(params);
-            }
-            GGML_ABORT("invalid DFlash variant");
+            return std::make_unique<graph_dspark>(params);
         default:
             GGML_ABORT("invalid graph type");
     };

@@ -74,12 +74,6 @@ struct mtmd_graph {
     //
     void cb(ggml_tensor * cur0, const char * name, int il) const;
 
-    const mtmd_image_f32 & get_img(size_t idx) const {
-        GGML_ASSERT(img_batch);
-        GGML_ASSERT(idx < img_batch->entries.size());
-        return img_batch->entries[idx];
-    }
-
     // siglip2 naflex
     ggml_tensor * resize_position_embeddings(uint32_t interpolation_mode = DEFAULT_INTERPOLATION_MODE);
 
@@ -100,10 +94,6 @@ struct mtmd_graph {
     ggml_tensor * build_inp();
 
     ggml_tensor * build_inp_raw(int channels = 3);
-
-    // qwen-vl style temporal merge, handles n_batch == 1 (image) or n_batch == 2 (2 video frames)
-    // requires patch_embeddings_0 and patch_embeddings_1; returns tensor with shape [w, h, n_embd, 1]
-    ggml_tensor * build_inp_temporal_merge();
 
     // f16 if flash attn is enabled, set it with set_input_attn_mask()
     // idx is only needed when the graph has more than one mask
@@ -128,12 +118,6 @@ struct mtmd_graph {
             ffn_op_type type_op,
             int il) const;
 
-    ggml_tensor * build_moe_ffn(
-            ggml_tensor * cur,
-            const mtmd_layer & layer,
-            ffn_op_type type_op,
-            int il) const;
-
     ggml_tensor * build_attn(
             ggml_tensor * wo,
             ggml_tensor * wo_b,
@@ -142,8 +126,7 @@ struct mtmd_graph {
             ggml_tensor * v_cur,
             ggml_tensor * kq_mask,
             float kq_scale,
-            int il,
-            ggml_tensor * sinks = nullptr) const;
+            int il) const;
 
     // implementation of the 2D RoPE using two ggml_rope_ext calls
     //
@@ -166,13 +149,6 @@ struct mtmd_graph {
     // aka pixel_shuffle / pixel_unshuffle / patch_merger (Kimi-VL)
     // support dynamic resolution
     ggml_tensor * build_patch_merge_permute(ggml_tensor * cur, int scale_factor);
-
-    // Generic function to stack frames for audio processing
-    // Abstracts out the StackAudioFrames logic used by ultravox
-    ggml_tensor * build_stack(ggml_tensor * cur, int32_t stack_factor, int32_t n_embed);
-
-    // append the separators of img.suffix_type after the image tokens
-    ggml_tensor * build_suffix(ggml_tensor * cur);
 };
 
 static inline std::string get_attn_mask_name(int idx) {
