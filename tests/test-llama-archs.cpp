@@ -162,6 +162,10 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
             tmp16[i] = ggml_fp32_to_fp16(tmp[i]);
         }
         ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
+    } else if (ggml_is_quantized(tensor->type)) {
+        std::vector<uint8_t> tmpq(ggml_nbytes(tensor));
+        ggml_quantize_chunk(tensor->type, tmp.data(), tmpq.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+        ggml_backend_tensor_set(tensor, tmpq.data(), 0, ggml_nbytes(tensor));
     } else {
         GGML_ABORT("fatal error");
     }
@@ -1004,22 +1008,56 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
             gpu = dev;
         }
     }
+    // a second GPU, for the error of a cache on two GPUs (GGML_CUDA_DEVICES=2 or GGML_METAL_DEVICES=2 emulate one)
+    ggml_backend_dev_t gpu2 = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count() && gpu2 == nullptr; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) && dev != gpu) {
+            gpu2 = dev;
+        }
+    }
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
 
-    bool all_ok = true;
+    // GGML_TYPE_COUNT: the default F32 experts
+    std::vector<std::pair<llm_arch, ggml_type>> variants;
     for (const llm_arch arch : { LLM_ARCH_INKLING2, LLM_ARCH_INKLING2_LOOP }) {
+        for (const ggml_type type_exps : { GGML_TYPE_COUNT, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4 }) {
+            variants.emplace_back(arch, type_exps);
+        }
+    }
+
+    bool all_ok = true;
+    for (const auto & variant : variants) {
+        const llm_arch  arch      = variant.first;
+        const ggml_type type_exps = variant.second;
         if (!arch_matches(arch_filter, arch)) {
             continue;
         }
+        const std::string name = std::string(llama_arch_name(arch)) + (type_exps == GGML_TYPE_COUNT ? "" : std::string(" ") + ggml_type_name(type_exps));
         if (gpu == nullptr) {
-            LOG("LongHaul %s: SKIP (no GPU)\n", llama_arch_name(arch));
+            LOG("LongHaul %s: SKIP (no GPU)\n", name.c_str());
             continue;
         }
         gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true);
         // more experts than used per token, so that the small caches evict
         gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_COUNT).c_str(), 16);
         gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_USED_COUNT).c_str(), 2);
+        if (type_exps != GGML_TYPE_COUNT) {
+            // quantized experts need rows that are a multiple of the block size
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_FEED_FORWARD_LENGTH).c_str(), 64);
+            const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT).c_str()));
+            for (uint32_t il = 0; il < n_layer; il++) {
+                ggml_tensor t;
+                memset(&t, 0, sizeof(ggml_tensor));
+                t.type = type_exps;
+                ggml_format_name(&t, "blk.%" PRIu32 ".ffn_gate_up_exps.weight", il);
+                gguf_add_tensor(gguf_ctx.get(), &t);
+                ggml_format_name(&t, "blk.%" PRIu32 ".ffn_down_exps.weight", il);
+                gguf_add_tensor(gguf_ctx.get(), &t);
+            }
+        }
 
         const std::string path = get_tmp_gguf_path();
         {
@@ -1092,21 +1130,29 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
             }
             fclose(file);
             set_env("LLAMA_LONGHAUL_IO_THREADS", nullptr);
-            LOG("LongHaul %s, cache %s: %s (%s)\n", llama_arch_name(arch), cc.name, ok ? "OK" : "FAIL", detail.c_str());
+            LOG("LongHaul %s, cache %s: %s (%s)\n", name.c_str(), cc.name, ok ? "OK" : "FAIL", detail.c_str());
             all_ok = all_ok && ok;
         }
 
-        // a cache that cannot hold the experts of one token, no cache without the test hook, and no GPU are errors
+        if (type_exps != GGML_TYPE_COUNT) {
+            std::filesystem::remove(path);
+            continue;
+        }
+
+        // a cache that cannot hold the experts of one token, no cache without the test hook, no GPU and two GPUs are errors
         struct error_case {
             const char *                    name;
             size_t                          size;
             std::vector<ggml_backend_dev_t> devs;
         };
-        const error_case errors[] = {
+        std::vector<error_case> errors = {
             { "cache too small", bank_size(1), { gpu } },
             { "no cache",        0,            { gpu } },
             { "no GPU",          bank_size(16), {} },
         };
+        if (gpu2 != nullptr) {
+            errors.push_back({ "two GPUs", bank_size(16), { gpu, gpu2 } });
+        }
         set_longhaul_resident(false);
         for (const error_case & ec : errors) {
             FILE * file = fopen(path.c_str(), "rb");
