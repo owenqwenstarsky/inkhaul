@@ -464,6 +464,7 @@ elseif (GGML_CPU)
 endif()
 
 ggml_add_backend(BLAS)
+ggml_add_backend(CUDA)
 ggml_add_backend(METAL)
 
 foreach (target ggml-base ggml)
