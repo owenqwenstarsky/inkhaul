@@ -179,13 +179,13 @@ ggml_tensor * mtmd_graph::build_vit(
 
                 if (layer.q_norm) {
                     GGML_ASSERT(layer.q_norm->ne[0] == Qcur->ne[0]);
-                    Qcur = build_norm(Qcur, layer.q_norm, layer.q_norm_b, norm_t, eps, il);
+                    Qcur = build_norm(Qcur, layer.q_norm, nullptr, norm_t, eps, il);
                     cb(Qcur, "Qcur_norm", il);
                 }
 
                 if (layer.k_norm) {
                     GGML_ASSERT(layer.k_norm->ne[0] == Kcur->ne[0]);
-                    Kcur = build_norm(Kcur, layer.k_norm, layer.k_norm_b, norm_t, eps, il);
+                    Kcur = build_norm(Kcur, layer.k_norm, nullptr, norm_t, eps, il);
                     cb(Kcur, "Kcur_norm", il);
                 }
 
@@ -211,11 +211,11 @@ ggml_tensor * mtmd_graph::build_vit(
 
                 if (!norm_per_head) {
                     if (layer.q_norm) {
-                        Qcur = build_norm(Qcur, layer.q_norm, layer.q_norm_b, norm_t, eps, il);
+                        Qcur = build_norm(Qcur, layer.q_norm, nullptr, norm_t, eps, il);
                         cb(Qcur, "Qcur_norm", il);
                     }
                     if (layer.k_norm) {
-                        Kcur = build_norm(Kcur, layer.k_norm, layer.k_norm_b, norm_t, eps, il);
+                        Kcur = build_norm(Kcur, layer.k_norm, nullptr, norm_t, eps, il);
                         cb(Kcur, "Kcur_norm", il);
                     }
                 }
@@ -226,11 +226,11 @@ ggml_tensor * mtmd_graph::build_vit(
 
                 if (norm_per_head) {
                     if (layer.q_norm) {
-                        Qcur = build_norm(Qcur, layer.q_norm, layer.q_norm_b, norm_t, eps, il);
+                        Qcur = build_norm(Qcur, layer.q_norm, nullptr, norm_t, eps, il);
                         cb(Qcur, "Qcur_norm_per_head", il);
                     }
                     if (layer.k_norm) {
-                        Kcur = build_norm(Kcur, layer.k_norm, layer.k_norm_b, norm_t, eps, il);
+                        Kcur = build_norm(Kcur, layer.k_norm, nullptr, norm_t, eps, il);
                         cb(Kcur, "Kcur_norm_per_head", il);
                     }
                 }
@@ -258,11 +258,6 @@ ggml_tensor * mtmd_graph::build_vit(
             cb(cur, "attn_out_scaled", il);
         }
 
-        if (layer.attn_post_norm_w) {
-            cur = build_norm(cur, layer.attn_post_norm_w, nullptr, norm_t, eps, il);
-            cb(cur, "attn_post_normed", il);
-        }
-
         // re-add the layer input, e.g., residual
         cur = ggml_add(ctx0, cur, inpL);
 
@@ -279,20 +274,13 @@ ggml_tensor * mtmd_graph::build_vit(
         cb(cur, "ffn_inp_normed", il);
 
         // ffn
-        cur = layer.ff_gate_exps_w
-            ? build_moe_ffn(cur, layer, ffn_t, il)
-            : build_ffn(cur,
-                layer.ff_up_w, layer.ff_up_b,
-                layer.ff_gate_w, layer.ff_gate_b,
-                layer.ff_down_w, layer.ff_down_b,
-                ffn_t, il);
+        cur = build_ffn(cur,
+            layer.ff_up_w, layer.ff_up_b,
+            layer.ff_gate_w, layer.ff_gate_b,
+            layer.ff_down_w, layer.ff_down_b,
+            ffn_t, il);
 
         cb(cur, "ffn_out", il);
-
-        if (layer.ff_post_norm_w) {
-            cur = build_norm(cur, layer.ff_post_norm_w, nullptr, norm_t, eps, il);
-            cb(cur, "ffn_post_normed", il);
-        }
 
         if (layer.ls_2_w) {
             cur = ggml_mul(ctx0, cur, layer.ls_2_w);
@@ -302,11 +290,6 @@ ggml_tensor * mtmd_graph::build_vit(
         // residual 2
         cur = ggml_add(ctx0, inpL, cur);
         cb(cur, "layer_out", il);
-
-        if (layer.ls_out_w) {
-            cur = ggml_mul(ctx0, cur, layer.ls_out_w);
-            cb(cur, "layer_out_scaled", il);
-        }
 
         inpL = cur;
     }
@@ -341,36 +324,6 @@ ggml_tensor * mtmd_graph::build_inp_raw(int channels) {
     ggml_set_name(inp_raw, "inp_raw");
     ggml_set_input(inp_raw);
     return inp_raw;
-}
-
-// qwen-vl style temporal merge: Conv3D(kt=2) split into 2 Conv2D
-ggml_tensor * mtmd_graph::build_inp_temporal_merge() {
-    ggml_tensor * inp_raw = build_inp_raw();
-
-    GGML_ASSERT(img.nx() % (patch_size * 2) == 0);
-    GGML_ASSERT(img.ny() % (patch_size * 2) == 0);
-
-    const size_t nb1 = ggml_row_size(inp_raw->type, img.nx());
-    const size_t nb2 = ggml_row_size(inp_raw->type, img.nx() * img.ny());
-
-    if (n_batch == 1) {
-        // still image input
-        return ggml_add(ctx0,
-            ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1),
-            ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1));
-    } else if (n_batch == 2) {
-        // 2 frames input (video input)
-        ggml_tensor * inp_0 = ggml_view_3d(ctx0, inp_raw,
-                                    img.nx(), img.ny(), 3, nb1, nb2, 0);
-        ggml_tensor * inp_1 = ggml_view_3d(ctx0, inp_raw,
-                                    img.nx(), img.ny(), 3, nb1, nb2,
-                                    nb2 * 3); // move to the second frame
-        return ggml_add(ctx0,
-            ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_0, patch_size, patch_size, 0, 0, 1, 1),
-            ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_1, patch_size, patch_size, 0, 0, 1, 1));
-    } else {
-        GGML_ASSERT(false && "n_batch > 2 is not supported");
-    }
 }
 
 ggml_tensor * mtmd_graph::build_inp_attn_mask(int64_t n_kv, int64_t n_q, int idx) {
@@ -441,9 +394,7 @@ ggml_tensor * mtmd_graph::build_ffn(
     switch (type_op) {
         case FFN_SILU:
             if (gate) {
-                cur = hparams.swiglu_clamp > 0.0f
-                    ? ggml_swiglu_clamp(ctx0, cur, tmp, hparams.swiglu_clamp)
-                    : ggml_swiglu_split(ctx0, cur, tmp);
+                cur = ggml_swiglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_swiglu", il);
             } else {
                 cur = ggml_silu(ctx0, cur);
@@ -496,50 +447,6 @@ ggml_tensor * mtmd_graph::build_ffn(
     return cur;
 }
 
-// MoE FFN with sigmoid router and normalized top-k weights (dots3note vision)
-// the router runs in fp32; exp_probs_b only affects expert selection, not the weights
-ggml_tensor * mtmd_graph::build_moe_ffn(ggml_tensor * cur, const mtmd_layer & layer, ffn_op_type type_op, int il) const {
-    const int64_t n_tokens      = cur->ne[1];
-    const int64_t n_expert      = layer.ff_gate_exps_w->ne[2];
-    const int64_t n_expert_used = std::min((int64_t) hparams.n_expert_used, n_expert);
-    GGML_ASSERT(n_expert_used > 0);
-    GGML_ASSERT(type_op == FFN_SILU);
-
-    ggml_tensor * probs = ggml_sigmoid(ctx0, build_mm(layer.ff_gate_inp_w, cur)); // [n_expert, n_tokens]
-    cb(probs, "ffn_moe_probs", il);
-
-    ggml_tensor * sel = layer.ff_exp_probs_b
-        ? ggml_add(ctx0, probs, layer.ff_exp_probs_b)
-        : probs;
-    ggml_tensor * selected = ggml_top_k(ctx0, sel, n_expert_used); // [n_expert_used, n_tokens]
-
-    ggml_tensor * weights = ggml_get_rows(ctx0,
-        ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens), selected);
-    weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
-    weights = ggml_div(ctx0, weights, ggml_sum_rows(ctx0, weights));
-    weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
-    cb(weights, "ffn_moe_weights", il);
-
-    cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_tokens);
-    ggml_tensor * gate = ggml_mul_mat_id(ctx0, layer.ff_gate_exps_w, cur, selected); // [n_ff, n_expert_used, n_tokens]
-    ggml_tensor * up   = ggml_mul_mat_id(ctx0, layer.ff_up_exps_w,   cur, selected);
-    cur = ggml_mul(ctx0, ggml_silu(ctx0, gate), up);
-    cur = ggml_mul_mat_id(ctx0, layer.ff_down_exps_w, cur, selected); // [n_embd, n_expert_used, n_tokens]
-    cur = ggml_mul(ctx0, cur, weights);
-
-    // sum over the selected experts
-    ggml_tensor * out = nullptr;
-    for (int64_t i = 0; i < n_expert_used; i++) {
-        ggml_tensor * v = ggml_view_2d(ctx0, cur, cur->ne[0], n_tokens, cur->nb[2], i * cur->nb[1]);
-        out = out ? ggml_add(ctx0, out, v) : v;
-    }
-    if (n_expert_used == 1) {
-        out = ggml_cont(ctx0, out);
-    }
-    cb(out, "ffn_moe_out", il);
-    return out;
-}
-
 ggml_tensor * mtmd_graph::build_attn(
         ggml_tensor * wo,
         ggml_tensor * wo_b,
@@ -548,8 +455,7 @@ ggml_tensor * mtmd_graph::build_attn(
         ggml_tensor * v_cur,
         ggml_tensor * kq_mask,
         float kq_scale,
-        int il,
-        ggml_tensor * sinks) const {
+        int il) const {
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // the order is fixed without the compute flag, so an unselected branch stays out of the compute set
@@ -575,9 +481,6 @@ ggml_tensor * mtmd_graph::build_attn(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f);
         ggml_prec_set_acc(cur, GGML_PREC_F32);
-        if (sinks != nullptr) {
-            ggml_flash_attn_ext_add_sinks(cur, sinks);
-        }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
 
@@ -590,9 +493,6 @@ ggml_tensor * mtmd_graph::build_attn(
         // ggml_prec_set_acc(kq, GGML_PREC_BF16);
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, 0.0f);
-        if (sinks != nullptr) {
-            ggml_soft_max_add_sinks(kq, sinks);
-        }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
@@ -662,44 +562,8 @@ ggml_tensor * mtmd_graph::build_rope_2d(
     return cur;
 }
 
-// Generic function to stack frames for audio processing
-// Abstracts out the StackAudioFrames logic used by ultravox
-ggml_tensor * mtmd_graph::build_stack(ggml_tensor * cur, int32_t stack_factor, int32_t n_embed) {
-    if (stack_factor <= 1) {
-        return cur;
-    }
-
-    int64_t total_elements = ggml_nelements(cur);
-    int64_t stride = n_embed * stack_factor;
-
-    // Calculate padded length
-    int64_t padded_len = GGML_PAD(total_elements, stride);
-    int64_t pad = padded_len - total_elements;
-
-    if (pad > 0) {
-        // Pad the tensor to make it divisible by stride
-        cur = ggml_view_1d(ctx0, cur, total_elements, 0);
-        cur = ggml_pad(ctx0, cur, pad, 0, 0, 0);
-    }
-
-    // Reshape to [stride, padded_len / stride]
-    cur = ggml_view_2d(ctx0, cur, stride, padded_len / stride,
-                        ggml_row_size(cur->type, stride), 0);
-    return cur;
-}
-
 // aka pixel_shuffle / pixel_unshuffle / patch_merger (Kimi-VL)
 // support dynamic resolution
-ggml_tensor * mtmd_graph::build_suffix(ggml_tensor * cur) {
-    for (int idx : mtmd_suffix_rows(img.suffix_type)) {
-        GGML_ASSERT(model.tok_embd_sep && idx < model.tok_embd_sep->ne[1]);
-        ggml_tensor * row = ggml_view_2d(ctx0, model.tok_embd_sep, model.tok_embd_sep->ne[0], 1,
-                                         model.tok_embd_sep->nb[1], idx * model.tok_embd_sep->nb[1]);
-        cur = ggml_concat(ctx0, cur, ggml_cast(ctx0, row, cur->type), 1);
-    }
-    return cur;
-}
-
 ggml_tensor * mtmd_graph::build_patch_merge_permute(ggml_tensor * cur, int scale_factor) {
     GGML_ASSERT(scale_factor > 1);
 

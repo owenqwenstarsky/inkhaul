@@ -2,7 +2,7 @@
 
 Goal: run Inkling 2 Mini on an M5 MacBook (24 GB unified memory) by keeping the routed expert weights on disk and holding only a fixed-size expert cache in RAM (default 512 MiB, set with one flag, always on). Then strip the fork down to Inkling 2 on Apple Silicon.
 
-Status: approved. Phases 1 and 2 are committed (see 12, 13). Phase 3 is in progress; its first part is committed (see 14). Phases 4-5 are open.
+Status: approved. Phases 1, 2 and 3 are committed (see 12, 13, 14). Phases 4-5 are open.
 
 Target: [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF). The model is not downloaded or run during this work.
 
@@ -317,7 +317,7 @@ Verified on Metal (code-level tests only, no real model):
 - Item 1 (parallel reads) is implemented: a persistent pool in `llama-moe-cache.cpp`, default 4 threads, `LLAMA_LONGHAUL_IO_THREADS` (1-64), one 8 MiB staging buffer per thread (32 MiB in total, as before). The uploads to the bank are serialized with a mutex. Tested for equal logits with 1, 4 and 16 threads, and the pool alone under ThreadSanitizer. **Not measured**: the default of 4 comes from the SSD's queue depth, not from a benchmark, since the model is not run here. Measure it with `llama-bench` and `LLAMA_LONGHAUL_IO_THREADS=1/2/4/8`.
 - Items 2-4 (direct reads into the Metal buffer, eviction tuning, prefill numbers) need profiles, traces or benchmarks of the real model, so they wait until you can run it.
 
-## 14. Phase 3 status (in progress)
+## 14. Phase 3 status (done)
 
 Committed in fe2a11a (steps 1-9 of section 7, and the speculative part of step 13):
 
@@ -340,7 +340,7 @@ Committed in fe2a11a (steps 1-9 of section 7, and the speculative part of step 1
 - Public API kept for DSpark: `llama_set_embeddings_nextn`, `llama_get_embeddings_nextn[_ith]`, the layer input buffers and `llama_batch_ext_add_embd_row`.
 - mtmd: `inkling2v` is the only encoder left, and `mtmd-helper-gen.cpp` is a stub. Unlike step 14, the ffmpeg video helper is kept.
 
-Done, uncommitted:
+Committed in e1545e1:
 
 - Control vectors: `llama_set_adapter_cvec`, `llama_adapter_cvec`, `common_control_vector_*`, `--control-vector*` and `tools/cvector-generator` are removed.
 - Vocab: only the `gpt2` (BPE) and `test` tokenizer models load; the others throw "unknown tokenizer".
@@ -363,11 +363,32 @@ Done, uncommitted:
   - `tools/tts`, `LLAMA_EXAMPLE_TTS`, `--tts-speaker-{file,text}`, `scripts/chat_tts_norm.py` and `docs/tts-norm-patterns.md` are removed.
   - The server's audio endpoints stay (generic, and already gated off because mtmd has no audio here). Transcription uses the generic "Transcribe audio to text" prompt, and `/tts` sends the input as is.
 
-Open: the rest of steps 9-16:
+Committed after e1545e1 (steps 14-16 and the rest of 13, done by three parallel worktree agents and reviewed):
 
-- mtmd: the optional tensors of other models in `mtmd-model.cpp` (deepstack, lfm3vl, MoE, sinks), and the phonemizer fields (`mtmd-model.h`).
-- Python and gguf-py (including `conversion/tiny_voca.py`).
-- Templates and docs, including `docs/speculative.md`, `examples/speculative-simple/README.md`, `tools/server/tests/README.md`, `docs/multimodal/tts.md`, `tools/mtmd/README-dev.md` and the `*-tts.jinja` templates.
-- `tools/server/tests/unit/`: `test_template.py`, `test_compat_anthropic.py` and `test_tool_call.py` use templates of removed parsers (K2-Horizon, LFM3, gpt-oss). They are not run here.
-- `tools/server/tests/unit/test_spec_methods.py`. Its targets are other archs, so it goes.
-- The never-assigned hparams that remain in shared code.
+- Python:
+  - `conversion/` keeps `base.py`, `inkling2.py`, a new `dspark.py` (the DFlash/DSpark drafter converter, now on `TextModel`) and `__init__.py`.
+  - `convert_hf_to_gguf.py` loses the Mistral, MTP, PLE, sentence-transformers and QKV-fusion paths. `convert_hf_to_gguf_update.py` keeps the inkling2 entry only.
+  - `convert_llama_ggml_to_gguf.py` and `examples/convert_legacy_llama.py` are deleted.
+  - gguf-py:
+    - `constants.py` keeps the INKLING2, INKLING2_LOOP, DFLASH and MMPROJ (inkling2v) lists, plus the keys the C++ side or the kept python still uses.
+    - `gguf_writer.py` loses 194 unused `add_*` methods.
+  - `tensor_mapping.py` was pruned conservatively: only entries for removed tensors went. The plan's before/after conversion on a real checkpoint was not run (no model downloads). Instead, in-memory synthetic DSpark and inkling2v conversions give bit-identical output before and after.
+  - `test_conversion_fp8.py` keeps only the Inkling2 tests.
+- C++ cleanup:
+  - mtmd drops the fields and tensors of other models (TTS, codec, g2p, deepstack, lfm3vl, MoE, sinks, post-norms). The public `mtmd.h` API is unchanged.
+  - Removed hparams nothing assigns: PLE, MLA, alibi, softcap, clamp_kqv, group/layer norm, rel buckets, deepstack, swiglu clamps, gating func, dsv4 HC, indexer.
+  - `llama-arch` loses 87 KV names and 9 tensors that are now unused.
+- Templates and docs:
+  - Removed the 25 templates nothing references, `docs/multimodal/` and `test_spec_methods.py` (plus its workflow).
+  - Rewrote `docs/multimodal.md`, `docs/speculative.md`, `examples/speculative-simple/README.md`, `docs/multi-gpu.md`, `tools/mtmd/README*.md` and `HOWTO-add-model.md` for the fork.
+  - Moved the removed-parser server tests onto kept templates.
+
+Phase 3 follow-ups (not blocking):
+
+- hparams still never assigned: `ssm_*`, `n_embd_head_kda`, and the `rs_replay` code that reads them. Also the `v_mla` plumbing in `build_attn`.
+- About 42 LLM_KV keys are used only by the `test-llama-archs` fixture writers.
+- Test coverage:
+  - The generic FP8 conversion code is now tested only through the Inkling2 packed-expert tests, and nothing tests a synthetic DSpark conversion.
+  - The generic `defer_loading`/`tool_reference` path has no test template.
+- The server python suite still uses LLaMA presets this fork cannot load (not run here).
+- `mtmd-cli` prints llava/MobileVLM hints, `arg.cpp` has the `--vision-gemma-*` presets, and the `/tts` README section lists model-specific params.

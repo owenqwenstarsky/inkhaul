@@ -178,25 +178,6 @@ struct mtmd_model_loader {
             if (is_vision) {
                 get_u32(KEY_IMAGE_SIZE, hparams.image_size);
                 get_u32(KEY_PATCH_SIZE, hparams.patch_size);
-                get_u32(KEY_MAX_SLICE_NUMS, hparams.max_slice_nums, false);
-                get_i32(KEY_MINICPMV_VERSION, hparams.minicpmv_version, false); // legacy
-                get_u32(KEY_MINICPMV_QUERY_NUM, hparams.minicpmv_query_num, false);
-                if (hparams.minicpmv_query_num == 0) {
-                    // Fallback to hardcoded values for legacy models
-                    if (hparams.minicpmv_version == 3) {
-                        hparams.minicpmv_query_num = 64;
-                    } else if (hparams.minicpmv_version == 4) {
-                        hparams.minicpmv_query_num = 64;
-                    } else if (hparams.minicpmv_version == 5) {
-                        hparams.minicpmv_query_num = 64;
-                    } else if (hparams.minicpmv_version == 6) {
-                        hparams.minicpmv_query_num = 64;
-                    } else if (hparams.minicpmv_version == 100045) {
-                        hparams.minicpmv_query_num = 64;
-                    } else {
-                        hparams.minicpmv_query_num = 96;
-                    }
-                }
             } else if (is_audio) {
                 get_u32(KEY_A_NUM_MEL_BINS, hparams.n_mel_bins);
                 // some hparams are unused, but still need to set to avoid issues
@@ -207,28 +188,9 @@ struct mtmd_model_loader {
                 // these are unused, but still need to be set to avoid issues
                 hparams.image_size = 0;
                 hparams.patch_size = 1;
-                get_string(KEY_GEN_AUDIO_VARIANT, hparams.gen_model_variant, false);
-                get_string(KEY_GEN_AUDIO_DEFAULT_VOICE, hparams.gen_default_voice, false);
 
             } else {
                 GGML_ASSERT(false && "unknown modality");
-            }
-
-            // for pinpoints, we need to convert it into a list of resolution candidates
-            {
-                std::vector<int> pinpoints;
-                get_arr_int(KEY_IMAGE_GRID_PINPOINTS, pinpoints, false);
-                if (pinpoints.size() % 2 != 0) {
-                    throw std::runtime_error(mtmd_format("%s: image_grid_pinpoints must have an even number of elements, got %zu\n", __func__, pinpoints.size()));
-                }
-                if (!pinpoints.empty()) {
-                    for (size_t i = 0; i < pinpoints.size(); i += 2) {
-                        hparams.image_res_candidates.push_back({
-                            pinpoints[i],
-                            pinpoints[i+1],
-                        });
-                    }
-                }
             }
 
             // default warmup value
@@ -254,14 +216,6 @@ struct mtmd_model_loader {
                 }
             }
 
-            {
-                std::string mm_patch_merge_type;
-                get_string(KEY_MM_PATCH_MERGE_TYPE, mm_patch_merge_type, false);
-                if (mm_patch_merge_type == "spatial_unpad") {
-                    hparams.mm_patch_merge_type = PATCH_MERGE_SPATIAL_UNPAD;
-                }
-            }
-
             if (is_vision) {
                 std::vector<float> image_mean;
                 std::vector<float> image_std;
@@ -273,16 +227,6 @@ struct mtmd_model_loader {
                 for (int i = 0; i < 3; ++i) {
                     hparams.image_mean[i] = image_mean[i];
                     hparams.image_std[i]  = image_std[i];
-                }
-            }
-
-            // Load the vision/audio feature layer indices if they are explicitly provided
-            // NOTE: gguf conversions should standardize the values of the vision feature layer to be non-negative, since we use -1 to mark values as unset here.
-            get_arr_int(mtmd_format(KEY_FEATURE_LAYERS, prefix), hparams.feature_layers, false);
-            for (const auto & v : hparams.feature_layers) {
-                if (v > (int) hparams.n_layer) {
-                    throw std::runtime_error(mtmd_format("%s: feature layer index %d is out of range (n_layer: %d)",
-                                                           __func__, v, hparams.n_layer));
                 }
             }
 
@@ -323,9 +267,6 @@ struct mtmd_model_loader {
                 if (hparams.n_merge <= 0 || hparams.n_merge >= 65536) {
                     throw std::runtime_error(mtmd_format("%s: n_merge (%d) must be greater than 0 and less than 65536\n", __func__, hparams.n_merge));
                 }
-                if (hparams.attn_window_size > 4096) {
-                    throw std::runtime_error(mtmd_format("%s: attn_window_size (%d) is too large (max 4096)\n", __func__, hparams.attn_window_size));
-                }
             }
 
             LOG_INF("%s: projector:          %s\n", __func__, proj_type.c_str());
@@ -339,45 +280,26 @@ struct mtmd_model_loader {
                 LOG_INF("\n--- vision hparams ---\n");
                 LOG_INF("%s: image_size:         %d\n", __func__, hparams.image_size);
                 LOG_INF("%s: patch_size:         %d\n", __func__, hparams.patch_size);
-                LOG_INF("%s: has_llava_proj:     %d\n", __func__, hparams.has_llava_projector);
-                LOG_INF("%s: minicpmv_version:   %d\n", __func__, hparams.minicpmv_version);
                 LOG_INF("%s: n_merge:            %d\n", __func__, hparams.n_merge);
-                LOG_INF("%s: n_wa_pattern: %d\n", __func__, hparams.n_wa_pattern);
-                if (!hparams.wa_layer_indexes.empty()) {
-                    LOG_INF("%s: wa_layer_indexes:  ", __func__);
-                    for (auto & layer : hparams.wa_layer_indexes) {
-                        LOG_INF("%d ", layer);
-                    }
-                    LOG_INF("\n");
-                }
                 if (hparams.image_min_pixels > 0) {
                     LOG_INF("%s: image_min_pixels:   %d%s\n", __func__, hparams.image_min_pixels, hparams.custom_image_min_tokens > 0 ? " (custom value)" : "");
                 }
                 if (hparams.image_max_pixels > 0) {
                     LOG_INF("%s: image_max_pixels:   %d%s\n", __func__, hparams.image_max_pixels, hparams.custom_image_max_tokens > 0 ? " (custom value)" : "");
                 }
-                if (hparams.preproc_max_tiles > 0) {
-                    LOG_INF("%s: preproc_tiles:      %d - %d\n", __func__, hparams.preproc_min_tiles, hparams.preproc_max_tiles);
-                }
             } else if (is_audio) {
                 LOG_INF("\n--- audio hparams ---\n");
                 LOG_INF("%s: n_mel_bins:         %d\n", __func__, hparams.n_mel_bins);
-                LOG_INF("%s: proj_stack_factor:  %d\n", __func__, hparams.proj_stack_factor);
-                LOG_INF("%s: audio_chunk_len:    %d\n", __func__, hparams.audio_chunk_len);
                 LOG_INF("%s: audio_sample_rate:  %d\n", __func__, hparams.audio_sample_rate);
-                LOG_INF("%s: audio_n_fft:        %d\n", __func__, hparams.audio_n_fft);
-                LOG_INF("%s: audio_window_len:   %d\n", __func__, hparams.audio_window_len);
                 LOG_INF("%s: audio_hop_len:      %d\n", __func__, hparams.audio_hop_len);
 
-                const bool fft_based = true;
-
                 // Validate audio hparams loaded from GGUF metadata
-                if (hparams.n_mel_bins <= 0 || (fft_based && hparams.n_mel_bins > 256)) {
+                if (hparams.n_mel_bins <= 0 || hparams.n_mel_bins > 256) {
                     throw std::runtime_error(mtmd_format("%s: n_mel_bins (%d) must be in range [1, 256]\n", __func__, hparams.n_mel_bins));
                 }
-                if (fft_based && (hparams.audio_sample_rate <= 0 || hparams.audio_n_fft <= 0 || hparams.audio_hop_len <= 0 || hparams.audio_window_len <= 0)) {
-                    throw std::runtime_error(mtmd_format("%s: audio hparams invalid: sample_rate=%d n_fft=%d window_len=%d hop_len=%d\n",
-                        __func__, hparams.audio_sample_rate, hparams.audio_n_fft, hparams.audio_window_len, hparams.audio_hop_len));
+                if (hparams.audio_sample_rate <= 0 || hparams.audio_hop_len <= 0) {
+                    throw std::runtime_error(mtmd_format("%s: audio hparams invalid: sample_rate=%d hop_len=%d\n",
+                        __func__, hparams.audio_sample_rate, hparams.audio_hop_len));
                 }
             }
             LOG_INF("\n");
@@ -454,16 +376,8 @@ struct mtmd_model_loader {
 
         model.patch_bias = get_tensor(TN_PATCH_BIAS, false);
         model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   has_patch_embd);
-        model.patch_embeddings_1 = get_tensor(TN_PATCH_EMBD_1, false);
-
-        model.norm_embd_w = get_tensor(mtmd_format(TN_NORM_EMBD, "weight"), false);
-        model.norm_embd_b = get_tensor(mtmd_format(TN_NORM_EMBD, "bias"),   false);
 
         model.position_embeddings = get_tensor(mtmd_format(TN_POS_EMBD, prefix), false);
-
-        // lfm3vl
-        model.lfm3vl_embedding_norm_w = get_tensor(mtmd_format(TN_LFM3VL_EMBEDDING_NORM, prefix, "weight"), false);
-
 
         // layers
         const int n_layers_to_load = hparams.n_layer;
@@ -482,9 +396,6 @@ struct mtmd_model_loader {
             layer.ln_2_w = get_tensor(mtmd_format(TN_LN_2,        prefix, il, "weight"), false);
             layer.ls_1_w        = get_tensor(mtmd_format(TN_LS_1,         prefix, il, "weight"), false); // no bias
             layer.ls_2_w        = get_tensor(mtmd_format(TN_LS_2,         prefix, il, "weight"), false); // no bias
-            layer.ls_out_w      = get_tensor(mtmd_format(TN_LS_OUT,        prefix, il, "weight"), false); // no bias
-            layer.attn_post_norm_w = get_tensor(mtmd_format(TN_ATTN_POST_NORM, prefix, il, "weight"), false); // no bias
-            layer.ff_post_norm_w   = get_tensor(mtmd_format(TN_FFN_POST_NORM,  prefix, il, "weight"), false); // no bias
 
             layer.k_b    = get_tensor(mtmd_format(TN_ATTN_K,      prefix, il, "bias"), false);
             layer.q_b    = get_tensor(mtmd_format(TN_ATTN_Q,      prefix, il, "bias"), false);
@@ -494,41 +405,13 @@ struct mtmd_model_loader {
             layer.ln_1_b = get_tensor(mtmd_format(TN_LN_1,        prefix, il, "bias"), false);
             layer.ln_2_b = get_tensor(mtmd_format(TN_LN_2,        prefix, il, "bias"), false);
 
-            // MoE ffn (dots3note vision pyramid blocks); replaces the dense ffn when present
-            layer.ff_gate_inp_w  = get_tensor(mtmd_format(TN_FFN_GATE_INP,  prefix, il, "weight"), false);
-            layer.ff_gate_exps_w = get_tensor(mtmd_format(TN_FFN_GATE_EXPS, prefix, il, "weight"), false);
-            layer.ff_up_exps_w   = get_tensor(mtmd_format(TN_FFN_UP_EXPS,   prefix, il, "weight"), false);
-            layer.ff_down_exps_w = get_tensor(mtmd_format(TN_FFN_DOWN_EXPS, prefix, il, "weight"), false);
-            layer.ff_exp_probs_b = get_tensor(mtmd_format(TN_FFN_EXP_PROBS_B, prefix, il, "weight"), false);
-            const bool is_moe = layer.ff_gate_exps_w != nullptr;
-
             // ffn
-            layer.ff_up_w   = get_tensor(mtmd_format(TN_FFN_UP,   prefix, il, "weight"), !is_moe);
+            layer.ff_up_w   = get_tensor(mtmd_format(TN_FFN_UP,   prefix, il, "weight"));
             layer.ff_up_b   = get_tensor(mtmd_format(TN_FFN_UP,   prefix, il, "bias"),   false);
             layer.ff_gate_w = get_tensor(mtmd_format(TN_FFN_GATE, prefix, il, "weight"), false);
             layer.ff_gate_b = get_tensor(mtmd_format(TN_FFN_GATE, prefix, il, "bias"),   false);
-            layer.ff_down_w = get_tensor(mtmd_format(TN_FFN_DOWN, prefix, il, "weight"), !is_moe);
+            layer.ff_down_w = get_tensor(mtmd_format(TN_FFN_DOWN, prefix, il, "weight"));
             layer.ff_down_b = get_tensor(mtmd_format(TN_FFN_DOWN, prefix, il, "bias"),   false);
-
-            // mimovl per-head attention sink bias
-            layer.attn_sinks = get_tensor(mtmd_format(TN_ATTN_SINKS, prefix, il), false);
-
-            // qwen3vl deepstack layer
-            layer.deepstack_norm_w = get_tensor(mtmd_format(TN_DEEPSTACK_NORM, il, "weight"), false);
-            layer.deepstack_norm_b = get_tensor(mtmd_format(TN_DEEPSTACK_NORM, il, "bias"), false);
-            layer.deepstack_fc1_w  = get_tensor(mtmd_format(TN_DEEPSTACK_FC1,  il, "weight"), false);
-            layer.deepstack_fc1_b  = get_tensor(mtmd_format(TN_DEEPSTACK_FC1,  il, "bias"), false);
-            layer.deepstack_fc2_w  = get_tensor(mtmd_format(TN_DEEPSTACK_FC2,  il, "weight"), false);
-            layer.deepstack_fc2_b  = get_tensor(mtmd_format(TN_DEEPSTACK_FC2,  il, "bias"), false);
-            if (layer.has_deepstack()) {
-                model.n_deepstack_layers++;
-            }
-
-            // lfm3vl conv layers
-            layer.conv2d_in_proj_w  = get_tensor(mtmd_format(TN_LFM3VL_CONV2D_IN_PROJ,  prefix, il, "weight"), false);
-            layer.conv2d_spatial_w  = get_tensor(mtmd_format(TN_LFM3VL_CONV2D_SPATIAL,  prefix, il, "weight"), false);
-            layer.conv2d_out_proj_w = get_tensor(mtmd_format(TN_LFM3VL_CONV2D_OUT_PROJ, prefix, il, "weight"), false);
-
         }
 
         switch (model.proj_type) {
@@ -617,17 +500,6 @@ struct mtmd_model_loader {
         output = gguf_get_val_bool(ctx_gguf.get(), i);
     }
 
-    void get_i32(const std::string & key, int & output, bool required = true) const {
-        const int i = gguf_find_key(ctx_gguf.get(), key.c_str());
-        if (i < 0) {
-            if (required) {
-                throw std::runtime_error("Key not found: " + key);
-            }
-            return;
-        }
-        output = gguf_get_val_i32(ctx_gguf.get(), i);
-    }
-
     void get_u32(const std::string & key, int & output, bool required = true) const {
         const int i = gguf_find_key(ctx_gguf.get(), key.c_str());
         if (i < 0) {
@@ -692,33 +564,6 @@ struct mtmd_model_loader {
         }
         output = std::string(gguf_get_val_str(ctx_gguf.get(), i));
     }
-
-    void get_arr_int(const std::string & key, std::vector<int> & output, bool required = true) const {
-        const int i = gguf_find_key(ctx_gguf.get(), key.c_str());
-        if (i < 0) {
-            if (required) {
-                throw std::runtime_error("Key not found: " + key);
-            }
-            return;
-        }
-        if (gguf_get_kv_type(ctx_gguf.get(), i) != GGUF_TYPE_ARRAY) {
-            throw std::runtime_error(mtmd_format("%s: key '%s' is not an array\n", __func__, key.c_str()));
-        }
-        const auto type = gguf_get_arr_type(ctx_gguf.get(), i);
-        if (type != GGUF_TYPE_INT32) {
-            throw std::runtime_error(mtmd_format("%s: array '%s' has type %d, expected %d (GGUF_TYPE_INT32)\n", __func__, key.c_str(), type, GGUF_TYPE_INT32));
-        }
-        const size_t n = gguf_get_arr_n(ctx_gguf.get(), i);
-        if (n > (size_t) std::numeric_limits<int>::max()) {
-            throw std::runtime_error(mtmd_format("%s: array '%s' is too large (%zu elements)\n", __func__, key.c_str(), n));
-        }
-        output.resize(n);
-        const int32_t * values = (const int32_t *)gguf_get_arr_data(ctx_gguf.get(), i);
-        for (size_t j = 0; j < n; ++j) {
-            output[j] = values[j];
-        }
-    }
-
 };
 
 //
@@ -737,10 +582,6 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
         model->hparams.custom_image_max_tokens = params.image_max_tokens;
         loader.load_hparams(*model, modality);
         loader.load_tensors(*model, buft, params.no_alloc);
-        const std::string & def = model->hparams.gen_default_voice;
-        if (!def.empty() && model->gen_voices.find(def) == model->gen_voices.end()) {
-            throw std::runtime_error(mtmd_format("%s: default voice \"%s\" is not a predefined voice\n", __func__, def.c_str()));
-        }
         return model;
     };
 
@@ -829,32 +670,6 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
     n_patches += (int) mtmd_suffix_rows(img->suffix_type).size();
 
     return n_patches;
-}
-
-size_t mtmd_model::cbx_read_tensor(const char * name, float * out, size_t n_max) const {
-    const auto & tensors = cbx_tensors;
-    auto it = tensors.find(name);
-    if (it == tensors.end() || !it->second) {
-        return 0;
-    }
-    ggml_tensor * t = it->second;
-    const size_t n = (size_t) ggml_nelements(t);
-    if (!out) {
-        return n;
-    }
-    if (n_max < n) {
-        return 0;
-    }
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out, 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-        for (size_t i = 0; i < n; i++) out[i] = ggml_fp16_to_fp32(tmp[i]);
-    } else {
-        return 0;
-    }
-    return n;
 }
 
 int mtmd_model::n_mmproj_embd() const {

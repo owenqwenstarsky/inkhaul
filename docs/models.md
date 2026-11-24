@@ -25,19 +25,9 @@ The Hugging Face platform provides a variety of online tools for converting, qua
 - Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: https://github.com/ggml-org/llama.cpp/discussions/9268)
 - Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: https://github.com/ggml-org/llama.cpp/discussions/9669)
 
-## Exporting per-layer embeddings separately
+## Loading extra shards
 
-For models with a per-layer embedding (PLE) table, export the backbone and table from the same checkpoint:
-
-```sh
-python3 convert_hf_to_gguf.py /path/to/model --no-ple --outfile model-no-ple.gguf
-python3 convert_hf_to_gguf.py /path/to/model --ple-only --outfile model-ple.gguf
-llama-cli -m model-no-ple.gguf --shard model-ple.gguf
-```
-
-`--no-ple` excludes only `per_layer_token_embd.weight` and keeps the PLE metadata and projection weights. `--ple-only` exports only that table, without a tokenizer. Each export supports `--outtype`, so the table and backbone can use different precisions. Default output names start with `no-ple-` and `ple-` respectively.
-
-These modes are mutually exclusive and require a model with a PLE table, such as Qwen3.8 Flash Next or Gemma 4. They cannot be combined with vocabulary, multimodal projector, MTP-only, or DSpark-only export. `--no-ple` can be combined with `--no-mtp`.
+The converter in this fork has no per-layer embedding (PLE) export (`--no-ple` and `--ple-only` are gone). The loader still accepts extra shards, as described below.
 
 `--ple` is an alias for `--shard`. Extra shards can be comma separated or supplied with repeated options, for example `-m backbone.gguf --shard /fast/ple.gguf,/other/token-embd.gguf`. Paths may be on different drives. Tensor names must be unique across all files, except for the PLE case below.
 

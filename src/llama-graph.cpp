@@ -994,7 +994,6 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     attn_factor      (cparams.yarn_attn_factor),
     beta_fast        (cparams.yarn_beta_fast),
     beta_slow        (cparams.yarn_beta_slow),
-    norm_eps         (hparams.f_norm_eps),
     norm_rms_eps     (hparams.f_norm_rms_eps),
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
@@ -1184,14 +1183,7 @@ ggml_tensor * llm_graph_context::build_norm(
        llm_norm_type   type,
                  int   il) const {
     switch (type) {
-        case LLM_NORM:       cur = ggml_norm    (ctx0, cur, hparams.f_norm_eps);     break;
         case LLM_NORM_RMS:   cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps); break;
-        case LLM_NORM_GROUP:
-            {
-                cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, cur->ne[1]);
-                cur = ggml_group_norm(ctx0, cur, hparams.n_norm_groups, hparams.f_norm_group_eps);
-                cur = ggml_reshape_2d(ctx0, cur, cur->ne[0],    cur->ne[2]);
-            } break;
     }
 
     if (mw || mb) {
@@ -1256,10 +1248,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
             qkv = ggml_add(ctx0, qkv, qkv_b);
             cb(qkv, "wqkv_b", il);
         }
-        if (reshape && hparams.f_clamp_kqv > 0.0f) {
-            qkv = ggml_clamp(ctx0, qkv, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
-            cb(qkv, "wqkv_clamped", il);
-        }
         if (reshape) {
             Qcur = ggml_view_3d(ctx0, qkv, n_embd_head_q, n_head_q, n_tokens,
                 ggml_row_size(qkv->type, n_embd_head_q), qkv->nb[1], 0);
@@ -1293,10 +1281,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
                 cb(Qcur, "Qcur", il);
             }
         }
-        if (reshape && hparams.f_clamp_kqv > 0.0f) {
-            Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
-            cb(Qcur, "Qcur_clamped", il);
-        }
         Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
         if (reshape) {
             cb(Kcur, "Kcur", il);
@@ -1307,10 +1291,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
                 cb(Kcur, "Kcur", il);
             }
         }
-        if (reshape && hparams.f_clamp_kqv > 0.0f) {
-            Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
-            cb(Kcur, "Kcur_clamped", il);
-        }
         Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
         if (reshape) {
             cb(Vcur, "Vcur", il);
@@ -1320,10 +1300,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
             if (reshape) {
                 cb(Vcur, "Vcur", il);
             }
-        }
-        if (reshape && hparams.f_clamp_kqv > 0.0f) {
-            Vcur = ggml_clamp(ctx0, Vcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
-            cb(Vcur, "Vcur_clamped", il);
         }
         if (reshape) {
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_q, n_head_q, n_tokens);
@@ -1391,23 +1367,6 @@ ggml_tensor * llm_graph_context::build_ffn(
     switch (type_op) {
         case LLM_FFN_SILU:
             if (gate && type_gate == LLM_FFN_PAR) {
-                if (il >= 0) {
-                    const float limit = hparams.swiglu_clamp_shexp[il];
-                    constexpr float eps = 1e-6f;
-                    if (limit > eps) {
-                        tmp = ggml_clamp(ctx0, tmp, -limit, limit);
-                        cb(tmp, "ffn_up_clamped", il);
-                        ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                        cb(gate_act, "ffn_silu", il);
-                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                        cb(gate_act, "ffn_silu_clamped", il);
-                        cur = ggml_mul(ctx0, gate_act, tmp);
-                        cb(cur, "ffn_swiglu_limited", il);
-                        type_gate = LLM_FFN_SEQ;
-                        break;
-                    }
-                }
-
                 cur = ggml_swiglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_swiglu", il);
                 type_gate = LLM_FFN_SEQ;
@@ -1773,24 +1732,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         switch (type_op) {
             case LLM_FFN_SILU:
-                if (gate_exps) {
-                    if (il >= 0) {
-                        const float limit = hparams.swiglu_clamp_exp[il];
-                        constexpr float eps = 1e-6f;
-                        if (limit > eps) {
-                            up = ggml_clamp(ctx0, up, -limit, limit);
-                            cb(up, "ffn_moe_up_clamped", il);
-                            ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                            cb(gate_act, "ffn_moe_silu", il);
-                            gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                            cb(gate_act, "ffn_moe_silu_clamped", il);
-                            cur = ggml_mul(ctx0, gate_act, up);
-                            cb(cur, "ffn_moe_swiglu_limited", il);
-                            break;
-                        }
-                    }
-                }
-
                 if (has_gate) {
                     cur = ggml_swiglu_split(ctx0, cur, up);
                     cb(cur, "ffn_moe_swiglu", il);
@@ -2051,12 +1992,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     res->t_inp_embd = cur;
 
-    // NOTE: For deepstack models, only apply scale to token inputs (ie text-only input).
-    //  Raw embeddings are assumed to be multimodal inputs that should not be scaled.
-    const bool scale_tok_only = hparams.f_embedding_scale != 0.0f && hparams.n_deepstack_layers > 0;
-
-    // For Granite architecture
-    if (hparams.f_embedding_scale != 0.0f && !scale_tok_only) {
+    if (hparams.f_embedding_scale != 0.0f) {
         if (!ggml_is_contiguous(cur)) {
             cur = ggml_cont(ctx0, cur);
         }
@@ -2064,7 +2000,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     }
 
     // scale the token rows only, applied after the select so that the graph is the same for any batch contents
-    inp->scale_tok = tok_scale*(scale_tok_only ? hparams.f_embedding_scale : 1.0f);
+    inp->scale_tok = tok_scale;
     if (inp->scale_tok != 1.0f) {
         inp->scale_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
         cb(inp->scale_rows, "inp_scale_rows", -1);
@@ -2233,11 +2169,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         if (kv_rows) {
-            cur = ggml_flash_attn_ext_rows(ctx0, q, k, v, kq_mask, kv_rows, kq_scale, hparams.f_max_alibi_bias,
-                                           hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            cur = ggml_flash_attn_ext_rows(ctx0, q, k, v, kq_mask, kv_rows, kq_scale, 0.0f, 0.0f);
         } else {
-            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f);
         }
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
@@ -2270,21 +2204,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_prec_set_acc(kq, GGML_PREC_BF16);
 
-        if (hparams.attn_soft_cap) {
-            kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_1", il);
-            kq = ggml_tanh (ctx0, kq);
-            cb(kq, "kq_tanh", il);
-            kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_2", il);
-        }
-
         if (kq_b) {
             kq = ggml_add(ctx0, kq, kq_b);
             cb(kq, "kq_plus_kq_b", il);
         }
 
-        kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+        kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, 0.0f);
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
 
@@ -2471,20 +2396,6 @@ ggml_tensor * llm_graph_context::build_attn(
 
 
 
-ggml_tensor * llm_graph_context::build_fused_top_k_mask(
-        ggml_tensor * kq_mask,
-        ggml_tensor * top_k,
-                int   il) const {
-    top_k = ggml_reshape_4d(ctx0, top_k, top_k->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
-
-    ggml_tensor * cur = ggml_top_k_mask(ctx0, kq_mask, top_k, nullptr, nullptr, nullptr);
-    res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, cur, il});
-
-    return cur;
-}
-
-
-
 // the iswa build_attn with the KQ mask and kv_rows given by the caller, which has to keep them in sync
 static ggml_tensor * build_attn_iswa_impl(
         const llm_graph_context & gctx,
@@ -2548,7 +2459,7 @@ static ggml_tensor * build_attn_iswa_impl(
         GGML_ASSERT(mctx_cur->get_n_kv() == gctx.n_tokens);
     }
 
-    const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
+    const bool store_kv = !use_kv_cur;
 
     // optionally store to KV cache
     if (store_kv && k_cur) {
@@ -2720,11 +2631,10 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->has_rep = mctx_cur->get_rs_replay();
     if (inp->has_rep) {
-        // the widest conv window of the model: the delta-net conv, or the PLE n-gram conv (qwen4exp)
+        // the conv window of the model: the delta-net conv
         const int64_t n_conv_r = hparams.ssm_d_conv - 1;
-        const int64_t n_conv_p = hparams.ple_conv_state() > 0 ? (int64_t) (hparams.ple_conv_kernel - 1)*hparams.ple_ngram_size : 0;
 
-        inp->n_conv = std::max(n_conv_r, n_conv_p);
+        inp->n_conv = n_conv_r;
         inp->n_pend = cparams.n_rs_seq + 1;
 
         inp->rep_cols = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, inp->n_conv, n_seqs);
@@ -2736,7 +2646,6 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         };
 
         inp->rep_cols_r = win(n_conv_r);
-        inp->rep_cols_p = n_conv_p > 0 ? win(n_conv_p) : nullptr;
 
         inp->rep_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
         ggml_set_input(inp->rep_n);
@@ -2915,8 +2824,7 @@ void llm_graph_context::build_pooling(
         ggml_tensor * cls,
         ggml_tensor * cls_b,
         ggml_tensor * cls_out,
-        ggml_tensor * cls_out_b,
-        ggml_tensor * cls_norm) const {
+        ggml_tensor * cls_out_b) const {
     if (!cparams.embeddings) {
         // a graph without logits still computes t_embd, so that it is never empty
         if (res->t_logits == nullptr && res->t_embd != nullptr) {
@@ -2977,10 +2885,6 @@ void llm_graph_context::build_pooling(
                         cur = ggml_add(ctx0, cur, cls_b);
                     }
                     cur = ggml_unary(ctx0, cur, hparams.act_cls);
-                    if (cls_norm) {
-                        // head norm
-                        cur = build_norm(cur, cls_norm, NULL, LLM_NORM, -1);
-                    }
                 }
 
                 // some models don't have `cls_out`, for example: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
@@ -3168,29 +3072,3 @@ void llm_graph_context::build_sampling() const {
     */
 }
 
-int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
-    // TODO move to hparams if a T5 variant appears that uses a different value
-    const int64_t max_distance = 128;
-
-    if (bidirectional) {
-        n_buckets >>= 1;
-    }
-
-    const int64_t max_exact = n_buckets >> 1;
-
-    int32_t relative_position = x - y;
-    int32_t relative_bucket = 0;
-
-    if (bidirectional) {
-        relative_bucket += (relative_position > 0) * n_buckets;
-        relative_position = std::abs(relative_position);
-    } else {
-        relative_position = -std::min<int32_t>(relative_position, 0);
-    }
-
-    int32_t relative_position_if_large = floorf(max_exact + logf(1.0 * relative_position / max_exact) * (n_buckets - max_exact) / log(1.0 * max_distance / max_exact));
-    relative_position_if_large = std::min<int32_t>(relative_position_if_large, n_buckets - 1);
-    relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
-
-    return relative_bucket;
-}

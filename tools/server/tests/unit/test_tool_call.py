@@ -130,8 +130,6 @@ def do_test_completion_with_required_tool_tiny(server: ServerProcess, tool: dict
 #
 # @pytest.mark.parametrize("stream", [CompletionMode.NORMAL, CompletionMode.STREAMED])
 # @pytest.mark.parametrize("template_name,tool,argument_key", [
-#     ("Qwen3-Coder",                                   TEST_TOOL,            "success"),
-#     ("Qwen3-Coder",                                   TEST_TOOL,            "success"),
 #     ("meta-llama-Llama-3.3-70B-Instruct",             TEST_TOOL,            "success"),
 #     ("meta-llama-Llama-3.3-70B-Instruct",             TEST_TOOL,            "success"),
 #     ("meta-llama-Llama-3.3-70B-Instruct",             PYTHON_TOOL,          "code"),
@@ -155,10 +153,6 @@ def do_test_completion_with_required_tool_tiny(server: ServerProcess, tool: dict
 
 #     ("meetkai-functionary-medium-v3.1",               TEST_TOOL,            "success"),
 #     ("meetkai-functionary-medium-v3.1",               PYTHON_TOOL,          "code"),
-
-#     ("meetkai-functionary-medium-v3.2",               TEST_TOOL,            "success"),
-#     # Functionary v3.2 format supports raw python content, which w/ a dummy stories model will never end on its own.
-#     # ("meetkai-functionary-medium-v3.2",               PYTHON_TOOL,          "code"),
 
 #     ("NousResearch-Hermes-2-Pro-Llama-3-8B-tool_use", TEST_TOOL,            "success"),
 #     ("NousResearch-Hermes-2-Pro-Llama-3-8B-tool_use", PYTHON_TOOL,          "code"),
@@ -230,8 +224,6 @@ def do_test_completion_with_required_tool_tiny(server: ServerProcess, tool: dict
     # (PYTHON_TOOL,  "code",     "bartowski/Mistral-Nemo-Instruct-2407-GGUF:Q4_K_M", None),
     # (PYTHON_TOOL,  "code",     "bartowski/Mistral-Nemo-Instruct-2407-GGUF:Q4_K_M", "chatml"),
 
-    (TEST_TOOL,    "success",  "bartowski/functionary-small-v3.2-GGUF:Q4_K_M",       ("meetkai/functionary-medium-v3.2", None)),
-    (PYTHON_TOOL,  "code",     "bartowski/functionary-small-v3.2-GGUF:Q4_K_M",       ("meetkai/functionary-medium-v3.2", None)),
     (PYTHON_TOOL,  "code",     "bartowski/functionary-small-v3.2-GGUF:Q4_K_M",       "chatml"),
 
     (TEST_TOOL,    "success",  "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M",      ("meta-llama/Llama-3.2-3B-Instruct", None)),
@@ -321,9 +313,6 @@ def test_completion_without_tool_call_fast(template_name: str, n_predict: int, t
 @pytest.mark.slow
 @pytest.mark.parametrize("stream", [CompletionMode.NORMAL, CompletionMode.STREAMED])
 @pytest.mark.parametrize("template_name,n_predict,tools,tool_choice", [
-    ("meetkai-functionary-medium-v3.2",               256, [],            None),
-    ("meetkai-functionary-medium-v3.2",               256, [TEST_TOOL],   None),
-    ("meetkai-functionary-medium-v3.2",               256, [PYTHON_TOOL], 'none'),
     ("meetkai-functionary-medium-v3.1",               256, [],            None),
     ("meetkai-functionary-medium-v3.1",               256, [TEST_TOOL],   None),
     ("meetkai-functionary-medium-v3.1",               256, [PYTHON_TOOL], 'none'),
@@ -366,9 +355,6 @@ def test_completion_without_tool_call_slow(template_name: str, n_predict: int, t
 
     # ("bartowski/Mistral-Nemo-Instruct-2407-GGUF:Q4_K_M", None),
     # ("bartowski/Mistral-Nemo-Instruct-2407-GGUF:Q4_K_M", "chatml"),
-
-    # ("bartowski/functionary-small-v3.2-GGUF:Q8_0",       ("meetkai/functionary-medium-v3.2", None)),
-    # ("bartowski/functionary-small-v3.2-GGUF:Q8_0",       "chatml"),
 
     ("bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M",      ("meta-llama/Llama-3.2-3B-Instruct", None)),
     ("bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M",      "chatml"),
@@ -432,7 +418,6 @@ def do_test_weather(server: ServerProcess, **kwargs):
     (None,                                           128,  "bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M",         "chatml"),
     (None,                                           128,  "bartowski/Hermes-2-Pro-Llama-3-8B-GGUF:Q4_K_M",     ("NousResearch/Hermes-2-Pro-Llama-3-8B", "tool_use")),
     (None,                                           128,  "bartowski/Hermes-3-Llama-3.1-8B-GGUF:Q4_K_M",       ("NousResearch/Hermes-3-Llama-3.1-8B", "tool_use")),
-    (None,                                           128,  "bartowski/functionary-small-v3.2-GGUF:Q8_0",        ("meetkai/functionary-medium-v3.2", None)),
     (None,                                           128,  "bartowski/Mistral-Nemo-Instruct-2407-GGUF:Q4_K_M",  None),
     (None,                                           128,  "bartowski/Mistral-Nemo-Instruct-2407-GGUF:Q4_K_M",  "chatml"),
     (None,                                           128,  "bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",       None),
@@ -575,7 +560,6 @@ def test_thoughts(n_predict: int, reasoning_format: Literal['deepseek', 'none'] 
     ("bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",      None),
     ("bartowski/Phi-3.5-mini-instruct-GGUF:Q4_K_M",      "chatml"),
 
-    ("bartowski/functionary-small-v3.2-GGUF:Q8_0",       ("meetkai-functionary-medium-v3.2", None)),
     ("bartowski/functionary-small-v3.2-GGUF:Q8_0",       "chatml"),
 
     # ("bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M", None),
@@ -642,54 +626,3 @@ def do_test_hello_world(server: ServerProcess, **kwargs):
     code = actual_arguments["code"]
     assert isinstance(code, str), f"Expected code to be a string, got {type(code)}: {json.dumps(code)}"
     assert re.match(r'''print\(("[Hh]ello,? [Ww]orld!?"|'[Hh]ello,? [Ww]orld!?')\)''', re.sub(r'#.*\n?', '', code)), f'Expected hello world, got {code}'
-
-
-SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "tool_search",
-        "description": "Search for available tools by keyword",
-        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
-    },
-}
-PURCHASE_FUNCTION = {
-    "name": "markItemPurchased",
-    "description": "Mark an item as purchased",
-    "parameters": {"type": "object", "properties": {"id": {"type": "string"}, "qty": {"type": "integer"}}},
-}
-
-PURCHASE_TOOL = {"type": "function", "function": PURCHASE_FUNCTION}
-
-
-def count_deferred_tokens(tools, tool_content):
-    res = server.make_request("POST", "/chat/completions/input_tokens", data={
-        "tools": tools,
-        "messages": [
-            {"role": "user", "content": "Mark item abc as purchased"},
-            {"role": "assistant", "content": None, "tool_calls": [
-                {"id": "call_1", "type": "function",
-                 "function": {"name": "tool_search", "arguments": "{\"query\": \"purchase\"}"}},
-            ]},
-            {"role": "tool", "tool_call_id": "call_1", "content": tool_content},
-        ],
-    })
-    assert res.status_code == 200, res.body
-    return res.body["input_tokens"]
-
-
-def test_deferred_tool_reference():
-    """A defer_loading tool is withheld from the system prompt, a tool_reference reveals its definition"""
-    server.jinja = True
-    server.chat_template_file = '../../../models/templates/LFM3.jinja'
-    server.start()
-
-    deferred = {"type": "function", "function": {**PURCHASE_FUNCTION, "defer_loading": True}}
-    tools = [SEARCH_TOOL, deferred]
-
-    # withheld from the system prompt
-    assert count_deferred_tokens(tools, "none") == count_deferred_tokens([SEARCH_TOOL], "none")
-
-    # the reference renders like the definition sent inline
-    by_reference = count_deferred_tokens(tools, [{"type": "tool_reference", "name": "markItemPurchased"}])
-    inline = count_deferred_tokens(tools, "<additional_tools>\n" + json.dumps(PURCHASE_FUNCTION) + "\n</additional_tools>")
-    assert by_reference == inline

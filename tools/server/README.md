@@ -288,8 +288,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-ngram-size-n N` | the argument has been removed. use the respective --spec-ngram-*-size-n or --spec-ngram-mod-n-match |
 | `--spec-ngram-size-m N` | the argument has been removed. use the respective --spec-ngram-*-size-m |
 | `--spec-ngram-min-hits N` | the argument has been removed. use the respective --spec-ngram-*-min-hits |
-| `--tts-lang FNAME` | language (ISO 639-1) for audio generation<br/>see docs/multimodal/tts.md for per-model usage notes |
-| `--tts-voice VOICE` | voice for audio generation (model-dependent)<br/>see docs/multimodal/tts.md for per-model usage notes |
+| `--tts-lang FNAME` | language (ISO 639-1) for audio generation |
+| `--tts-voice VOICE` | voice for audio generation (model-dependent) |
 | `--embd-gemma-default` | use default EmbeddingGemma model (note: can download weights from the internet) |
 | `--fim-qwen-1.5b-default` | use default Qwen 2.5 Coder 1.5B (note: can download weights from the internet) |
 | `--fim-qwen-3b-default` | use default Qwen 2.5 Coder 3B (note: can download weights from the internet) |
@@ -847,7 +847,7 @@ Causal decoder rerankers (e.g. `Qwen3-VL-Reranker`) have no such limitation.
 
 ### POST `/tts`: Generate speech audio from text
 
-Returns raw audio bytes (`audio/wav` by default) rather than JSON. For the list of supported models and their params, see [docs/multimodal/tts.md](../../docs/multimodal/tts.md)
+Returns raw audio bytes (`audio/wav` by default) rather than JSON. The params depend on the audio generation model. This fork keeps no audio generation model, so the endpoint stays in the API and answers with a "not supported" error.
 
 *Options:*
 
@@ -2369,10 +2369,10 @@ from the files already on disk, and `DELETE /models` drops its partial files.
 ```
 
 Cached models and incomplete downloads carry the sidecar kinds they have on disk
-(`mmproj`, `mtp`, `dflash`, `eagle3`, `dspark`), resolved the way `-hf` loads them:
+(`mmproj`, `dflash`, `dspark`), resolved the way `-hf` loads them:
 
 ```json
-"sidecars": ["mmproj", "mtp"]
+"sidecars": ["mmproj", "dspark"]
 ```
 
 A cached model whose download of more sidecars never finished also lists the kinds not on
@@ -2380,7 +2380,7 @@ disk yet: posting the model with them resumes them, and `DELETE /models` with `&
 drops their partial files.
 
 ```json
-"incomplete_sidecars": ["mtp"]
+"incomplete_sidecars": ["dspark"]
 ```
 
 ### POST `/models/load`: Load a model
@@ -2529,11 +2529,11 @@ Payload:
 ```json
 {
   "model": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
-  "sidecars": ["mmproj", "mtp"]
+  "sidecars": ["mmproj", "dspark"]
 }
 ```
 
-`sidecars` lists the sidecar kinds pulled with the model, picked by the server the way `-hf` picks them: `mmproj`, and the draft heads `mtp`, `dflash`, `eagle3` and `dspark`. It defaults to `["mmproj"]`, as `-hf` does.
+`sidecars` lists the sidecar kinds pulled with the model, picked by the server the way `-hf` picks them: `mmproj`, and the draft models `dflash` and `dspark`. It defaults to `["mmproj"]`, as `-hf` does.
 
 Posting a model that is already in the cache and not running downloads the sidecars it lacks and keeps the files already on disk.
 
@@ -2563,7 +2563,7 @@ IMPORTANT: only model stored in cache can be deleted. You cannot delete models i
 
 Model name must be passed via query param: `?model={name}`
 
-To remove one sidecar of a cached model and keep the model, add `&sidecar={kind}` (`mmproj`, `mtp`, `dflash`, `eagle3` or `dspark`); the model must not be running.
+To remove one sidecar of a cached model and keep the model, add `&sidecar={kind}` (`mmproj`, `dflash` or `dspark`); the model must not be running.
 
 Deleting a model keeps the files another cached quant of the repo still loads, such as an mmproj named after the deleted quant, and the partial files another download still writes. A sidecar deleted on its own goes for every quant that shares it.
 

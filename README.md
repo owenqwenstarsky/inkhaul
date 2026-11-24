@@ -70,7 +70,6 @@ llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
 - [cli](tools/cli/README.md)
 - [completion](tools/completion/README.md)
 - [server](tools/server/README.md)
-- [Text-to-speech (TTS) models](docs/multimodal/tts.md)
 - [GBNF grammars](grammars/README.md)
 
 #### Development

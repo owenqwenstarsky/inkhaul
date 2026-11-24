@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import ast
 import logging
 import contextlib
 import json
@@ -11,11 +10,10 @@ import math
 import os
 import re
 import sys
-import tempfile
 from enum import IntEnum
 from pathlib import Path
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Literal, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Sequence, TypeVar, cast
 from itertools import chain
 from math import prod
 from transformers import AutoConfig
@@ -29,30 +27,6 @@ if TYPE_CHECKING:
 if 'NO_LOCAL_GGUF' not in os.environ:
     sys.path.insert(1, str(Path(__file__).parent.parent / 'gguf-py'))
 import gguf
-from gguf.vocab import MistralTokenizerType, MistralVocab
-
-try:
-    from mistral_common.tokens.tokenizers.base import TokenizerVersion # ty: ignore[import-not-found]
-    from mistral_common.tokens.tokenizers.multimodal import DATASET_MEAN as _MISTRAL_COMMON_DATASET_MEAN, DATASET_STD as _MISTRAL_COMMON_DATASET_STD # ty: ignore[import-not-found]
-    from mistral_common.tokens.tokenizers.tekken import Tekkenizer # ty: ignore[import-not-found]
-    from mistral_common.tokens.tokenizers.sentencepiece import ( # ty: ignore[import-not-found]
-        SentencePieceTokenizer,
-    )
-
-    _mistral_common_installed = True
-    _mistral_import_error_msg = ""
-except ImportError:
-    _MISTRAL_COMMON_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
-    _MISTRAL_COMMON_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
-
-    _mistral_common_installed = False
-    TokenizerVersion: Any = None
-    Tekkenizer: Any = None
-    SentencePieceTokenizer: Any = None
-    _mistral_import_error_msg = (
-        "Mistral format requires `mistral-common` to be installed. Please run "
-        "`pip install mistral-common[image,audio]` to install it."
-    )
 
 
 logger = logging.getLogger("hf-to-gguf")
@@ -64,15 +38,6 @@ AnyModel = TypeVar("AnyModel", bound="type[ModelBase]")
 # for checkpoints that ship no config.json, we will try to provide a synthetic one
 HparamsMatcher = Callable[[Path], bool]
 HparamsLoader = Callable[[Path], dict[str, Any]]
-
-
-class SentencePieceTokenTypes(IntEnum):
-    NORMAL = 1
-    UNKNOWN = 2
-    CONTROL = 3
-    USER_DEFINED = 4
-    UNUSED = 5
-    BYTE = 6
 
 
 class ModelType(IntEnum):
@@ -112,43 +77,19 @@ class ModelBase:
     block_count: int
     tensor_map: gguf.TensorNameMap
 
-    # Mistral format specifics
-    is_mistral_format: bool = False
-    disable_mistral_community_chat_template: bool = False
-    sentence_transformers_dense_modules: bool = False
-
-    # MTP (multi-token prediction) export modes; set by main() before instantiation.
-    # Architectures that implement the filtering/export behavior opt in by
-    # setting supports_mtp_export = True on their model class or a mixin.
-    supports_mtp_export: bool = False
-    mtp_only: bool = False
-    no_mtp: bool = False
-
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
                  metadata_override: Path | None = None, model_name: str | None = None,
                  split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False,
                  small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None,
-                 disable_mistral_community_chat_template: bool = False,
-                 sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False,
-                 fuse_qkv: bool = False,
-                 ple_only: bool = False, no_ple: bool = False):
+                 fp8_as_q8: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
             raise TypeError(f"{type(self).__name__!r} should not be directly instantiated")
 
-        if self.is_mistral_format and not _mistral_common_installed:
-            raise ImportError(_mistral_import_error_msg)
-
-        if ple_only and no_ple:
-            raise ValueError("ple_only and no_ple are mutually exclusive")
-        self.ple_only = ple_only
-        self.no_ple = no_ple
-        self._has_ple = False
         self.dir_model = dir_model
         self.ftype = ftype
         self.fname_out = fname_out
@@ -158,22 +99,12 @@ class ModelBase:
         self.lazy = not eager or (remote_hf_model_id is not None)
         self.dry_run = dry_run
         self.remote_hf_model_id = remote_hf_model_id
-        self.sentence_transformers_dense_modules = sentence_transformers_dense_modules
         self.target_model_dir = target_model_dir
         self.fuse_gate_up_exps = fuse_gate_up_exps
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
         self._unfusable_gate_up_layers: set[int] = set()
-        self.fuse_qkv = fuse_qkv
-        self._q_buffer: dict[int, Tensor] = {}
-        self._k_buffer: dict[int, Tensor] = {}
-        self._v_buffer: dict[int, Tensor] = {}
-        self._q_bias_buffer: dict[int, Tensor] = {}
-        self._k_bias_buffer: dict[int, Tensor] = {}
-        self._v_bias_buffer: dict[int, Tensor] = {}
-        self._fusable_qkv_weight_layers: set[int] = set()
-        self._fusable_qkv_bias_layers: set[int] = set()
-        self.hparams = ModelBase.load_hparams(self.dir_model, self.is_mistral_format) if hparams is None else hparams
+        self.hparams = ModelBase.load_hparams(self.dir_model) if hparams is None else hparams
         # source tensor name to filtered tensor name mapping.
         self._source_tensor_names: dict[str, str | None] = {}
         self.model_tensors = self.index_tensors(remote_hf_model_id=remote_hf_model_id)
@@ -211,11 +142,7 @@ class ModelBase:
 
         # Configure GGUF Writer
         self.gguf_writer = gguf.GGUFWriter(path=None, arch=gguf.MODEL_ARCH_NAMES[self.model_arch], endianess=self.endianess, use_temp_file=self.use_temp_file,
-                                           split_max_tensors=split_max_tensors, split_max_size=split_max_size, dry_run=dry_run, small_first_shard=small_first_shard,
-                                           tensor_filter=self._include_ple_tensor if ple_only or no_ple else None)
-
-        # Mistral specific
-        self.disable_mistral_community_chat_template = disable_mistral_community_chat_template
+                                           split_max_tensors=split_max_tensors, split_max_size=split_max_size, dry_run=dry_run, small_first_shard=small_first_shard)
 
     @classmethod
     def add_prefix_to_filename(cls, path: Path, prefix: str) -> Path:
@@ -247,36 +174,33 @@ class ModelBase:
 
             return tensors
 
-        return self.index_local_tensors("model" if not self.is_mistral_format else "consolidated")
+        return self.index_local_tensors("model")
 
     # index the local "<prefix>*.safetensors" files (or pytorch_model*.bin), through filter_tensors
     def index_local_tensors(self, prefix: str) -> dict[str, Callable[[], Tensor]]:
         tensors: dict[str, Callable[[], Tensor]] = {}
         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
-        is_safetensors: bool = len(part_names) > 0 or (not self.is_mistral_format and (self.dir_model / f"{prefix}.safetensors.index.json").is_file())
+        is_safetensors: bool = len(part_names) > 0 or (self.dir_model / f"{prefix}.safetensors.index.json").is_file()
         if not is_safetensors:
             part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
 
         tensor_names_from_index: set[str] = set()
         tensor_names_from_parts: set[str] = set()
 
-        if not self.is_mistral_format:
-            index_name = f"{prefix}.safetensors" if is_safetensors else "pytorch_model.bin"
-            index_name += ".index.json"
-            index_file = self.dir_model / index_name
+        index_name = f"{prefix}.safetensors" if is_safetensors else "pytorch_model.bin"
+        index_name += ".index.json"
+        index_file = self.dir_model / index_name
 
-            if index_file.is_file():
-                logger.info(f"gguf: loading model weight map from '{index_name}'")
-                with open(index_file, "r", encoding="utf-8") as f:
-                    index: dict[str, Any] = json.load(f)
-                    weight_map = index.get("weight_map")
-                    if weight_map is None or not isinstance(weight_map, dict):
-                        raise ValueError(f"Can't load 'weight_map' from {index_name!r}")
-                    tensor_names_from_index.update(weight_map.keys())
-                    part_dict: dict[str, None] = dict.fromkeys(weight_map.values(), None)
-                    part_names = sorted(part_dict.keys())
-            else:
-                weight_map = {}
+        if index_file.is_file():
+            logger.info(f"gguf: loading model weight map from '{index_name}'")
+            with open(index_file, "r", encoding="utf-8") as f:
+                index: dict[str, Any] = json.load(f)
+                weight_map = index.get("weight_map")
+                if weight_map is None or not isinstance(weight_map, dict):
+                    raise ValueError(f"Can't load 'weight_map' from {index_name!r}")
+                tensor_names_from_index.update(weight_map.keys())
+                part_dict: dict[str, None] = dict.fromkeys(weight_map.values(), None)
+                part_names = sorted(part_dict.keys())
         else:
             weight_map = {}
 
@@ -354,7 +278,7 @@ class ModelBase:
                 continue
 
             tensor_type, new_name = mapped
-            if tensor_type not in (gguf.MODEL_TENSOR.ATTN_K, gguf.MODEL_TENSOR.ATTN_V, gguf.MODEL_TENSOR.ATTN_QKV):
+            if tensor_type not in (gguf.MODEL_TENSOR.ATTN_K, gguf.MODEL_TENSOR.ATTN_V):
                 continue
 
             bid = int(new_name.split(".")[1])
@@ -702,12 +626,10 @@ class ModelBase:
         expert_pattern = re.compile(r"(\.[^.]*experts)\.(\d+)\.")
         scale_types = {
             gguf.MODEL_TENSOR.ATTN_Q, gguf.MODEL_TENSOR.ATTN_K, gguf.MODEL_TENSOR.ATTN_V,
-            gguf.MODEL_TENSOR.ATTN_OUT, gguf.MODEL_TENSOR.ATTN_QKV, gguf.MODEL_TENSOR.ATTN_GATE,
+            gguf.MODEL_TENSOR.ATTN_OUT, gguf.MODEL_TENSOR.ATTN_GATE,
             gguf.MODEL_TENSOR.FFN_GATE, gguf.MODEL_TENSOR.FFN_UP, gguf.MODEL_TENSOR.FFN_DOWN,
-            gguf.MODEL_TENSOR.FFN_GATE_SHEXP, gguf.MODEL_TENSOR.FFN_UP_SHEXP, gguf.MODEL_TENSOR.FFN_DOWN_SHEXP,
             gguf.MODEL_TENSOR.FFN_GATE_EXP, gguf.MODEL_TENSOR.FFN_UP_EXP, gguf.MODEL_TENSOR.FFN_DOWN_EXP,
-            gguf.MODEL_TENSOR.SSM_IN, gguf.MODEL_TENSOR.SSM_OUT, gguf.MODEL_TENSOR.SSM_ALPHA, gguf.MODEL_TENSOR.SSM_BETA,
-            gguf.MODEL_TENSOR.NEXTN_EH_PROJ, gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD, gguf.MODEL_TENSOR.OUTPUT,
+            gguf.MODEL_TENSOR.OUTPUT,
         }
 
         for scale_name in list(self.model_tensors.keys()):
@@ -891,51 +813,6 @@ class ModelBase:
         for bid in sorted(self._unfusable_gate_up_layers):
             logger.warning(f"Skipping --fuse-gate-up-exps for layer {bid}: fusion of preserved FP8 expert projections is not supported")
 
-    def prepare_qkv_fusion(self) -> None:
-        self._fusable_qkv_weight_layers.clear()
-        self._fusable_qkv_bias_layers.clear()
-        if not self.fuse_qkv or gguf.MODEL_TENSOR.ATTN_QKV not in gguf.MODEL_TENSORS[self.model_arch]:
-            return
-
-        qkv_types = {
-            gguf.MODEL_TENSOR.ATTN_Q,
-            gguf.MODEL_TENSOR.ATTN_K,
-            gguf.MODEL_TENSOR.ATTN_V,
-        }
-        weights: dict[int, set[gguf.MODEL_TENSOR]] = {}
-        biases: dict[int, set[gguf.MODEL_TENSOR]] = {}
-        fp8_layers: set[int] = set()
-
-        for name in self.model_tensors:
-            mapped = self.tensor_map.get_type_and_name(name, try_suffixes=(".weight", ".bias"))
-            if mapped is None:
-                continue
-            tensor_type, new_name = mapped
-            if tensor_type not in qkv_types:
-                continue
-
-            bid = next((int(part) for part in new_name.split(".") if part.isdecimal()), None)
-            if bid is None:
-                continue
-            if new_name.endswith(".weight"):
-                weights.setdefault(bid, set()).add(tensor_type)
-                if not self._fp8_as_q8 and self.model_tensors[name]().dtype == torch.float8_e4m3fn:
-                    fp8_layers.add(bid)
-            elif new_name.endswith(".bias"):
-                biases.setdefault(bid, set()).add(tensor_type)
-
-        for bid, weight_types in weights.items():
-            bias_types = biases.get(bid, set())
-            if weight_types == qkv_types and (not bias_types or bias_types == qkv_types):
-                # NVFP4 weights use separate reordering and repacking hooks and are exported before this fusion pass.
-                # Separate FP8 scales cannot be represented by one fused QKV scale.
-                if bid in fp8_layers:
-                    logger.warning(f"Skipping --fuse-qkv for layer {bid}: fusion of preserved FP8 projections is not supported")
-                    continue
-                self._fusable_qkv_weight_layers.add(bid)
-                if bias_types:
-                    self._fusable_qkv_bias_layers.add(bid)
-
     def _tag_prec_a4(self, hf_name: str, gguf_name: str) -> None:
         # W4A16_NVFP4 should not use 4-bit activations
         name = hf_name.removesuffix(".weight").removesuffix(".bias")
@@ -948,170 +825,10 @@ class ModelBase:
         if algo == "W4A16_NVFP4":
             self._prec_a4[gguf_name] = False
 
-    def hadamard_folded_names(self) -> set[str]:
-        """Source-tensor names folded under a Hadamard manifest, or empty."""
-        cached = getattr(self, "_hadamard_folded_names", None)
-        if cached is not None:
-            return cached
-        names: set[str] = set()
-        manifest_path = self.dir_model / "hadamard_packing.json"
-        if manifest_path.is_file():
-            with manifest_path.open("r", encoding="utf-8") as f:
-                for record in json.load(f).get("tensors", []):
-                    if isinstance(record, dict) and isinstance(record.get("name"), str):
-                        names.add(record["name"])
-        self._hadamard_folded_names = names
-        return names
-
-    def add_hadamard_metadata(self) -> None:
-        """Transfer a packed-checkpoint transform contract into GGUF metadata."""
-        manifest_path = self.dir_model / "hadamard_packing.json"
-        if not manifest_path.is_file():
-            return
-
-        with manifest_path.open("r", encoding="utf-8") as f:
-            manifest = json.load(f)
-
-        schema_version = manifest.get("schema_version")
-        if schema_version not in (1, 2, 3) or manifest.get("kind") != "hadamard-weight-fold":
-            raise ValueError(f"Unsupported Hadamard manifest: {manifest_path}")
-        if manifest.get("status") != "requires-matching-runtime":
-            raise ValueError(f"Unexpected Hadamard manifest status: {manifest.get('status')!r}")
-
-        transform = manifest.get("transform")
-        if not isinstance(transform, dict):
-            raise ValueError("Hadamard manifest is missing transform metadata")
-        block_size = transform.get("block_size")
-        if not isinstance(block_size, int) or block_size <= 0 or block_size & (block_size - 1):
-            raise ValueError(f"Invalid Hadamard block size: {block_size!r}")
-        if transform.get("name") != "normalized-signed-sylvester-walsh-hadamard":
-            raise ValueError(f"Unsupported Hadamard transform: {transform.get('name')!r}")
-        sign_mode = transform.get("sign_mode")
-        if sign_mode not in ("identity", "explicit"):
-            raise ValueError(f"Unsupported Hadamard sign mode: {sign_mode!r}")
-        sign_widths: list[int] = []
-        sign_values: list[int] = []
-        if sign_mode == "explicit":
-            signs = manifest.get("signs")
-            if not isinstance(signs, dict) or not signs:
-                raise ValueError("explicit sign mode requires a signs table")
-            for width_str, vec in sorted(signs.items(), key=lambda kv: int(kv[0])):
-                width = int(width_str)
-                # same width rule as the runtime, so a manifest that converts also loads
-                if width <= 0 or width % block_size != 0:
-                    raise ValueError(
-                        f"sign width {width} must be positive and a multiple of block size {block_size}"
-                    )
-                if len(vec) != width or any(v not in (-1, 1) for v in vec):
-                    raise ValueError(f"invalid sign vector for width {width}")
-                sign_widths.append(width)
-                sign_values.extend(int(v) for v in vec)
-
-        tensor_records = manifest.get("tensors")
-        if not isinstance(tensor_records, list) or not tensor_records:
-            raise ValueError("Hadamard manifest has no folded tensors")
-
-        # only build_lora_mm/build_lora_mm_id apply the transform: refuse archs and tensor kinds that can skip them
-        _HADAMARD_ARCHS = {
-            gguf.MODEL_ARCH.LLAMA,
-            gguf.MODEL_ARCH.QWEN3,
-            gguf.MODEL_ARCH.QWEN3MOE,
-            gguf.MODEL_ARCH.QWEN35,
-            gguf.MODEL_ARCH.QWEN35MOE,
-            gguf.MODEL_ARCH.QWEN3NEXT,
-        }
-        if self.model_arch not in _HADAMARD_ARCHS:
-            raise ValueError(
-                f"Hadamard folding is not verified for arch {self.model_arch.name}; "
-                "the runtime would load the GGUF without applying the activation transform"
-            )
-        _HADAMARD_KINDS = re.compile(
-            r"output\.weight|"
-            r"blk\.\d+\.("
-            r"attn_q|attn_k|attn_v|attn_qkv|attn_gate|attn_output"
-            r"|ffn_gate|ffn_up|ffn_down"
-            r"|ffn_gate_exps|ffn_up_exps|ffn_down_exps|ffn_gate_up_exps"
-            r"|ffn_gate_shexp|ffn_up_shexp|ffn_down_shexp"
-            r"|ssm_out"
-            r")\.weight"
-        )
-        weight_names: list[str] = []
-        inverse_weight_names: list[str] = []
-        for record in tensor_records:
-            if not isinstance(record, dict) or not isinstance(record.get("name"), str):
-                raise ValueError("Hadamard manifest has an invalid tensor record")
-            if record.get("axis") != -1:
-                raise ValueError(f"Unsupported Hadamard tensor axis for {record['name']!r}")
-            role = record.get("role", "fold-before-matmul")
-            if role not in ("fold-before-matmul", "inverse-after-lookup"):
-                raise ValueError(f"Unsupported Hadamard tensor role for {record['name']!r}: {role!r}")
-            filtered = self.filter_tensors((record["name"], lambda: torch.empty(0)))
-            if filtered is None:
-                raise ValueError(f"Hadamard tensor is filtered out: {record['name']!r}")
-            mapped = self.map_tensor_name(filtered[0])
-            if role == "inverse-after-lookup":
-                # the runtime applies the inverse only after the token-embedding lookup, other latent tables stay rotated
-                if mapped != "token_embd.weight":
-                    raise ValueError(
-                        f"Hadamard tensor {record['name']!r} maps to {mapped!r}, which is not a "
-                        "verified inverse-after-lookup table"
-                    )
-                inverse_weight_names.append(mapped)
-            else:
-                if not _HADAMARD_KINDS.fullmatch(mapped):
-                    raise ValueError(
-                        f"Hadamard tensor {record['name']!r} maps to {mapped!r}, which is not on a "
-                        "verified Hadamard-aware matmul path"
-                    )
-                weight_names.append(mapped)
-
-        # --fuse-qkv writes one attn_qkv per layer, so Q, K and V must all be folded and get one name
-        for bid in sorted(self._fusable_qkv_weight_layers):
-            qkv = [
-                self.format_tensor_name(t, bid)
-                for t in (gguf.MODEL_TENSOR.ATTN_Q, gguf.MODEL_TENSOR.ATTN_K, gguf.MODEL_TENSOR.ATTN_V)
-            ]
-            n_folded = sum(name in weight_names for name in qkv)
-            if n_folded == 0:
-                continue
-            if n_folded != len(qkv):
-                raise ValueError(f"--fuse-qkv needs all of Q, K and V folded in layer {bid}, or none of them")
-            weight_names = [name for name in weight_names if name not in qkv]
-            weight_names.append(self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV, bid))
-
-        tied_output = manifest.get("tied_output", False)
-        if not isinstance(tied_output, bool) or (schema_version == 3) != tied_output:
-            raise ValueError("Hadamard schema 3 requires tied_output=true; older schemas forbid it")
-        if tied_output:
-            if inverse_weight_names != ["token_embd.weight"]:
-                raise ValueError("Tied Hadamard output requires one latent token embedding")
-            if not self.hparams.get("tie_word_embeddings", False):
-                raise ValueError("Tied Hadamard output requires tie_word_embeddings=true")
-            if "output.weight" in weight_names or any(
-                self.tensor_map.get_name(name, try_suffixes=(".weight", ".bias")) == "output.weight"
-                for name in self.model_tensors
-            ):
-                raise ValueError("Tied Hadamard output must not carry a separate output head")
-            self.gguf_writer.add_prism_hadamard_tied_output(True)
-        elif "token_embd.weight" in inverse_weight_names and self.hparams.get("tie_word_embeddings", False):
-            raise ValueError("A tied latent embedding requires Hadamard schema 3 and tied_output=true")
-
-        self.gguf_writer.add_prism_hadamard_version(2 if tied_output else 1)
-        self.gguf_writer.add_prism_hadamard_block_size(block_size)
-        self.gguf_writer.add_prism_hadamard_transform("normalized-sylvester-walsh-hadamard")
-        self.gguf_writer.add_prism_hadamard_axis("input-last-dimension")
-        self.gguf_writer.add_prism_hadamard_sign_mode(sign_mode)
-        self.gguf_writer.add_prism_hadamard_weight_names(weight_names)
-        if sign_mode == "explicit":
-            self.gguf_writer.add_prism_hadamard_sign_widths(sign_widths)
-            self.gguf_writer.add_prism_hadamard_sign_values(sign_values)
-        if inverse_weight_names:
-            self.gguf_writer.add_prism_hadamard_inverse_weight_names(inverse_weight_names)
-        if getattr(self, "_hadamard_gdn_v_grouped", False):
-            self.gguf_writer.add_prism_hadamard_gdn_v_grouped(True)
-            logger.info("GGUF Hadamard: linear-attention out_proj kept in grouped V order")
-        logger.info("GGUF Hadamard contract: H%d, sign_mode=%s, %d folded weight(s), %d inverse-lookup",
-                    block_size, sign_mode, len(weight_names), len(inverse_weight_names))
+    def check_no_hadamard(self) -> None:
+        # the runtime has no Hadamard-aware matmul path
+        if (self.dir_model / "hadamard_packing.json").is_file():
+            raise ValueError("Hadamard-folded checkpoints (hadamard_packing.json) are not supported")
 
     def set_gguf_parameters(self):
         raise NotImplementedError("set_gguf_parameters() must be implemented in subclasses")
@@ -1142,40 +859,6 @@ class ModelBase:
                self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.FFN_UP_EXP, bid):
                 return []
 
-        # Handle Q/K/V tensor fusion if enabled
-        qkv_bid = next((int(part) for part in new_name.split(".") if part.isdecimal()), None) if self.fuse_qkv else None
-        if qkv_bid is not None:
-            is_bias = new_name.endswith('.bias')
-            suffix = '.bias' if is_bias else '.weight'
-            fusable_layers = self._fusable_qkv_bias_layers if is_bias else self._fusable_qkv_weight_layers
-            if qkv_bid not in fusable_layers:
-                return [(new_name, data_torch)]
-
-            buf_q = self._q_bias_buffer if is_bias else self._q_buffer
-            buf_k = self._k_bias_buffer if is_bias else self._k_buffer
-            buf_v = self._v_bias_buffer if is_bias else self._v_buffer
-
-            if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_Q, qkv_bid, suffix):
-                buf_q[qkv_bid] = data_torch
-            elif self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_K, qkv_bid, suffix):
-                buf_k[qkv_bid] = data_torch
-            elif self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_V, qkv_bid, suffix):
-                buf_v[qkv_bid] = data_torch
-
-            if qkv_bid in buf_q and qkv_bid in buf_k and qkv_bid in buf_v:
-                q_data = buf_q.pop(qkv_bid)
-                k_data = buf_k.pop(qkv_bid)
-                v_data = buf_v.pop(qkv_bid)
-                fused_data = torch.cat([q_data, k_data, v_data], dim=0)
-                fused_name = self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV, qkv_bid, suffix=suffix)
-                logger.info(f"Fused Q, K, V {suffix[1:]} into QKV for layer {qkv_bid}")
-                return [(fused_name, fused_data)]
-
-            if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_Q, qkv_bid, suffix) or \
-               self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_K, qkv_bid, suffix) or \
-               self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_V, qkv_bid, suffix):
-                return []
-
         return [(new_name, data_torch)]
 
     def _tensor_requires_f32(self, new_name: str, bid: int | None, n_dims: int) -> bool:
@@ -1185,29 +868,7 @@ class ModelBase:
                 self.match_model_tensor_name(new_name, key, bid)
                 for key in (
                     gguf.MODEL_TENSOR.FFN_GATE_INP,
-                    gguf.MODEL_TENSOR.FFN_GATE_INP_SHEXP,
-                    gguf.MODEL_TENSOR.POS_EMBD,
-                    gguf.MODEL_TENSOR.TOKEN_TYPES,
-                    gguf.MODEL_TENSOR.SSM_CONV1D,
-                    gguf.MODEL_TENSOR.SHORTCONV_CONV,
-                    gguf.MODEL_TENSOR.TIME_MIX_FIRST,
-                    gguf.MODEL_TENSOR.TIME_MIX_W1,
-                    gguf.MODEL_TENSOR.TIME_MIX_W2,
-                    gguf.MODEL_TENSOR.TIME_MIX_DECAY_W1,
-                    gguf.MODEL_TENSOR.TIME_MIX_DECAY_W2,
-                    gguf.MODEL_TENSOR.TIME_MIX_LERP_FUSED,
-                    gguf.MODEL_TENSOR.POSNET_NORM1,
-                    gguf.MODEL_TENSOR.POSNET_NORM2,
                     gguf.MODEL_TENSOR.V_ENC_EMBD_POS,
-                    gguf.MODEL_TENSOR.A_ENC_EMBD_POS,
-                    gguf.MODEL_TENSOR.ALTUP_CORRECT_COEF,
-                    gguf.MODEL_TENSOR.ALTUP_PREDICT_COEF,
-                    # Kimi KDA conv weights should be F32
-                    gguf.MODEL_TENSOR.SSM_CONV1D_Q,
-                    gguf.MODEL_TENSOR.SSM_CONV1D_K,
-                    gguf.MODEL_TENSOR.SSM_CONV1D_V,
-                    # DSA indexer weights should be F32
-                    gguf.MODEL_TENSOR.INDEXER_PROJ,
                 )
             )
             or new_name[-7:] not in (".weight", ".lora_a", ".lora_b")
@@ -1445,11 +1106,6 @@ class ModelBase:
 
         del experts, merged
 
-    def _include_ple_tensor(self, name: str) -> bool:
-        is_ple = name == gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD] + ".weight"
-        self._has_ple |= is_ple
-        return is_ple if self.ple_only else not is_ple
-
     def prepare_tensors(self):
         # detect NVFP4 quantization (ModelOpt and Compressed-tensors formats)
         quantization_config = self.hparams.get("quantization_config") or {}
@@ -1547,7 +1203,6 @@ class ModelBase:
         self.dequant_model()
 
         self.prepare_gate_up_fusion()
-        self.prepare_qkv_fusion()
 
         # Handle empty tensor_map for models with block_count=0 (like MobileNetV5)
         if self.tensor_map.mapping:
@@ -1585,8 +1240,6 @@ class ModelBase:
                     break
 
             for new_name, data_torch in (self.modify_tensors(data_torch, name, bid)):
-                if (self.ple_only or self.no_ple) and not self._include_ple_tensor(new_name):
-                    continue
                 n_dims = len(data_torch.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
 
@@ -1601,11 +1254,7 @@ class ModelBase:
                     self.match_model_tensor_name(new_name, key, bid)
                     for key in (
                         gguf.MODEL_TENSOR.TOKEN_EMBD,
-                        gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
                         gguf.MODEL_TENSOR.OUTPUT,
-                        gguf.MODEL_TENSOR.ALTUP_ROUTER,
-                        gguf.MODEL_TENSOR.LAUREL_L,
-                        gguf.MODEL_TENSOR.LAUREL_R,
                     )
                 ):
                     if self.ftype in (
@@ -1659,13 +1308,6 @@ class ModelBase:
 
                 self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
 
-        qkv_buffers = (
-            self._q_buffer, self._k_buffer, self._v_buffer,
-            self._q_bias_buffer, self._k_bias_buffer, self._v_bias_buffer,
-        )
-        if any(qkv_buffers):
-            raise ValueError("QKV fusion did not consume all buffered tensors")
-
     def set_type(self):
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
 
@@ -1706,7 +1348,7 @@ class ModelBase:
         logger.info("Set model quantization version")
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
 
-        self.add_hadamard_metadata()
+        self.check_no_hadamard()
 
         if self._prec_a4:
             names = sorted(self._prec_a4.keys())
@@ -1719,8 +1361,6 @@ class ModelBase:
 
     def write(self):
         self.prepare_tensors()
-        if (self.ple_only or self.no_ple) and not self._has_ple:
-            raise ValueError("model has no per-layer embedding table to export separately")
         self.prepare_metadata(vocab_only=False)
         self.gguf_writer.write_header_to_file(path=self.fname_out)
         self.gguf_writer.write_kv_data_to_file()
@@ -1757,12 +1397,7 @@ class ModelBase:
         return inner
 
     @staticmethod
-    def load_hparams(dir_model: Path, is_mistral_format: bool, guess: bool = True):
-        if is_mistral_format:
-            with open(dir_model / "params.json", "r", encoding="utf-8") as f:
-                config = json.load(f)
-            return config
-
+    def load_hparams(dir_model: Path, guess: bool = True):
         # checkpoints with a non-HF layout are matched by their own loader
         # models with a HF layout can also register a hparams loader to switch to a custom class
         config = ModelBase.load_hparams_guess(dir_model) if guess and dir_model.is_dir() else None
@@ -1778,21 +1413,6 @@ class ModelBase:
             logger.warning("Trying to load config.json instead")
             with open(dir_model / "config.json", "r", encoding="utf-8") as f:
                 config = json.load(f)
-        if "llm_config" in config:
-            # rename for InternVL
-            config["text_config"] = config["llm_config"]
-        if "lm_config" in config:
-            # rename for GlmASR
-            config["text_config"] = config["lm_config"]
-        if "thinker_config" in config:
-            # rename for Qwen2.5-Omni
-            config["text_config"] = config["thinker_config"]["text_config"]
-        if "language_config" in config:
-            # rename for DeepSeekOCR
-            config["text_config"] = config["language_config"]
-        if "lfm" in config:
-            # rename for LFM2-Audio
-            config["text_config"] = config["lfm"]
         return config
 
     @classmethod
@@ -1835,10 +1455,7 @@ class TextModel(ModelBase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not self.is_mistral_format:
-            self.hf_arch = get_model_architecture(self.hparams, self.model_type)
-        else:
-            self.hf_arch = ""
+        self.hf_arch = get_model_architecture(self.hparams, self.model_type)
 
         if "text_config" in self.hparams:
             # move the text_config to the root level
@@ -1913,8 +1530,7 @@ class TextModel(ModelBase):
                 fname_default: str = gguf.naming_convention(self.metadata.name, self.metadata.basename, self.metadata.finetune, self.metadata.version, size_label=None, output_type=None, model_type="vocab")
 
             # Use the default filename
-            prefix = "ple-" if self.ple_only else "no-ple-" if self.no_ple else ""
-            self.fname_out = self.fname_out / f"{prefix}{fname_default}.gguf"
+            self.fname_out = self.fname_out / f"{fname_default}.gguf"
         else:
             # Output path is a custom defined templated filename
             # Note: `not is_dir()` is used because `.is_file()` will not detect
@@ -1923,9 +1539,8 @@ class TextModel(ModelBase):
             # Process templated file name with the output ftype, useful with the "auto" ftype
             self.fname_out = self.fname_out.parent / gguf.fill_templated_filename(self.fname_out.name, output_type)
 
-        if not self.ple_only:
-            logger.info("Set model tokenizer")
-            self.set_vocab()
+        logger.info("Set model tokenizer")
+        self.set_vocab()
 
     def set_gguf_parameters(self):
         self.gguf_writer.add_block_count(self.block_count)
@@ -2152,327 +1767,9 @@ class TextModel(ModelBase):
         # NOTE: if you get an error here, you need to update the convert_hf_to_gguf_update.py script
         #       or pull the latest version of the model from Huggingface
         #       don't edit the hashes manually!
-        if chkhsh == "b6e8e1518dc4305be2fe39c313ed643381c4da5db34a98f6a04c093f8afbe99b":
-            # ref: https://huggingface.co/THUDM/glm-4-9b-chat
-            res = "chatglm-bpe"
-        if chkhsh == "81d72c7348a9f0ebe86f23298d37debe0a5e71149e29bd283904c02262b27516":
-            # ref: https://huggingface.co/THUDM/glm-4-9b-chat
-            res = "chatglm-bpe"
-        if chkhsh == "a1336059768a55c99a734006ffb02203cd450fed003e9a71886c88acf24fdbc2":
-            # ref: https://huggingface.co/THUDM/glm-4-9b-hf
-            res = "glm4"
-        if chkhsh == "9ca2dd618e8afaf09731a7cf6e2105b373ba6a1821559f258b272fe83e6eb902":
-            # ref: https://huggingface.co/zai-org/GLM-4.5-Air
-            res = "glm4"
-        if chkhsh == "cdf5f35325780597efd76153d4d1c16778f766173908894c04afc20108536267":
-            # ref: https://huggingface.co/zai-org/GLM-4.7-Flash
-            res = "glm4"
-        if chkhsh == "1431a23e583c97432bc230bff598d103ddb5a1f89960c8f1d1051aaa944d0b35":
-            # ref: https://huggingface.co/sapienzanlp/Minerva-7B-base-v1.0
-            res = "minerva-7b"
-        if chkhsh == "6e4d72c6e5260b90606e26a0931fa15e4b42ec6e97719d12919f2b1f93478262":
-            # ref: https://huggingface.co/domyn/Domyn-Small-v1.0
-            res = "domyn-small"
-        if chkhsh == "7e57df22b1fe23a7b1e1c7f3dc4e3f96d43a4eb0836d0c6bdc3436d7b2f1c664":
-            # ref: https://huggingface.co/tencent/Hunyuan-A13B-Instruct
-            res = "hunyuan"
-        if chkhsh == "bba3b3366b646dbdded5dbc42d59598b849371afc42f7beafa914afaa5b70aa6":
-            # ref: https://huggingface.co/tencent/Hunyuan-4B-Instruct
-            res = "hunyuan-dense"
-        if chkhsh == "e6ddf9c6686791c12d698d34c31ab9be1fea9af5a3d9a6909783ab382198ae1c":
-            # ref: https://huggingface.co/tencent/Hy4-preview
-            res = "hy_v4"
-        if chkhsh == "a6b57017d60e6edb4d88ecc2845188e0eb333a70357e45dcc9b53964a73bbae6":
-            # ref: https://huggingface.co/tiiuae/Falcon-H1-0.5B-Base
-            res = "falcon-h1"
-        if chkhsh == "60476e1243776c4fb1b993dbd7a5f15ac22f83c80afdf425fa5ae01c8d44ef86":
-            # ref: https://huggingface.co/tiiuae/Falcon-H1-1B-Base
-            res = "falcon-h1"
-        if chkhsh == "3eda48b4c4dc7de733d1a8b3e3b4a85243dbbf704da2ee9d42c6beced8897896":
-            # ref: https://huggingface.co/tiiuae/Falcon-H1-7B-Base
-            res = "falcon-h1"
-        if chkhsh == "48f8e02c0359c0bbdd82f26909171fac1c18a457bb47573ed1fe3bbb2c1cfd4b":
-            # ref: https://huggingface.co/tiiuae/Falcon-H1-34B-Base
-            res = "falcon-h1"
-        if chkhsh == "81212dc7cdb7e0c1074ca62c5aeab0d43c9f52b8a737be7b12a777c953027890":
-            # ref: https://huggingface.co/moonshotai/Kimi-K2-Base
-            res = "kimi-k2"
-        if chkhsh == "d4540891389ea895b53b399da6ac824becc30f2fba0e9ddbb98f92e55ca0e97c":
-            # ref: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
-            res = "qwen2"
-        if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
-            # ref: https://huggingface.co/openbmb/MiniCPM-V-4_6
-            res = "qwen35"
-        if chkhsh == "66b8d4e19ab16c3bfd89bce5d785fb7e0155e8648708a1f42077cb9fe002c273":
-            # ref: https://huggingface.co/alvarobartt/grok-2-tokenizer
-            res = "grok-2"
-        if chkhsh == "f5c965e4198da6e7525072d87d1ecf4c51d981fd486c7c4ec728ef9cec7e03fc":
-            # ref: https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B
-            res = "gpt-4o"
-        if chkhsh == "6e040dfe72e4b85855588c53acf4909ac4e98e55bc3a33cd7db499180dc42a78":
-            # ref: https://huggingface.co/Aleph-Alpha/Kolibri-1
-            res = "qwen2"
-        if chkhsh == "b3d1dd861f1d4c5c0d2569ce36baf3f90fe8a102db3de50dd71ff860d91be3df":
-            # ref: https://huggingface.co/aari1995/German_Semantic_V3
-            res = "jina-v2-de"
-        if chkhsh == "0fe1cf6eda062318a1af7270f3331a85c539a01778ff948e24388e949c5282f4":
-            # ref: https://huggingface.co/evilfreelancer/ruGPT3XL
-            res = "gpt-2"
-        if chkhsh == "df1bc34a6366466bcb36a9a1b1cc0afdb08cfe21c9250602c930f159085390a9":
-            # ref: https://huggingface.co/Lernex/Metis-1.6-Logos
-            res = "gpt-2"
-        if chkhsh == "9e454714343b69b99b71795c1d27a68c2a1d15dab111f4d353109f966af29da7":
-            # ref: https://huggingface.co/LiquidAI/LFM2.5-8B-A1B
-            res = "lfm2"
-        if chkhsh == "846deafc5b0fa786186fa4ae6c7b49903cf2f1d1895bdb80b9120d60be135252":
-            # ref: https://huggingface.co/danish-foundation-models/DFM-Mimir
-            res = "gemma4"
-        if chkhsh == "0a766d034107bc736a3f2dc4968fd62e54a3570f1454443e0c5a4cc6bd7941ed":
-            # ref: https://huggingface.co/XHToken/Spark-X2.5-1.7B
-            res = "spark2_5"
-        if chkhsh == "1f9825a388f700a6b591722f17d470cbbcf10973ece35d2fd14239a14110ae1a":
-            # ref: https://huggingface.co/IFM/K2-Horizon-0.9B
-            res = "k2-horizon"
-        if chkhsh == "0ef9807a4087ebef797fc749390439009c3b9eda9ad1a097abbe738f486c01e5":
-            # ref: https://huggingface.co/meta-llama/Meta-Llama-3-8B
-            res = "llama-bpe"
-        if chkhsh == "049ecf7629871e3041641907f3de7c733e4dbfdc736f57d882ba0b0845599754":
-            # ref: https://huggingface.co/deepseek-ai/deepseek-llm-7b-base
-            res = "deepseek-llm"
-        if chkhsh == "347715f544604f9118bb75ed199f68779f423cabb20db6de6f31b908d04d7821":
-            # ref: https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-base
-            res = "deepseek-coder"
-        if chkhsh == "8aeee3860c56296a157a1fe2fad249ec40aa59b1bb5709f4ade11c4e6fe652ed":
-            # ref: https://huggingface.co/tiiuae/falcon-7b
-            res = "falcon"
-        if chkhsh == "0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f":
-            # ref: https://huggingface.co/BAAI/bge-small-en-v1.5
-            res = "bert-bge"
-        if chkhsh == "9d032fcbd5501f4a38150912590928bfb36091efb5df11b8e2124b0390e3fb1e":
-            # ref: https://huggingface.co/tiiuae/Falcon3-7B-Base
-            res = "falcon3"
-        if chkhsh == "8e62295832751ca1e8f92f2226f403dea30dc5165e448b5bfa05af5340c64ec7":
-            # ref: https://huggingface.co/BAAI/bge-large-zh-v1.5
-            res = "bert-bge-large"
-        if chkhsh == "b6dc8df998e1cfbdc4eac8243701a65afe638679230920b50d6f17d81c098166":
-            # ref: https://huggingface.co/mosaicml/mpt-7b
-            res = "mpt"
-        if chkhsh == "35d91631860c815f952d711435f48d356ebac988362536bed955d43bfa436e34":
-            # ref: https://huggingface.co/bigcode/starcoder2-3b
-            res = "starcoder"
-        if chkhsh == "3ce83efda5659b07b1ad37ca97ca5797ea4285d9b9ab0dc679e4a720c9da7454":
-            # ref: https://huggingface.co/openai-community/gpt2
-            res = "gpt-2"
-        if chkhsh == "32d85c31273f8019248f2559fed492d929ea28b17e51d81d3bb36fff23ca72b3":
-            # ref: https://huggingface.co/stabilityai/stablelm-2-zephyr-1_6b
-            res = "stablelm2"
-        if chkhsh == "6221ad2852e85ce96f791f476e0b390cf9b474c9e3d1362f53a24a06dc8220ff":
-            # ref: https://huggingface.co/smallcloudai/Refact-1_6-base
-            res = "refact"
-        if chkhsh == "9c2227e4dd922002fb81bde4fc02b0483ca4f12911410dee2255e4987644e3f8":
-            # ref: https://huggingface.co/CohereForAI/c4ai-command-r-v01
-            res = "command-r"
-        if chkhsh == "d772b220ace2baec124bed8cfafce0ead7d6c38a4b65ef11261cf9d5d62246d1":
-            # ref: https://huggingface.co/CohereLabs/tiny-aya-base
-            res = "tiny_aya"
-        if chkhsh == "52df12b4c8d4176e7481aab4b6e8454d1fd0a210a04a574f6d4e067d10e23c3e":
-            # ref: https://huggingface.co/CohereLabs/North-Mini-Code-1.0
-            res = "cohere2moe"
-        if chkhsh == "d5420e601e979078c670bc503d9ac411c311fa76b76a76267c31e0d6ba816637":
-            # ref: https://huggingface.co/RecursiveSI/flint
-            res = "flint"
-        if chkhsh == "e636dc30a262dcc0d8c323492e32ae2b70728f4df7dfe9737d9f920a282b8aea":
-            # ref: https://huggingface.co/Qwen/Qwen1.5-7B
-            res = "qwen2"
-        if chkhsh == "b6dc8df998e1cfbdc4eac8243701a65afe638679230920b50d6f17d81c098166":
-            # ref: https://huggingface.co/allenai/OLMo-1.7-7B-hf
-            res = "olmo"
-        if chkhsh == "a8594e3edff7c29c003940395316294b2c623e09894deebbc65f33f1515df79e":
-            # ref: https://huggingface.co/databricks/dbrx-base
-            res = "dbrx"
-        if chkhsh == "c7699093ba4255a91e702aa38a596aa81669f3525dae06c2953267dde580f448":
-            # ref: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
-            res = "jina-v1-en"
-        if chkhsh == "0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f":
-            # ref: https://huggingface.co/jinaai/jina-embeddings-v2-base-en
-            res = "jina-v2-en"
-        if chkhsh == "171aeeedd6fb548d418a7461d053f11b6f1f1fc9b387bd66640d28a4b9f5c643":
-            # ref: https://huggingface.co/jinaai/jina-embeddings-v2-base-es
-            res = "jina-v2-es"
-        if chkhsh == "27949a2493fc4a9f53f5b9b029c82689cfbe5d3a1929bb25e043089e28466de6":
-            # ref: https://huggingface.co/jinaai/jina-embeddings-v2-base-de
-            res = "jina-v2-de"
-        if chkhsh == "a023e9fdc5a11f034d3ef515b92350e56fb2af1f66c6b6811a4444ea9bf8763d":
-            # ref: https://huggingface.co/jinaai/jina-embeddings-v5-text-nano
-            res = "jina-v5-nano"
-        if chkhsh == "c136ed14d01c2745d4f60a9596ae66800e2b61fa45643e72436041855ad4089d":
-            # ref: https://huggingface.co/abacusai/Smaug-Llama-3-70B-Instruct
-            res = "smaug-bpe"
-        if chkhsh == "c7ea5862a53e4272c035c8238367063e2b270d51faa48c0f09e9d5b54746c360":
-            # ref: https://huggingface.co/LumiOpen/Poro-34B-chat
-            res = "poro-chat"
-        if chkhsh == "7967bfa498ade6b757b064f31e964dddbb80f8f9a4d68d4ba7998fcf281c531a":
-            # ref: https://huggingface.co/jinaai/jina-embeddings-v2-base-code
-            res = "jina-v2-code"
-        if chkhsh == "7fc505bd3104ca1083b150b17d088b59534ede9bde81f0dd2090967d7fe52cee":
-            # ref: https://huggingface.co/LumiOpen/Viking-7B
-            res = "viking"
-        if chkhsh == "b53802fb28e26d645c3a310b34bfe07da813026ec7c7716883404d5e0f8b1901":
-            # ref: https://huggingface.co/core42/jais-13b
-            res = "jais"
-        if chkhsh == "bc5108ee1eb6a3d600cadd065f63190fbd0554dbc9e4bbd6a0d977970afc8d2a":
-            # ref: https://huggingface.co/inceptionai/Jais-2-8B-Chat
-            res = "jais-2"
-        if chkhsh == "7b3e7548e4308f52a76e8229e4e6cc831195d0d1df43aed21ac6c93da05fec5f":
-            # ref: https://huggingface.co/WisdomShell/CodeShell-7B
-            res = "codeshell"
-        if chkhsh == "63b97e4253352e6f357cc59ea5b583e3a680eaeaf2632188c2b952de2588485e":
-            # ref: https://huggingface.co/mistralai/Mistral-Nemo-Base-2407
-            res = "tekken"
-        if chkhsh == "855059429035d75a914d1eda9f10a876752e281a054a7a3d421ef0533e5b6249":
-            # ref: https://huggingface.co/HuggingFaceTB/SmolLM-135M
-            res = "smollm"
-        if chkhsh == "3c30d3ad1d6b64202cd222813e7736c2db6e1bd6d67197090fc1211fbc612ae7":
-            # ref: https://huggingface.co/bigscience/bloom
-            res = "bloom"
-        if chkhsh == "bc01ce58980e1db43859146dc51b1758b3b88729b217a74792e9f8d43e479d21":
-            # ref: https://huggingface.co/TurkuNLP/gpt3-finnish-small
-            res = "gpt3-finnish"
-        if chkhsh == "4e2b24cc4770243d65a2c9ec19770a72f08cffc161adbb73fcbb6b7dd45a0aae":
-            # ref: https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct
-            res = "exaone"
-        if chkhsh == "fcace8b9cac38ce847670c970cd5892031a753a1ef381abd1d9af00f713da085":
-            # ref: https://huggingface.co/microsoft/phi-2
-            res = "phi-2"
-        if chkhsh == "60824e3c0d9401f89943cbb2fff727f0e2d4c545ba4df2d6e4f09a6db0f5b450":
-            # ref: https://huggingface.co/facebook/chameleon-7b
-            res = "chameleon"
-        if chkhsh == "8b5a93ed704057481f240da0be7e7dca721d7f8f4755263b6807227a2cbeae65":
-            # ref: https://huggingface.co/sentence-transformers/stsb-roberta-base
-            res = "roberta-bpe"
-        if chkhsh == "ad851be1dba641f2e3711822f816db2c265f788b37c63b4e1aeacb9ee92de8eb":
-            # ref: https://huggingface.co/ai-sage/GigaChat-20B-A3B-instruct
-            res = "gigachat"
-        if chkhsh == "d4c8f286ea6b520b3d495c4455483cfa2302c0cfcd4be05d781b6a8a0a7cdaf1":
-            # ref: https://huggingface.co/Infinigence/Megrez-3B-Instruct
-            res = "megrez"
-        if chkhsh == "877081d19cf6996e2c4ff0e1236341e9b7bde288f5311a56a937f0afbbb3aeb5":
-            # ref: https://huggingface.co/deepseek-ai/DeepSeek-V3
-            res = "deepseek-v3"
-        if chkhsh == "b3f499bb4255f8ca19fccd664443283318f2fd2414d5e0b040fbdd0cc195d6c5":
-            # ref: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-            res = "deepseek-r1-qwen"
-        if chkhsh == "ccc2ef013c104be7bae2965776d611e1d7a8a2a9c547dd93a682c9a9fc80352e":
-            # ref: https://huggingface.co/Xenova/gpt-4o
-            res = "gpt-4o"
-        if chkhsh == "7dec86086fcc38b66b7bc1575a160ae21cf705be7718b9d5598190d7c12db76f":
-            # ref: https://huggingface.co/UW/OLMo2-8B-SuperBPE-t180k
-            res = "superbpe"
-        if chkhsh == "1994ffd01900cfb37395608534236ecd63f2bd5995d6cb1004dda1af50240f15":
-            # ref: https://huggingface.co/trillionlabs/Trillion-7B-preview
-            res = "trillion"
-        if chkhsh == "96a5f08be6259352137b512d4157e333e21df7edd3fcd152990608735a65b224":
-            # ref: https://huggingface.co/inclusionAI/Ling-lite
-            res = "bailingmoe"
-        if chkhsh == "d353350c764d8c3b39c763113960e4fb4919bea5fbf208a0e3b22e8469dc7406":
-            # ref: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct
-            res = "llama4"
-        if chkhsh == "0e9433cbbb161f89e264eb32e8e64bfe69e834973ffca5d41d3948a604a3e2a3":
-            # ref: https://huggingface.co/mistral-community/pixtral-12b
-            res = "pixtral"
-        if chkhsh == "d5f1dd6f980fec569fb218a81a7658ac45fc56b38c5a0adeb1c232fbe04ef5ec":
-            # ref: https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Base
-            res = "seed-coder"
-        if chkhsh == "b0a6b1c0bd5998ebd9df08611efde34a4ff03faed45ae09c43e6b31ebd4b94cf":
-            # ref: https://huggingface.co/skt/A.X-4.0
-            res = "a.x-4.0"
-        if chkhsh == "f6791d196f87ce6b56a7d234be618e0d58f8cda3549416635b2bebcd22cd95c4":
-            # ref: https://huggingface.co/K-intelligence/Midm-2.0-Base-Instruct
-            res = "midm-2.0"
-        if chkhsh == "169bf0296a13c4d9b7672313f749eb36501d931022de052aad6e36f2bf34dd51":
-            # ref: https://huggingface.co/LiquidAI/LFM2.5-350M
-            res = "lfm2"
-        if chkhsh == "2085e1638f6c377a0aa4ead21b27bb4cb941bf800df86ed391011769c1758dfb":
-            # ref: https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B
-            res = "exaone4"
-        if chkhsh == "a1e163ecab2e718a4c829d1148b6e86824ec36163bb71941c3dca9cd5ac25756":
-            # ref: https://huggingface.co/JetBrains/Mellum-4b-base
-            res = "mellum"
-        if chkhsh == "a0b64b4385f123663873756336c085744376d015ff328bb1d901598f63c44152":
-            # ref: https://huggingface.co/answerdotai/ModernBERT-base
-            res = "modern-bert"
-        if chkhsh == "49fc0303c9e0d2c2c565c510f64b2d9b271276acdcdadff733249eda9f7d59df":
-            # ref: https://huggingface.co/arcee-ai/Trinity-Tokenizer
-            res = "afmoe"
-        if chkhsh == "9b1be57e70d20d9501b2b3186e792d81181ae36ada3903c26f9fea418cf87206":
-            # ref: https://huggingface.co/inclusionAI/Ling-mini-base-2.0
-            res = "bailingmoe2"
-        if chkhsh == "53e325976a6e142379c19b09afcae354f2f496f147afa8f9e189a33fe4e3024e":
-            # ref: https://huggingface.co/ibm-granite/granite-docling-258M
-            res = "granite-docling"
-        if chkhsh == "f4f37b6c8eb9ea29b3eac6bb8c8487c5ab7885f8d8022e67edc1c68ce8403e95":
-            # ref: https://huggingface.co/MiniMaxAI/MiniMax-M2
-            res = "minimax-m2"
-        if chkhsh == "4a2e2abae11ca2b86d570fc5b44be4d5eb5e72cc8f22dd136a94b37da83ab665":
-            # ref: https://huggingface.co/KORMo-Team/KORMo-tokenizer
-            res = "kormo"
-        if chkhsh == "9d70134b369a70e5735009b6de918f7581b5211f7c074d1f89f753aea8248af1":
-            # ref: https://huggingface.co/tencent/Youtu-LLM-2B
-            res = "youtu"
-        if chkhsh == "16389f0a1f51ee53e562ffd51c371dc508639ab0e4261502071836e50e223e91":
-            # ref: https://huggingface.co/upstage/Solar-Open-100B
-            res = "solar-open"
-        if chkhsh == "6c81ce329e0802883b22eabab0d3fa48357337ef1ecb45443828bf1f6254833f":
-            # ref: https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
-            res = "exaone-moe"
-        if chkhsh == "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4":
-            # ref: https://huggingface.co/Qwen/Qwen3.5-9B-Instruct
-            res = "qwen35"
-        if chkhsh == "b4b8ca1f9769494fbd956ebc4c249de6131fb277a4a3345a7a92c7dd7a55808d":
-            # ref: https://huggingface.co/jdopensource/JoyAI-LLM-Flash
-            res = "joyai-llm"
-        if chkhsh == "e4d54df1ebc1f2b91acd986c5b51aa50837d5faf7c7398e73c1f9e9ee5d19869":
-            # ref: https://huggingface.co/kakaocorp/kanana-2-30b-a3b-instruct-2601
-            res = "kanana2"
-        if chkhsh == "862f827721df956049dff5ca81a57f29e575280bc622e290d3bf4e35eca29015":
-            # ref: https://huggingface.co/codefuse-ai/F2LLM-v2-4B
-            res = "f2llmv2"
-        if chkhsh == "62f6fb0a6fd5098caeabb19b07a5c1099cafc8b9c40eab6ea89ece4ec02fbc57":
-            # ref: https://huggingface.co/sarvamai/sarvam-30b
-            res = "sarvam-moe"
-        if chkhsh == "f728162c1315c26e40249849799b4ba3fe584c32084b4795b03eb295e63cb5af":
-            # ref: https://huggingface.co/lewtun/talkie-1930-13b-it-hf
-            res = "talkie"
-        if chkhsh == "36f3066e97b7f3994b379aaacde306c1444c6ae84e81a5ae3cd2b7ed3b8c42d4":
-            # ref: https://huggingface.co/openbmb/MiniCPM5-1B
-            res = "minicpm5"
-        if chkhsh == "f241072145675bf8322086f115aebad05e9f869557a238bf2150a2a417d1bf60":
-            # ref: https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2
-            res = "granite-embed-multi-97m"
-        if chkhsh == "789696f5946cc0fc59371f39f6097cafed196b3acded6140432f26bbb1ae1669":
-            # ref: https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2
-            res = "granite-embed-multi-311m"
-        if chkhsh == "9dcf830ee9990cdbf78cc523a5f7bd9ad8f3f9890c2d3581d2785ad10f07049d":
-            # ref: https://huggingface.co/JetBrains/Mellum2-12B-A2.5B-Base
-            res = "mellum2"
-        if chkhsh == "972da7b59cec44d1f0a490a86c96df53859e486e481563e5dddac155013d87ac":
-            # ref: https://huggingface.co/poolside/Laguna-XS.2
-            res = "laguna"
-        if chkhsh == "653660222fb704f61cbf2b618a8ae6502b7f8b20c980f9a5de07ed78e13319cd":
-            # ref: https://huggingface.co/ufakai/ufakzeka-1
-            res = "ufakzeka"
-        if chkhsh == "4b05e02dad1c5ae07d266fd3342ddb644c6f6be058d728bc0a33af31a1d6ee66":
-            # ref: https://huggingface.co/jhu-clsp/mmBERT-base
-            res = "mmbert"
-        if chkhsh == "a9af07a84191f55098b248ae6f3dfe9e32d3190bebe8eafd91c1ddec9bc3449f":
-            # ref: https://huggingface.co/IFM/K2-Horizon-36B
-            res = "k2-horizon"
         if chkhsh == "5635e1c8d621dff7b4825f41f2f97b6ceb39bcf2d5c541db28577080d6efd5e5":
             # ref: https://huggingface.co/thinkingmachines/Inkling-2-Small
             res = "inkling2"
-        if chkhsh == "32d85c31273f8019248f2559fed492d929ea28b17e51d81d3bb36fff23ca72b3":
-            # ref: https://huggingface.co/domyn/Domyn-Edge-Teacher-IF
-            res = "domyn-edge"
 
         if res is None:
             logger.warning("\n")
@@ -2508,668 +1805,6 @@ class TextModel(ModelBase):
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
         special_vocab.add_to_gguf(self.gguf_writer)
 
-    def _set_vocab_whitespace(self) -> None:
-        tokens, toktypes, _ = self.get_vocab_base()
-        self.gguf_writer.add_tokenizer_model("whitespace")
-        self.gguf_writer.add_tokenizer_pre("whitespace") # pinned, not hash-detected: chktxt hash collides with jina-v1-en
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-        special_vocab.add_to_gguf(self.gguf_writer)
-
-    def _is_hybriddna(self) -> bool:
-        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
-        if not tokenizer_config_file.is_file():
-            return False
-        with open(tokenizer_config_file, "r", encoding="utf-8") as f:
-            return json.load(f).get("tokenizer_class") == "HybridDNATokenizer"
-
-    def _set_vocab_hybriddna(self):
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
-        assert tokenizer is not None
-        vocab = tokenizer.get_vocab()
-        vocab_size = self.hparams.get("vocab_size", len(vocab))
-        assert max(vocab.values()) < vocab_size
-
-        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in vocab.items()}
-        # k-mers can share text with a base-vocab BPE token (e.g. CCCCCC) and get dropped by get_vocab()
-        # a reserved marker suffix (U+E000) keeps each k-mer's own id (llama.cpp strips it on detokenization)
-        # tail="pad_n" (Carbon-14B) adds N-padded tail tokens ("CT" -> "CTNNNN") that get the same marker
-        # llama.cpp detects them to pad with N and strips the padding on detokenization, tail="char" is unsupported
-        tail = getattr(tokenizer, "tail", "pad_a")
-        if tokenizer.k != 6 or tail not in ("pad_a", "pad_n"):
-            raise NotImplementedError(f"HybridDNATokenizer with k={tokenizer.k}, tail={tail!r}")
-        for kmer in [*tokenizer.kmers, *getattr(tokenizer, "npad_tokens", [])]:
-            reverse_vocab[tokenizer.dna_token_to_id[kmer]] = kmer + "\ue000"
-        # older HybridDNATokenizer versions (Carbon-500M/3B/8B) do not register the base tokenizer's added tokens (<|im_start|>, <think>, ...) as their own
-        # but they are still encoded as special tokens: take their types from the base tokenizer
-        base_tokenizer = getattr(tokenizer, "_base_tokenizer", tokenizer)
-        added_tokens_decoder = {**base_tokenizer.added_tokens_decoder, **tokenizer.added_tokens_decoder}
-
-        tokens: list[str] = []
-        toktypes: list[int] = []
-        for i in range(vocab_size):
-            if i not in reverse_vocab:
-                tokens.append(f"[PAD{i}]")
-                toktypes.append(gguf.TokenType.UNUSED)
-            else:
-                token: str = reverse_vocab[i]
-                if i in added_tokens_decoder:
-                    if added_tokens_decoder[i].special or self.does_token_look_special(token):
-                        toktypes.append(gguf.TokenType.CONTROL)
-                    else:
-                        toktypes.append(gguf.TokenType.USER_DEFINED)
-                else:
-                    toktypes.append(gguf.TokenType.NORMAL)
-                tokens.append(token)
-
-        tokpre = self.get_vocab_base_pre(tokenizer)
-        self.gguf_writer.add_tokenizer_model("hybriddna")
-        self.gguf_writer.add_tokenizer_pre(tokpre)
-        self.gguf_writer.add_dna_auto_tags(getattr(tokenizer, "auto_dna_tags", False))
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-        if not special_vocab.merges:
-            # Carbon-500M/3B/8B ship only tokenizer.py, no tokenizer.json
-            # take the merges and special token ids from the base BPE tokenizer, keeping the model's own chat template (if any)
-            with tempfile.TemporaryDirectory() as tmp:
-                base_tokenizer.save_pretrained(tmp)
-                base_special_vocab = gguf.SpecialVocab(Path(tmp), load_merges=True)
-            base_special_vocab.chat_template = special_vocab.chat_template
-            special_vocab = base_special_vocab
-        special_vocab.add_to_gguf(self.gguf_writer)
-
-    def _set_vocab_qwen(self):
-        from .qwen import QwenModel
-
-        dir_model = self.dir_model
-        hparams = self.hparams
-        tokens: list[str] = []
-        toktypes: list[int] = []
-
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(dir_model, trust_remote_code=True)
-        assert tokenizer is not None
-        vocab_size = hparams["vocab_size"]
-        assert max(tokenizer.get_vocab().values()) < vocab_size
-
-        tokpre = self.get_vocab_base_pre(tokenizer)
-
-        merges = []
-        vocab = {}
-        mergeable_ranks = tokenizer.mergeable_ranks
-        for token, rank in mergeable_ranks.items():
-            vocab[QwenModel.token_bytes_to_string(token)] = rank
-            if len(token) == 1:
-                continue
-            merged = QwenModel.bpe(mergeable_ranks, token, max_rank=rank)
-            assert len(merged) == 2
-            merges.append(str(' '.join(map(QwenModel.token_bytes_to_string, merged))))
-
-        # for this kind of tokenizer, added_vocab is not a subset of vocab, so they need to be combined
-        added_vocab = tokenizer.special_tokens
-        reverse_vocab = {id_ : encoded_tok for encoded_tok, id_ in {**vocab, **added_vocab}.items()}
-
-        for i in range(vocab_size):
-            if i not in reverse_vocab:
-                tokens.append(f"[PAD{i}]")
-                toktypes.append(gguf.TokenType.UNUSED)
-            elif reverse_vocab[i] in added_vocab:
-                tokens.append(reverse_vocab[i])
-                toktypes.append(gguf.TokenType.CONTROL)
-            else:
-                tokens.append(reverse_vocab[i])
-                toktypes.append(gguf.TokenType.NORMAL)
-
-        self.gguf_writer.add_tokenizer_model("gpt2")
-        self.gguf_writer.add_tokenizer_pre(tokpre)
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-
-        special_vocab = gguf.SpecialVocab(dir_model, load_merges=False)
-        special_vocab.merges = merges
-        # only add special tokens when they were not already loaded from config.json
-        if len(special_vocab.special_token_ids) == 0:
-            special_vocab._set_special_token("bos", tokenizer.special_tokens["<|endoftext|>"])
-            special_vocab._set_special_token("eos", tokenizer.special_tokens["<|endoftext|>"])
-        # this one is usually not in config.json anyway
-        special_vocab._set_special_token("unk", tokenizer.special_tokens["<|endoftext|>"])
-        special_vocab.add_to_gguf(self.gguf_writer)
-
-    def _set_vocab_sentencepiece(self, add_to_gguf=True):
-        tokens, scores, toktypes = self._create_vocab_sentencepiece()
-
-        self.gguf_writer.add_tokenizer_model("llama")
-        self.gguf_writer.add_tokenizer_pre("default")
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_scores(scores)
-        self.gguf_writer.add_token_types(toktypes)
-
-        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
-        special_vocab.add_to_gguf(self.gguf_writer)
-
-    def _create_vocab_sentencepiece(self):
-        from sentencepiece import SentencePieceProcessor
-
-        tokenizer_path = self.dir_model / 'tokenizer.model'
-
-        if not tokenizer_path.is_file():
-            raise FileNotFoundError(f"File not found: {tokenizer_path}")
-
-        tokenizer = SentencePieceProcessor()
-        tokenizer.LoadFromFile(str(tokenizer_path))
-
-        vocab_size = self.find_hparam([
-            "vocab_size_per_layer_input", # gemma3n
-            "vocab_size",
-        ], optional=True) or tokenizer.vocab_size()
-
-        tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
-        scores: list[float] = [-10000.0] * vocab_size
-        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
-
-        for token_id in range(tokenizer.vocab_size()):
-            if token_id >= vocab_size:
-                logger.warning(f'ignore tokens from {token_id}: id is out of range, max={vocab_size - 1}')
-                break
-
-            piece = tokenizer.IdToPiece(token_id)
-            text = piece.encode("utf-8")
-            score = tokenizer.GetScore(token_id)
-
-            toktype = SentencePieceTokenTypes.NORMAL
-            if tokenizer.IsUnknown(token_id):
-                toktype = SentencePieceTokenTypes.UNKNOWN
-            elif tokenizer.IsControl(token_id):
-                toktype = SentencePieceTokenTypes.CONTROL
-            elif tokenizer.IsUnused(token_id):
-                toktype = SentencePieceTokenTypes.UNUSED
-            elif tokenizer.IsByte(token_id):
-                toktype = SentencePieceTokenTypes.BYTE
-
-            tokens[token_id] = text
-            scores[token_id] = score
-            toktypes[token_id] = toktype
-
-        added_tokens_file = self.dir_model / 'added_tokens.json'
-        if added_tokens_file.is_file():
-            with open(added_tokens_file, "r", encoding="utf-8") as f:
-                added_tokens_json = json.load(f)
-                for key in added_tokens_json:
-                    token_id = added_tokens_json[key]
-                    if token_id >= vocab_size:
-                        logger.warning(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
-                        continue
-
-                    tokens[token_id] = key.encode("utf-8")
-                    scores[token_id] = -1000.0
-                    toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
-
-        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
-        if tokenizer_config_file.is_file():
-            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
-                tokenizer_config_json = json.load(f)
-                added_tokens_decoder = tokenizer_config_json.get("added_tokens_decoder", {})
-                for token_id, token_data in added_tokens_decoder.items():
-                    token_id = int(token_id)
-                    token: str = token_data["content"]
-                    if token_id >= vocab_size:
-                        logger.warning(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
-                        continue
-                    if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
-                        if tokens[token_id] != token.encode("utf-8"):
-                            logger.warning(f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token!r}')
-                    if token_data.get("special") or self.does_token_look_special(token):
-                        toktypes[token_id] = SentencePieceTokenTypes.CONTROL
-                    else:
-                        token = token.replace(b"\xe2\x96\x81".decode("utf-8"), " ")  # pre-normalize user-defined spaces
-                        toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
-
-                    scores[token_id] = -1000.0
-                    tokens[token_id] = token.encode("utf-8")
-
-        if vocab_size > len(tokens):
-            pad_count = vocab_size - len(tokens)
-            logger.debug(f"Padding vocab with {pad_count} token(s) - [PAD1] through [PAD{pad_count}]")
-            for i in range(1, pad_count + 1):
-                tokens.append(bytes(f"[PAD{i}]", encoding="utf-8"))
-                scores.append(-1000.0)
-                toktypes.append(SentencePieceTokenTypes.UNUSED)
-
-        return tokens, scores, toktypes
-
-    def _set_vocab_llama_hf(self):
-        vocab = gguf.LlamaHfVocab(self.dir_model)
-        tokens = []
-        scores = []
-        toktypes = []
-
-        for text, score, toktype in vocab.all_tokens():
-            tokens.append(text)
-            scores.append(score)
-            toktypes.append(toktype)
-
-        assert len(tokens) == vocab.vocab_size
-
-        self.gguf_writer.add_tokenizer_model("llama")
-        self.gguf_writer.add_tokenizer_pre("default")
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_scores(scores)
-        self.gguf_writer.add_token_types(toktypes)
-
-        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
-        special_vocab.add_to_gguf(self.gguf_writer)
-
-    def _set_vocab_rwkv_world(self):
-        assert (self.dir_model / "rwkv_vocab_v20230424.txt").is_file()
-        vocab_size = self.hparams.get("vocab_size", 65536)
-
-        tokens: list[bytes] = ['<s>'.encode("utf-8")]
-        toktypes: list[int] = [gguf.TokenType.CONTROL]
-
-        with open(self.dir_model / "rwkv_vocab_v20230424.txt", "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            for line in lines:
-                parts = line.split(' ')
-                assert len(parts) >= 3
-                token, token_len = ast.literal_eval(' '.join(parts[1:-1])), int(parts[-1])
-                token = token.encode("utf-8") if isinstance(token, str) else token
-                assert isinstance(token, bytes)
-                assert len(token) == token_len
-                token_text: str = repr(token)[2:-1]  # "b'\xff'" -> "\xff"
-                tokens.append(token_text.encode("utf-8"))
-                toktypes.append(gguf.TokenType.NORMAL)
-        remainder = vocab_size - len(tokens)
-        assert remainder >= 0
-        for i in range(len(tokens), vocab_size):
-            tokens.append(f"[PAD{i}]".encode("utf-8"))
-            toktypes.append(gguf.TokenType.UNUSED)
-
-        self.gguf_writer.add_tokenizer_model("rwkv")
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=False)
-        if special_vocab.chat_template is None:
-            template_path = Path(__file__).parent.parent / "models" / "templates" / "llama-cpp-rwkv-world.jinja"
-            if template_path.is_file():
-                with open(template_path, "r", encoding="utf-8") as f:
-                    template = f.read()
-            else:
-                template = "rwkv-world"
-            special_vocab.chat_template = template
-        # hack: Add '\n\n' as the EOT token to make it chat normally
-        special_vocab._set_special_token("eot", 261)
-        # hack: Override these as they have already been set (incorrectly)
-        special_vocab.special_token_ids["bos"] = 0
-        special_vocab.special_token_ids["eos"] = 0
-
-        special_vocab.add_to_gguf(self.gguf_writer)
-
-    def _set_vocab_builtin(self, model_name: Literal["gpt-neox", "llama-spm"], vocab_size: int):
-        tokenizer_path = Path(sys.path[0]) / "models" / f"ggml-vocab-{model_name}.gguf"
-        logger.warning(f"Using tokenizer from '{os.path.relpath(tokenizer_path, os.getcwd())}'")
-        vocab_reader = gguf.GGUFReader(tokenizer_path, "r")
-
-        default_pre = "mpt" if model_name == "gpt-neox" else "default"
-
-        field = vocab_reader.get_field(gguf.Keys.Tokenizer.MODEL)
-        assert field  # tokenizer model
-        self.gguf_writer.add_tokenizer_model(bytes(field.parts[-1]).decode("utf-8"))
-
-        field = vocab_reader.get_field(gguf.Keys.Tokenizer.PRE)
-        self.gguf_writer.add_tokenizer_pre(bytes(field.parts[-1]).decode("utf-8") if field else default_pre)
-
-        field = vocab_reader.get_field(gguf.Keys.Tokenizer.LIST)
-        assert field  # token list
-        self.gguf_writer.add_token_list([bytes(field.parts[i]) for i in field.data][:vocab_size])
-
-        if model_name == "llama-spm":
-            field = vocab_reader.get_field(gguf.Keys.Tokenizer.SCORES)
-            assert field  # token scores
-            self.gguf_writer.add_token_scores([field.parts[i].tolist()[0] for i in field.data][:vocab_size])
-
-        field = vocab_reader.get_field(gguf.Keys.Tokenizer.TOKEN_TYPE)
-        assert field  # token types
-        self.gguf_writer.add_token_types([field.parts[i].tolist()[0] for i in field.data][:vocab_size])
-
-        if model_name != "llama-spm":
-            field = vocab_reader.get_field(gguf.Keys.Tokenizer.MERGES)
-            assert field  # token merges
-            self.gguf_writer.add_token_merges([bytes(field.parts[i]) for i in field.data])
-
-        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.BOS_ID)) is not None:
-            self.gguf_writer.add_bos_token_id(field.parts[-1].tolist()[0])
-        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.EOS_ID)) is not None:
-            self.gguf_writer.add_eos_token_id(field.parts[-1].tolist()[0])
-        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.UNK_ID)) is not None:
-            self.gguf_writer.add_unk_token_id(field.parts[-1].tolist()[0])
-        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.PAD_ID)) is not None:
-            self.gguf_writer.add_pad_token_id(field.parts[-1].tolist()[0])
-        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.ADD_BOS)) is not None:
-            self.gguf_writer.add_add_bos_token(field.parts[-1].tolist()[0])
-        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.ADD_EOS)) is not None:
-            self.gguf_writer.add_add_eos_token(field.parts[-1].tolist()[0])
-
-    def _try_set_pooling_type(self) -> None:
-        # get pooling path
-        pooling_path = None
-        module_path = self.dir_model / "modules.json"
-        if module_path.is_file():
-            with open(module_path, encoding="utf-8") as f:
-                modules = json.load(f)
-            for mod in modules:
-                if mod["type"].endswith("Pooling"):
-                    pooling_path = mod["path"]
-                    break
-
-        mode_mapping = {
-            "mean": gguf.PoolingType.MEAN,
-            "cls": gguf.PoolingType.CLS,
-            "lasttoken": gguf.PoolingType.LAST,
-        }
-
-        # get pooling type
-        if pooling_path is not None:
-            with open(self.dir_model / pooling_path / "config.json", encoding="utf-8") as f:
-                pooling = json.load(f)
-            if pooling.get("pooling_mode_mean_tokens"):
-                pooling_type = gguf.PoolingType.MEAN
-            elif pooling.get("pooling_mode_cls_token"):
-                pooling_type = gguf.PoolingType.CLS
-            elif pooling.get("pooling_mode_lasttoken"):
-                pooling_type = gguf.PoolingType.LAST
-            elif (pooling_mode := pooling.get("pooling_mode")) in mode_mapping:
-                pooling_type = mode_mapping[pooling_mode]
-            else:
-                raise NotImplementedError("Only MEAN, CLS, and LAST pooling types supported")
-            self.gguf_writer.add_pooling_type(pooling_type)
-        else:
-            embedding_config_path = self.dir_model / "embedding_config.json"
-            if embedding_config_path.is_file():
-                with open(embedding_config_path, encoding="utf-8") as f:
-                    embedding_config = json.load(f)
-                pooling = embedding_config.get("pooling")
-                if pooling == "last_token":
-                    self.gguf_writer.add_pooling_type(gguf.PoolingType.LAST)
-                elif pooling is not None:
-                    raise NotImplementedError(f"unsupported embedding_config.json pooling {pooling!r}")
-
-        # pooling before a classification head (e.g. ModernBertForSequenceClassification)
-        if (classifier_pooling := self.hparams.get("classifier_pooling")) is not None:
-            if classifier_pooling not in ("cls", "mean"):
-                raise NotImplementedError(f"Unsupported classifier_pooling: {classifier_pooling}")
-            self.gguf_writer.add_classifier_pooling_type(mode_mapping[classifier_pooling])
-        if (classifier_activation := self.hparams.get("classifier_activation")) is not None:
-            if classifier_activation not in ("gelu", "silu", "tanh"):
-                raise NotImplementedError(f"Unsupported classifier_activation: {classifier_activation}")
-            self.gguf_writer.add_classifier_activation(classifier_activation)
-
-    def _set_vocab_glmedge(self):
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
-        assert tokenizer is not None
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-        tokens, toktypes, tokpre = self.get_vocab_base()
-        self.gguf_writer.add_tokenizer_model("gpt2")
-        self.gguf_writer.add_tokenizer_pre(tokpre)
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-        special_vocab._set_special_token("eos", tokenizer.get_added_vocab()["<|endoftext|>"])
-        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])
-        special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|endoftext|>"])
-        special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["<|endoftext|>"])
-        special_vocab.add_to_gguf(self.gguf_writer)
-
-    def _set_vocab_glm(self):
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
-        assert tokenizer is not None
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-        tokens, toktypes, tokpre = self.get_vocab_base()
-        self.gguf_writer.add_tokenizer_model("gpt2")
-        self.gguf_writer.add_tokenizer_pre(tokpre)
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-        # Special tokens
-        # Note: Using <|endoftext|> (151329) for eot causes endless generation
-        special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["[gMASK]"])  # 151331
-        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])  # 151336
-        special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|endoftext|>"])  # 151329
-        special_vocab._set_special_token("eom", tokenizer.get_added_vocab()["<|observation|>"])  # 151338
-        special_vocab.add_to_gguf(self.gguf_writer)
-
-    def _set_vocab_interns1(self):
-        tokens: list[str] = []
-        toktypes: list[int] = []
-
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
-        assert tokenizer is not None
-        vocab = getattr(tokenizer, 'vocab', tokenizer.get_vocab())
-        vocab_size = self.hparams.get("vocab_size", len(vocab))
-        assert max(vocab.values()) < vocab_size
-
-        tokpre = self.get_vocab_base_pre(tokenizer)
-
-        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in vocab.items()}
-        added_vocab = tokenizer.get_added_vocab()
-
-        added_tokens_decoder = tokenizer.added_tokens_decoder
-
-        for i in range(vocab_size):
-            if i not in reverse_vocab:
-                tokens.append(f"[PAD{i}]")
-                toktypes.append(gguf.TokenType.UNUSED)
-            else:
-                token: str = reverse_vocab[i]
-                if token in added_vocab:
-                    # The tokenizer in llama.cpp assumes the CONTROL and USER_DEFINED tokens are pre-normalized.
-                    # To avoid unexpected issues - we make sure to normalize non-normalized tokens
-                    if not added_tokens_decoder[i].normalized:
-                        previous_token = token
-                        token = tokenizer.decode(tokenizer.encode(token, add_special_tokens=False))  # ty: ignore[invalid-assignment]
-                        if previous_token != token:
-                            logger.info(f"{repr(previous_token)} is encoded and decoded back to {repr(token)} using AutoTokenizer")
-
-                    if added_tokens_decoder[i].special or self.does_token_look_special(token):
-                        toktypes.append(gguf.TokenType.CONTROL)
-                    else:
-                        toktypes.append(gguf.TokenType.USER_DEFINED)
-                else:
-                    toktypes.append(gguf.TokenType.NORMAL)
-                tokens.append(token)
-
-        self.gguf_writer.add_tokenizer_model("gpt2")
-        self.gguf_writer.add_tokenizer_pre(tokpre)
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-        special_vocab._set_special_token("bos", 151643)
-        special_vocab.add_to_gguf(self.gguf_writer)
-
-    def _set_vocab_mistral(self):
-        from .mistral import MistralModel
-
-        if not _mistral_common_installed:
-            raise ImportError(_mistral_import_error_msg)
-
-        vocab = MistralVocab(self.dir_model)
-        logger.info(
-            f"Converting tokenizer {vocab.tokenizer_type} of size {vocab.vocab_size}."
-        )
-
-        self.gguf_writer.add_tokenizer_model(vocab.gguf_tokenizer_model)
-
-        tokens = []
-        scores = []
-        toktypes = []
-
-        for text, score, toktype in vocab.all_tokens():
-            tokens.append(text)
-            scores.append(score)
-            toktypes.append(toktype)
-
-        assert len(tokens) == vocab.vocab_size, (
-            f"token count ({len(tokens)}) != vocab size ({vocab.vocab_size})"
-        )
-
-        if vocab.tokenizer_type == MistralTokenizerType.tekken:
-            with open(vocab.fname_tokenizer, encoding="utf-8") as f:
-                pattern = json.load(f)["config"]["pattern"]
-            # newer tekken.json split numbers into right-aligned groups of 3 digits instead of single digits
-            if "\\p{N}{1,3}(?=(?:\\p{N}{3})*(?!\\p{N}))" in pattern:
-                self.gguf_writer.add_tokenizer_pre("tekken-num3")
-            else:
-                self.gguf_writer.add_tokenizer_pre("tekken")
-            self.gguf_writer.add_token_merges(
-                vocab.extract_vocab_merges_from_model()
-            )
-
-        logger.info(
-            f"Setting bos, eos, unk and pad token IDs to {vocab.bos_id}, {vocab.eos_id}, {vocab.unk_id}, {vocab.pad_id}."
-        )
-
-        self.gguf_writer.add_bos_token_id(vocab.bos_id)
-        self.gguf_writer.add_eos_token_id(vocab.eos_id)
-        self.gguf_writer.add_unk_token_id(vocab.unk_id)
-        self.gguf_writer.add_pad_token_id(vocab.pad_id)
-
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_scores(scores)
-        self.gguf_writer.add_token_types(toktypes)
-        self.gguf_writer.add_vocab_size(vocab.vocab_size)
-
-        self.gguf_writer.add_add_bos_token(True)
-        self.gguf_writer.add_add_eos_token(False)
-
-        local_template_file_path = self.dir_model / "chat_template.jinja"
-
-        if self.is_mistral_format and local_template_file_path.is_file():
-            # Ministral-3 and other new Mistral models come with chat templates.
-            # ref: https://huggingface.co/mistralai/Ministral-3-14B-Instruct-2512/tree/main
-            logger.info("Using an existing Mistral local chat template.")
-
-            with open(local_template_file_path, "r", encoding="utf-8") as f:
-                template = f.read()
-        elif not self.is_mistral_format or not self.disable_mistral_community_chat_template:
-            template_dir = Path(__file__).parent.parent / "models/templates/"
-
-            # Log only for Mistral format that the official tokenization and detokenization is via `mistral-common`.
-            if self.is_mistral_format:
-                logger.info(
-                    "Using a Mistral community chat template. These templates can be subject to errors in early days or weeks after a release. "
-                    "Mistral recommends to use `mistral-common` to perform tokenization and detokenization."
-                )
-            template = MistralModel.get_community_chat_template(vocab, template_dir, self.is_mistral_format)
-        else:
-            logger.info("Not using a Mistral local or community chat template. Ensure to perform the tokenization and detokenization via `mistral-common`.")
-            template = None
-
-        if template is not None:
-            self.gguf_writer.add_chat_template(template)
-
-    def _set_vocab_plamo(
-        self,
-        eot_token: str,
-        normal_tokens: Iterable[str] = (),
-    ):
-        # PLaMo models use a custom tokenizer with a .jsonl file
-        tokenizer_jsonl_path = self.dir_model / "tokenizer.jsonl"
-        tokenizer_config_path = self.dir_model / "tokenizer_config.json"
-
-        if not tokenizer_jsonl_path.is_file():
-            raise FileNotFoundError(f"PLaMo tokenizer file not found: {tokenizer_jsonl_path}")
-
-        # Load tokenizer config
-        with open(tokenizer_config_path, "r", encoding="utf-8") as f:
-            tokenizer_config = json.load(f)
-
-        tokenizer_class = tokenizer_config.get("tokenizer_class")
-        if tokenizer_class == "Plamo2Tokenizer":
-            tokenizer_model = "plamo2"
-        elif tokenizer_class == "Plamo3Tokenizer":
-            tokenizer_model = "plamo3"
-        else:
-            raise ValueError(f"Unsupported PLaMo tokenizer class: {tokenizer_class}")
-
-        # Load tokens from JSONL file (actually a list format)
-        tokens = []
-        scores = []
-        toktypes = []
-        normal_tokens = set(normal_tokens)
-
-        with open(tokenizer_jsonl_path, "r", encoding="utf-8") as f:
-            for line_num, line in enumerate(f):
-                if line.strip():
-                    token_data = json.loads(line)
-                    # Format: [token, score, type, ?, ?, ?, ?]
-                    token_str = token_data[0]
-                    token = token_str.encode("utf-8")
-                    score = float(token_data[1])
-                    token_type_str = token_data[2] if len(token_data) > 2 else "NORMAL"
-
-                    tokens.append(token)
-                    scores.append(score)
-
-                    if token_str in normal_tokens:
-                        toktypes.append(gguf.TokenType.NORMAL)
-                    elif token_type_str == "UNKNOWN":
-                        toktypes.append(gguf.TokenType.UNKNOWN)
-                    elif token_type_str == "CONTROL":
-                        toktypes.append(gguf.TokenType.CONTROL)
-                    elif token_type_str == "BYTE":
-                        toktypes.append(gguf.TokenType.BYTE)
-                    else:
-                        if token_str.startswith("<|plamo:") and token_str.endswith("|>"):
-                            toktypes.append(gguf.TokenType.CONTROL)
-                        else:
-                            toktypes.append(gguf.TokenType.NORMAL)
-
-        vocab_size = self.hparams["vocab_size"]
-        if vocab_size > len(tokens):
-            pad_count = vocab_size - len(tokens)
-            logger.debug(f"Padding vocab with {pad_count} token(s) - [PAD1] through [PAD{pad_count}]")
-            for i in range(1, pad_count + 1):
-                tokens.append(bytes(f"[PAD{i}]", encoding="utf-8"))
-                scores.append(-1000.0)
-                toktypes.append(gguf.TokenType.UNUSED)
-
-        self.gguf_writer.add_tokenizer_model(tokenizer_model)
-        self.gguf_writer.add_tokenizer_pre("default")
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_scores(scores)
-        self.gguf_writer.add_token_types(toktypes)
-
-        if "bos_token" in tokenizer_config and tokenizer_config["bos_token"] is not None:
-            token_id = tokens.index(tokenizer_config["bos_token"].encode("utf-8"))
-            self.gguf_writer.add_bos_token_id(token_id)
-        if "eos_token" in tokenizer_config and tokenizer_config["eos_token"] is not None:
-            token_id = tokens.index(tokenizer_config["eos_token"].encode("utf-8"))
-            self.gguf_writer.add_eos_token_id(token_id)
-        if "pad_token" in tokenizer_config and tokenizer_config["pad_token"] is not None:
-            token_id = tokens.index(tokenizer_config["pad_token"].encode("utf-8"))
-            self.gguf_writer.add_pad_token_id(token_id)
-        if "sep_token" in tokenizer_config and tokenizer_config["sep_token"] is not None:
-            token_id = tokens.index(tokenizer_config["sep_token"].encode("utf-8"))
-            self.gguf_writer.add_sep_token_id(token_id)
-        if "unk_token" in tokenizer_config and tokenizer_config["unk_token"] is not None:
-            token_id = tokens.index(tokenizer_config["unk_token"].encode("utf-8"))
-            self.gguf_writer.add_unk_token_id(token_id)
-
-        self.gguf_writer.add_eot_token_id(tokens.index(eot_token.encode("utf-8")))
-
-        self.gguf_writer.add_add_space_prefix(False)
-
-        if (add_bos := tokenizer_config.get("add_bos_token")) is not None:
-            self.gguf_writer.add_add_bos_token(add_bos)
-        if (add_eos := tokenizer_config.get("add_eos_token")) is not None:
-            self.gguf_writer.add_add_eos_token(add_eos)
-
 
 class MmprojModel(ModelBase):
     model_type = ModelType.MMPROJ
@@ -3193,19 +1828,12 @@ class MmprojModel(ModelBase):
             raise TypeError("MmprojModel must be subclassed with model_arch = gguf.MODEL_ARCH.MMPROJ")
 
         # get n_embd of the text model
-        if not self.is_mistral_format:
-            if "text_config" not in self.hparams:
-                self.hparams["text_config"] = {}
-            if "audio_config" not in self.hparams:
-                self.hparams["audio_config"] = {}
-            text_config = {**self.hparams, **self.hparams["text_config"]}
-            self.n_embd_text = text_config.get("hidden_size", text_config.get("n_embd", 0))
-        else:
-            text_config = {
-                k: v for k, v in self.hparams.items() if k not in ["vision_encoder", "audio_encoder"]
-            }
-            # mistral native params.json: "dim" is the text hidden size ("hidden_dim" is the FFN intermediate size)
-            self.n_embd_text = text_config.get("dim", 0)
+        if "text_config" not in self.hparams:
+            self.hparams["text_config"] = {}
+        if "audio_config" not in self.hparams:
+            self.hparams["audio_config"] = {}
+        text_config = {**self.hparams, **self.hparams["text_config"]}
+        self.n_embd_text = text_config.get("hidden_size", text_config.get("n_embd", 0))
 
         assert self.n_embd_text > 0, "n_embd not found in hparams"
 
@@ -3268,8 +1896,7 @@ class MmprojModel(ModelBase):
         return super().filter_tensors(item)
 
     def get_vision_config(self) -> dict[str, Any] | None:
-        config_name = "vision_config" if not self.is_mistral_format else "vision_encoder"
-        return self.global_config.get(config_name)
+        return self.global_config.get("vision_config")
 
     def get_audio_config(self) -> dict[str, Any] | None:
         mm_config_key = "whisper_config" if "whisper_config" in self.hparams else "audio_config"
@@ -3306,8 +1933,8 @@ class MmprojModel(ModelBase):
             self.gguf_writer.add_vision_head_count(self.find_vparam(["num_attention_heads", "num_heads", "heads", "vt_num_attention_heads"]))
 
             # preprocessor config
-            image_mean = _MISTRAL_COMMON_DATASET_MEAN if self.is_mistral_format else self.preprocessor_config["image_mean"]
-            image_std = _MISTRAL_COMMON_DATASET_STD if self.is_mistral_format else self.preprocessor_config["image_std"]
+            image_mean = self.preprocessor_config["image_mean"]
+            image_std = self.preprocessor_config["image_std"]
 
             self.gguf_writer.add_vision_image_mean(image_mean)
             self.gguf_writer.add_vision_image_std(image_std)
@@ -3479,41 +2106,22 @@ else:
     LazyTorchTensor._dtype_str_map["F8_E8M0"] = torch.uint8
 
 
-def jinja_str_or_json(name: str) -> str:
-    # jinja expression that renders a variable as-is if it is a string, as JSON otherwise
-    return "{{ " + name + " if " + name + " is string else " + name + " | tojson }}"
-
-
 def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> str:
-    # TODO @ngxson : this won't work correctly if the model has both audio & vision encoders
-    # maybe we should fallback to text model's arch in that case, since not many models have both
     text_config = hparams.get("text_config", {})
     vision_config = hparams.get("vision_config", {})
     arch = None
     if (arches := hparams.get("architectures")) is not None and len(arches) > 0:
         arch = arches[0]
-    elif "ssm_cfg" in hparams:
-        # For non-hf Mamba and Mamba2 models
-        arch = hparams["ssm_cfg"].get("layer", "Mamba") + "ForCausalLM"
-
-    # Step3-VL keeps text config under text_config but uses a custom top-level architecture.
-    # For text conversion we route to a dedicated text-only class.
-    # TODO: refactor this later to avoid adding exception here
-    # Kimi-K3's text_config reports "KimiLinearForCausalLM", which is the older
-    # Kimi-Linear-48B architecture and cannot load K3 (no attention residuals,
-    # latent MoE, situ, ...). Route on the top-level architecture instead.
-    if model_type == ModelType.TEXT and arch in ("NEOChatModel", "StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM", "Exaone4_5_ForConditionalGeneration", "Step3p7ForConditionalGeneration", "KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration", "Nemotron3_5TranscribeForConditionalGeneration", "HiggsAudio3Model"):
-        return arch
 
     # if "architectures" is found in the sub-config, use that instead
     if model_type == ModelType.TEXT and text_config.get("architectures") is not None:
         arch = text_config["architectures"][0]
     elif model_type == ModelType.MMPROJ and vision_config.get("architectures") is not None:
         arch = vision_config["architectures"][0]
-    # some models (llava_onevision2) only declare the architecture inside text_config
+    # some configs only declare the architecture inside text_config
     if arch is None and text_config.get("architectures") is not None:
         arch = text_config["architectures"][0]
-    # some configs only have a model_type (fishaudio/s2-pro)
+    # some configs only have a model_type
     if arch is None:
         arch = hparams.get("model_type")
     if arch is None:

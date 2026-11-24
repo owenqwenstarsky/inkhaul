@@ -76,15 +76,6 @@ const char * llm_type_name(llm_type type) {
     }
 }
 
-static const char * llama_expert_gating_func_name(llama_expert_gating_func_type type) {
-    switch (type) {
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX: return "softmax";
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID: return "sigmoid";
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: return "sqrtsoftplus";
-        default:                                    return "unknown";
-    }
-}
-
 static const std::map<llama_rope_scaling_type, const char *> LLAMA_ROPE_SCALING_TYPES = {
     { LLAMA_ROPE_SCALING_TYPE_NONE,       "none"       },
     { LLAMA_ROPE_SCALING_TYPE_LINEAR,     "linear"     },
@@ -481,10 +472,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
     std::iota(hparams.kv_source_impl.begin(), hparams.kv_source_impl.end(), 0);
 
-    std::fill(hparams.swiglu_clamp_exp.begin(),   hparams.swiglu_clamp_exp.end(),   0.0f);
-    std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
-    std::fill(hparams.swiglu_clamp.begin(),       hparams.swiglu_clamp.end(),       0.0f);
-
     ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer_all, false);
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer_all, false);
 
@@ -578,10 +565,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     pimpl->ftype = ml.ftype;
 
-    if (hparams.f_max_alibi_bias > 0.0f) {
-        hparams.use_alibi = true;
-    }
-
     hparams.rope_type = llama_model_rope_type(this);
 
     if (hparams.rope_section_order != LLAMA_ROPE_SECTION_ORDER_TYXZ && hparams.n_pos_per_embd() != 4) {
@@ -596,8 +579,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 void llama_model_base::load_prec_policy(llama_model_loader & ml) {
-    // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L565
-    if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS || hparams.expert_router_f32) {
+    if (hparams.expert_router_f32) {
         for (const auto & layer : layers) {
             prec_policy.set_acc(layer.ffn_gate_inp, GGML_PREC_F32);
         }
@@ -1263,16 +1245,12 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: n_rot                 = %u\n",     __func__, hparams.n_rot_full);
         LLAMA_LOG_INFO("%s: n_swa                 = %u\n",     __func__, hparams.n_swa);
         LLAMA_LOG_INFO("%s: is_swa_any            = %u\n",     __func__, hparams.is_swa_any());
-        LLAMA_LOG_INFO("%s: non_causal_type       = %d\n",     __func__, hparams.non_causal_type);
         LLAMA_LOG_INFO("%s: n_embd_head_k         = %u\n",     __func__, hparams.n_embd_head_k_full);
         LLAMA_LOG_INFO("%s: n_embd_head_v         = %u\n",     __func__, hparams.n_embd_head_v_full);
         LLAMA_LOG_INFO("%s: n_gqa                 = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_gqa(il);        }, hparams.n_layer_all).c_str());
         LLAMA_LOG_INFO("%s: n_embd_k_gqa          = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_embd_k_gqa(il); }, hparams.n_layer_all).c_str());
         LLAMA_LOG_INFO("%s: n_embd_v_gqa          = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_embd_v_gqa(il); }, hparams.n_layer_all).c_str());
-        LLAMA_LOG_INFO("%s: f_norm_eps            = %.1e\n",   __func__, hparams.f_norm_eps);
         LLAMA_LOG_INFO("%s: f_norm_rms_eps        = %.1e\n",   __func__, hparams.f_norm_rms_eps);
-        LLAMA_LOG_INFO("%s: f_clamp_kqv           = %.1e\n",   __func__, hparams.f_clamp_kqv);
-        LLAMA_LOG_INFO("%s: f_max_alibi_bias      = %.1e\n",   __func__, hparams.f_max_alibi_bias);
         LLAMA_LOG_INFO("%s: f_logit_scale         = %.1e\n",   __func__, hparams.f_logit_scale);
         LLAMA_LOG_INFO("%s: f_attn_scale          = %.1e\n",   __func__, hparams.f_attention_scale);
         LLAMA_LOG_INFO("%s: f_attn_value_scale    = %.4f\n",   __func__, hparams.f_attn_value_scale);
@@ -1295,7 +1273,6 @@ void llama_model::print_info() const {
             LLAMA_LOG_INFO("%s: n_rot_swa             = %u\n",     __func__, hparams.n_rot_swa);
         }
         LLAMA_LOG_INFO("%s: n_ctx_orig_yarn       = %u\n",     __func__, hparams.n_ctx_orig_yarn);
-        LLAMA_LOG_INFO("%s: rope_yarn_log_mul     = %.4f\n",   __func__, hparams.rope_yarn_log_mul);
         LLAMA_LOG_INFO("%s: rope_finetuned        = %s\n",     __func__, hparams.rope_finetuned ? "yes" : "unknown");
         // MRoPE (Multi-axis Rotary Position Embedding) sections
         if (const auto & s = hparams.rope_sections; s[0] || s[1] || s[2] || s[3]) {
@@ -1497,7 +1474,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
     // add on pooling layer
-    llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+    llm->build_pooling(cls, cls_b, cls_out, cls_out_b);
 
     // add the LM head (if the context outputs logits)
     llm->build_logits();
@@ -1735,7 +1712,8 @@ bool llama_model_has_decoder(const llama_model * model) {
 }
 
 llama_token llama_model_decoder_start_token(const llama_model * model) {
-    return model->hparams.dec_start_token_id;
+    GGML_UNUSED(model);
+    return LLAMA_TOKEN_NULL;
 }
 
 bool llama_model_is_recurrent(const llama_model * model) {
@@ -1909,7 +1887,8 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 }
 
 uint32_t llama_model_n_tokens_delay(const struct llama_model * model) {
-    return model->hparams.n_tokens_delay;
+    GGML_UNUSED(model);
+    return 0;
 }
 
 bool llama_model_classifier_free_guidance(const struct llama_model * model) {

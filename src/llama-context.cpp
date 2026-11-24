@@ -52,30 +52,6 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
-    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
-    /*.name             =*/ "fused DeepSeek V4 HC pre",
-    /*.n_tokens_per_seq =*/ 1,
-};
-
-static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
-    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
-    /*.name             =*/ "fused DeepSeek V4 HC comb",
-    /*.n_tokens_per_seq =*/ 1,
-};
-
-static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
-    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
-    /*.name             =*/ "fused DeepSeek V4 HC post",
-    /*.n_tokens_per_seq =*/ 1,
-};
-
-static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
-    /*.op               =*/ LLM_FUSED_OP_TOP_K_MASK,
-    /*.name             =*/ "fused top-k mask",
-    /*.n_tokens_per_seq =*/ 1,
-};
-
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -176,19 +152,7 @@ llama_context::llama_context(
         const float factor = 1.0f / cparams.rope_freq_scale;
 
         // ref: https://github.com/huggingface/transformers/blob/6d00f6b0a5679c36510f203e4226e36f517c3032/src/transformers/modeling_rope_utils.py#L336-L348
-        if (hparams.rope_yarn_log_mul != 0.0f) {
-            // note: here we assume `mscale == 1.0f`
-            // TODO: start reading the actual value of mscale and handle the case where it is not 1.0f
-                  float mscale          = 1.0f;
-            const float mscale_all_dims = hparams.rope_yarn_log_mul;
-
-            cparams.yarn_attn_factor = get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dims);
-
-            LLAMA_LOG_WARN("%s: setting new yarn_attn_factor = %.4f (mscale == %.1f, mscale_all_dim = %.1f)\n",
-                    __func__, cparams.yarn_attn_factor, mscale, mscale_all_dims);
-        } else {
-            cparams.yarn_attn_factor = get_mscale(factor, 1.0f);
-        }
+        cparams.yarn_attn_factor = get_mscale(factor, 1.0f);
 
         // when YARN is applied with yarn_ext_factor != 0.0f, we need to cancel this factor:
         // https://github.com/ggml-org/llama.cpp/blob/a81a569577cc38b32558958b048228150be63eae/ggml/src/ggml-cpu/ops.cpp#L5541-L5544
@@ -219,15 +183,6 @@ llama_context::llama_context(
 
     // the KV cache is shared with ctx_other, so follow its flash attention setting instead of resolving it here:
     // the probe disables it when the layers and the shared KV are on different devices, which breaks a quantized V cache
-
-    cparams.fused_dsv4_hc_pre  = true;
-    cparams.fused_dsv4_hc_comb = true;
-    cparams.fused_dsv4_hc_post = true;
-    cparams.auto_fhc           = true;
-
-    // only the indexer models build this mask, skip the probe for the others
-    cparams.fused_top_k_mask = true;
-    cparams.auto_ftkm        = hparams.indexer_top_k > 0;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -620,20 +575,6 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_kv_rows = cparams.flash_attn;
         resolve(llm_fused_op_flash_attn_kv_rows_probe, cparams.fused_kv_rows);
         cparams.auto_fkvr = false;
-    }
-
-    if (cparams.auto_fhc) {
-        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
-        resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
-        resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
-        resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
-        cparams.auto_fhc = false;
-    }
-
-    if (cparams.auto_ftkm) {
-        LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
-        resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
-        cparams.auto_ftkm = false;
     }
 }
 
@@ -3855,7 +3796,6 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     llama_set_param(model->cls_b,           param_filter, param_filter_ud);
     llama_set_param(model->cls_out,         param_filter, param_filter_ud);
     llama_set_param(model->cls_out_b,       param_filter, param_filter_ud);
-    llama_set_param(model->cls_norm,        param_filter, param_filter_ud);
 
     for (struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
@@ -4091,14 +4031,9 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    if (model->hparams.is_mla() && params.type_k != params.type_v) {
-        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
-        return nullptr;
-    }
-
     const bool fp8_cache = params.type_k == GGML_TYPE_F8_E4M3 || params.type_v == GGML_TYPE_F8_E4M3;
     // Direct cache consumers do not use the shared attention scaling helpers.
-    if (fp8_cache && (model->hparams.is_mla() || model->arch == LLM_ARCH_DFLASH)) {
+    if (fp8_cache && model->arch == LLM_ARCH_DFLASH) {
         LLAMA_LOG_ERROR("%s: FP8 cache is not supported for architecture '%s'\n", __func__, llm_arch_name(model->arch));
         return nullptr;
     }

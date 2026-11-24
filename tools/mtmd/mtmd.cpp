@@ -228,19 +228,6 @@ struct mtmd_bitmap {
         }
     }
 
-    static mtmd_bitmap * init_voice(const std::string & name, const mtmd_gen_voice & voice, uint32_t n_embd) {
-        const float *  rows   = voice.rows.data();
-        const uint32_t n_rows = voice.rows.size() / n_embd;
-        auto * bitmap = new mtmd_bitmap(nullptr, n_embd, n_rows);
-        bitmap->is_voice = true;
-        if (!voice.ref.tokens.empty()) {
-            bitmap->gen_ref = std::make_shared<const mtmd_gen_ref>(voice.ref);
-        }
-        bitmap->id = name;
-        bitmap->data.assign((const unsigned char *) rows, (const unsigned char *) (rows + (size_t) n_embd * n_rows));
-        return bitmap;
-    }
-
     const std::vector<unsigned char> & get_ro_buf() const {
         return data;
     }

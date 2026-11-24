@@ -193,40 +193,24 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_BLOCK_COUNT,                       hparams.n_layer_all);
     add_kv(LLM_KV_FEED_FORWARD_LENGTH,               hparams.n_ff_arr, true);
     add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp_arr, true);
-    add_kv(LLM_KV_SWIGLU_CLAMP, std::vector<float>(
-            hparams.swiglu_clamp.begin(), hparams.swiglu_clamp.begin() + hparams.n_layer_all));
-    add_kv(LLM_KV_SWIGLU_CLAMP_EXP, std::vector<float>(
-            hparams.swiglu_clamp_exp.begin(), hparams.swiglu_clamp_exp.begin() + hparams.n_layer_all));
-    add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>(
-            hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.begin() + hparams.n_layer_all));
     // add_kv(LLM_KV_TENSOR_DATA_LAYOUT,                ???);
     add_kv(LLM_KV_EXPERT_COUNT,                      hparams.n_expert);
     add_kv(LLM_KV_EXPERT_USED_COUNT,                 hparams.n_expert_used());
     add_kv(LLM_KV_EXPERT_GROUP_COUNT,                hparams.n_expert_groups);
     add_kv(LLM_KV_EXPERT_GROUP_USED_COUNT,           hparams.n_group_used);
     add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale);
-    add_kv(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func);
-    add_kv(LLM_KV_NUM_DEEPSTACK_LAYERS,              hparams.n_deepstack_layers);
     add_kv(LLM_KV_POOLING_TYPE,                      uint32_t(hparams.pooling_type));
     add_kv(LLM_KV_LOGIT_SCALE,                       hparams.f_logit_scale);
-    add_kv(LLM_KV_DECODER_START_TOKEN_ID,            hparams.dec_start_token_id);
-    add_kv(LLM_KV_ATTN_LOGIT_SOFTCAPPING,            hparams.f_attn_logit_softcapping);
     add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING,           hparams.f_final_logit_softcapping);
     add_kv(LLM_KV_EMBEDDING_SCALE,                   hparams.f_embedding_scale);
     // add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,           ???); // saved as LLM_KV_ATTENTION_RECURRENT_LAYERS instead
 
     add_kv(LLM_KV_ATTENTION_HEAD_COUNT,              hparams.n_head_arr, true);
     add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,           hparams.n_head_kv_arr, true);
-    add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS,          hparams.f_max_alibi_bias);
-    add_kv(LLM_KV_ATTENTION_CLAMP_KQV,               hparams.f_clamp_kqv);
     add_kv(LLM_KV_ATTENTION_KEY_LENGTH,              hparams.n_embd_head_k_full);
     add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,            hparams.n_embd_head_v_full);
-    add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,           hparams.f_norm_eps);
     add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-    add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,           hparams.f_norm_group_eps);
-    add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,        hparams.n_norm_groups);
     add_kv(LLM_KV_ATTENTION_CAUSAL,                  hparams.causal_attn);
-    add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_ROPE_PATTERN,            hparams.rope_pattern, true);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -236,19 +220,12 @@ void llama_model_saver::add_kv_from_model() {
     }
     add_kv(LLM_KV_ATTENTION_SCALE,                   hparams.f_attention_scale);
     add_kv(LLM_KV_ATTENTION_VALUE_SCALE,             hparams.f_attn_value_scale);
-    add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,          hparams.n_embd_head_k_mla_impl);
-    add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,        hparams.n_embd_head_v_mla_impl);
     add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,          hparams.n_embd_head_k_swa);
     add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,        hparams.n_embd_head_v_swa);
-    add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,           hparams.indexer_top_k);
-    if (hparams.n_layer_kv_from_start >= 0) {
-        add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,    uint32_t(hparams.n_layer_all - hparams.n_layer_kv_from_start));
-    } else {
-        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-            if (hparams.kv_source(il) != il) {
-                add_kv(LLM_KV_ATTENTION_KV_SOURCE_MAP, hparams.kv_source_impl, true);
-                break;
-            }
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (hparams.kv_source(il) != il) {
+            add_kv(LLM_KV_ATTENTION_KV_SOURCE_MAP, hparams.kv_source_impl, true);
+            break;
         }
     }
     add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
@@ -259,32 +236,6 @@ void llama_model_saver::add_kv_from_model() {
         add_kv(LLM_KV_ATTENTION_RELATIVE_CLIP,       hparams.f_relative_clip);
         add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR,     hparams.n_log_scale_floor);
         add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA,     hparams.f_log_scale_alpha);
-    }
-    add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
-
-    // the PLE group only means anything whole: write all of it or none
-    if (hparams.ple_n_heads > 0) {
-        std::vector<uint32_t> ple_layers;
-        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
-            if (hparams.is_ple_impl[il]) {
-                ple_layers.push_back(il);
-            }
-        }
-        add_kv(LLM_KV_PLE_LAYERS,            ple_layers);
-        add_kv(LLM_KV_PLE_NGRAM_SIZE,        hparams.ple_ngram_size);
-        add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,   hparams.ple_heads_per_ngram);
-        add_kv(LLM_KV_PLE_CONV_KERNEL,       hparams.ple_conv_kernel);
-        add_kv(LLM_KV_PLE_EOS_TOKEN_ID,      hparams.ple_eos_token_id);
-        add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.ple_head_dim);
-        add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS, std::vector<uint64_t>(
-                hparams.ple_layer_multipliers.begin(),
-                hparams.ple_layer_multipliers.begin() + hparams.ple_n_modules*hparams.ple_ngram_size));
-        add_kv(LLM_KV_PLE_HEAD_OFFSETS,      std::vector<uint64_t>(
-                hparams.ple_head_offsets.begin(),
-                hparams.ple_head_offsets.begin() + hparams.ple_n_modules*hparams.ple_n_heads));
-        add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,  std::vector<uint64_t>(
-                hparams.ple_head_vocab_sizes.begin(),
-                hparams.ple_head_vocab_sizes.begin() + hparams.ple_n_modules*hparams.ple_n_heads));
     }
 
     const float rope_scaling_factor = hparams.rope_freq_scale_train == 1.0f ? 0.0f : 1.0f/hparams.rope_freq_scale_train;
@@ -301,7 +252,6 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ROPE_SCALING_ATTN_FACTOR,          hparams.rope_attn_factor);
     add_kv(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN,         hparams.n_ctx_orig_yarn);
     add_kv(LLM_KV_ROPE_SCALING_FINETUNED,            hparams.rope_finetuned);
-    add_kv(LLM_KV_ROPE_SCALING_YARN_LOG_MUL,         hparams.rope_yarn_log_mul);
     add_kv(LLM_KV_ROPE_SCALING_YARN_EXT_FACTOR,      hparams.yarn_ext_factor);
     add_kv(LLM_KV_ROPE_SCALING_YARN_ATTN_FACTOR,     hparams.yarn_attn_factor);
     add_kv(LLM_KV_ROPE_SCALING_YARN_BETA_FAST,       hparams.yarn_beta_fast);
@@ -390,7 +340,6 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->cls_b);
     add_tensor(model->cls_out);
     add_tensor(model->cls_out_b);
-    add_tensor(model->cls_norm);
 
     // looped architectures alias physical tensors across cache slots; save each
     // tensor once. a different tensor with an existing name still asserts below

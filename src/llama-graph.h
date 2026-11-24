@@ -41,10 +41,6 @@ enum llm_graph_type {
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
-    LLM_FUSED_OP_DSV4_HC_PRE,
-    LLM_FUSED_OP_DSV4_HC_COMB,
-    LLM_FUSED_OP_DSV4_HC_POST,
-    LLM_FUSED_OP_TOP_K_MASK,
 };
 
 enum llm_ffn_op_type : int {
@@ -68,9 +64,7 @@ enum llm_ffn_gate_type {
 };
 
 enum llm_norm_type {
-    LLM_NORM,
     LLM_NORM_RMS,
-    LLM_NORM_GROUP,
 };
 
 
@@ -244,9 +238,8 @@ public:
     ggml_tensor * rep_n    = nullptr; // I32 [n_seqs], kept pending tokens
     ggml_tensor * rep_cols = nullptr; // I32 [n_conv, n_seqs], conv history columns of the window after the kept tokens
 
-    // views of rep_cols for the delta-net conv and the PLE conv windows, computed once per graph and shared across layers
+    // view of rep_cols for the delta-net conv window, computed once per graph and shared across layers
     ggml_tensor * rep_cols_r = nullptr;
-    ggml_tensor * rep_cols_p = nullptr;
 
     void set_input_rep(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch);
 
@@ -682,7 +675,6 @@ struct llm_graph_context {
     const float attn_factor;
     const float beta_fast;
     const float beta_slow;
-    const float norm_eps;
     const float norm_rms_eps;
 
     const int64_t n_tokens;
@@ -906,12 +898,6 @@ struct llm_graph_context {
 
 
 
-    // ggml_top_k_mask with top_k viewed in the row layout of kq_mask, see ggml.h
-    ggml_tensor * build_fused_top_k_mask(
-            ggml_tensor * kq_mask, // [n_kv, n_tokens/n_stream, 1, n_stream]
-            ggml_tensor * top_k,   // [n_top, n_tokens]
-                    int   il) const;
-
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 
@@ -1007,8 +993,7 @@ struct llm_graph_context {
             ggml_tensor * cls,
             ggml_tensor * cls_b,
             ggml_tensor * cls_out,
-            ggml_tensor * cls_out_b,
-            ggml_tensor * cls_norm) const;
+            ggml_tensor * cls_out_b) const;
 
     //
     // logits
@@ -1026,6 +1011,3 @@ struct llm_graph_context {
     void build_layer_inp_dev() const;
 
 };
-
-// TODO: better name
-int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);

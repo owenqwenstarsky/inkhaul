@@ -218,7 +218,6 @@ struct llama_model {
     struct ggml_tensor * cls_b     = nullptr;
     struct ggml_tensor * cls_out   = nullptr;
     struct ggml_tensor * cls_out_b = nullptr;
-    struct ggml_tensor * cls_norm  = nullptr;
 
     // dflash feature fusion layer
     struct ggml_tensor * fc      = nullptr;

@@ -1139,11 +1139,10 @@ static void test_embd_inp_width(testing & t) {
     t.test("default_uses_n_embd_inp", [&](testing & t) {
         llama_hparams hparams = {};
         hparams.n_embd             = 64;
-        hparams.n_deepstack_layers = 2;   // makes n_embd_inp() = 64 + 64*2 = 192
         hparams.n_embd_out_impl    = 96;  // makes n_embd_out() = 96
 
-        t.assert_equal("default context uses n_embd_inp (deepstack-aware)",
-                (size_t) 192, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_INKLING2, hparams));
+        t.assert_equal("default context uses n_embd_inp, not n_embd_out",
+                (size_t) 64, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_INKLING2, hparams));
     });
 
     t.test("dflash_uses_n_embd_inp_enc", [&](testing & t) {

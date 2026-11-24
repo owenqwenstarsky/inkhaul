@@ -3,15 +3,12 @@
 #include "llama.h"
 
 #include <array>
-#include <bitset>
 #include <cassert>
 #include <cmath>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
 #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
-#define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp, deepseek41 (all hash modules)
-#define LLAMA_MAX_PLE_HEADS 64 // qwen4exp, deepseek41 (all hash modules)
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
@@ -26,15 +23,6 @@ enum llama_swa_type {
     LLAMA_SWA_TYPE_STANDARD  = 1,
     LLAMA_SWA_TYPE_CHUNKED   = 2,
     LLAMA_SWA_TYPE_SYMMETRIC = 3,
-};
-
-// how the non-causal mask should be constructed with llama_set_causal_attn(ctx, false)
-// (e.g. mtmd decoding image tokens)
-enum llama_non_causal_type {
-    LLAMA_NON_CAUSAL_TYPE_ALL      = 0, // all layers non-causal, SWA still applied (gemma 3, qwen-vl, ...)
-    LLAMA_NON_CAUSAL_TYPE_SWA_ONLY = 1, // SWA layers non-causal, dense layers stay causal (gemma 4)
-    LLAMA_NON_CAUSAL_TYPE_SWA_FULL = 2, // all layers non-causal, SWA not applied between tokens of the current ubatch (deepseek 4)
-    LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY = 3, // dense layers non-causal, SWA layers stay causal (lfm3 d1)
 };
 
 // M-RoPE: which input position slot feeds each RoPE section
@@ -58,10 +46,6 @@ struct llama_hparams {
     uint32_t n_embd;
     uint32_t n_layer_all;
     uint32_t n_expert = 0;
-    uint32_t n_rel_attn_bkts = 0;
-
-    // TODO: this needs to be reworked
-    int32_t  n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
 
     // layer il reads the KV cache of layer kv_source_impl[il] (own cache if equal to il)
     std::array<uint32_t, LLAMA_MAX_LAYERS> kv_source_impl;
@@ -76,10 +60,6 @@ struct llama_hparams {
     uint32_t n_rot_full;
     uint32_t n_rot_swa;
 
-    // note: deepseek2 using MLA converts into MQA with larger heads, then decompresses to MHA
-    uint32_t n_embd_head_k_mla_impl = 0;
-    uint32_t n_embd_head_v_mla_impl = 0;
-
     uint32_t n_shortconv_l_cache  = 0;
     uint32_t n_sconv_channels     = 0;
 
@@ -92,20 +72,15 @@ struct llama_hparams {
     // per-layer top-k expert routing count
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_expert_used_arr;
 
-    uint32_t n_norm_groups      = 0;
     uint32_t n_expert_groups    = 0;
     uint32_t n_group_used       = 0;
 
     float    expert_weights_scale = 0.0f;
     float    expert_weights_norm_eps = 0.0f; // > 0: weights / (sum + eps), else the sum is clamped
     bool     expert_router_f32    = false;   // compute the router logits in F32
-    uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
 
-    float f_norm_eps;
     float f_norm_rms_eps;
-    float f_norm_group_eps;
 
-    float f_attn_logit_softcapping   = 50.0f;
     float f_final_logit_softcapping  = 30.0f;
 
     float    rope_attn_factor = 1.0f;
@@ -115,7 +90,6 @@ struct llama_hparams {
     float    rope_freq_scale_train_swa = 1.0f;
 
     uint32_t n_ctx_orig_yarn;
-    float    rope_yarn_log_mul = 0.0f;
 
     float    yarn_ext_factor  = -1.0f;
     float    yarn_attn_factor =  1.0f;
@@ -134,10 +108,6 @@ struct llama_hparams {
     llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
     // the size of the sliding window (0 - no SWA)
     uint32_t n_swa = 0;
-
-    // see llama_non_causal_type
-    // note: for SWA_FULL, older tokens (outside the current ubatch) are still window-clipped
-    llama_non_causal_type non_causal_type = LLAMA_NON_CAUSAL_TYPE_ALL;
 
     // if is_swa_impl[il] == 1, then layer il is SWA
     // if is_swa_impl[il] == 0, then layer il is dense (i.e. non-SWA)
@@ -173,8 +143,6 @@ struct llama_hparams {
     float    f_qk_clip         = 0.0f;
     float    f_relative_clip   = 0.0f;
 
-    float f_clamp_kqv      = 0.0f;
-    float f_max_alibi_bias = 0.0f;
     float f_logit_scale    = 0.0f;
 
     // Additional scale factors (Granite/Granite MoE)
@@ -184,14 +152,9 @@ struct llama_hparams {
     float    f_attn_value_scale = 0.0f;
 
     bool causal_attn   = true;
-    bool use_alibi     = false;
-    bool attn_soft_cap = false;
 
     // for Classifiers
     uint32_t n_cls_out = 1;
-
-    // input embedding dimension (0 = use n_embd)
-    uint32_t n_embd_inp_impl = 0;
 
     // encoder input embedding dimension (0 = use n_embd_inp())
     // e.g. the dflash encoder fuses target_layers * target_hidden features
@@ -202,55 +165,8 @@ struct llama_hparams {
 
     uint32_t dflash_block_size = 0;
 
-    // realtime models: number of tokens the output lags behind the audio input
-    uint32_t n_tokens_delay          = 0;
-
     // each sequence is paired with an unconditional one
     bool     classifier_free_guidance = false;
-
-    // DSA (deepseek sparse attention)
-    uint32_t indexer_top_k     = 0;
-
-    // DeepSeek-V4
-    uint32_t dsv4_hc_mult              = 0;
-
-    uint32_t ple_ngram_size      = 0;
-    uint32_t ple_heads_per_ngram = 0;
-    uint32_t ple_conv_kernel     = 0;
-    uint32_t ple_n_heads         = 0;   // (ngram_size - 1) * heads_per_ngram
-    uint32_t ple_head_dim        = 0;
-    uint32_t ple_eos_token_id    = 0;
-    // the id the PLE hash stands in at image positions; 0 makes the loader fall back to EOS
-    uint32_t ple_image_token_id  = 0;
-    // the id the KV cells record at embedding (image) positions for the n-gram history; LLAMA_TOKEN_NULL = none
-    llama_token ple_embd_token   = LLAMA_TOKEN_NULL;
-    // hash constant sets, stored back to back: 1 shared by all PLE layers (qwen4exp), or 1 per PLE layer in layer order (deepseek41)
-    uint32_t ple_n_modules       = 1;
-    // the file lists PLE layer indices, so this is never a per-layer gguf array and can hold one bit per layer
-    std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
-    // the hash multipliers reach ~2e13 and have to stay 64-bit
-    std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>  ple_layer_multipliers;
-    // head offsets and vocab sizes are token-space indices; the gather truncates them to int32 anyway
-    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_offsets;
-    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_vocab_sizes;
-
-    bool is_ple(uint32_t il) const;
-
-    // PLE conv history rows: (kernel - 1) * ngram_size; 0 without a PLE module
-    uint32_t ple_conv_state() const;
-
-    // qwen3vl deepstack
-    // When parsed from GGUF, this implies the first N layers consume the first
-    // N deepstack embeddings. Use deepstack_mapping_arr if you need a more
-    // complex mapping. If using deepstack_mapping_arr, also make sure to set
-    // n_deepstack_layers to the number of unique deepstack layers so that
-    // n_embd_imp is accurate (see granite.cpp).
-    // TODO: can be expressed via the `new n_embd_inp_impl` and remove this param
-    uint32_t n_deepstack_layers = 0;
-
-    // needed by encoder-decoder models (e.g. T5, FLAN-T5)
-    // ref: https://github.com/ggml-org/llama.cpp/pull/8141
-    llama_token dec_start_token_id = LLAMA_TOKEN_NULL;
 
     enum llama_pooling_type      pooling_type            = LLAMA_POOLING_TYPE_NONE;
     enum llama_pooling_type      pooling_type_cls        = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling before the classifier head (RANK)
@@ -265,11 +181,6 @@ struct llama_hparams {
     // rope_scaling_type_train is handled.
     enum llm_ffn_op_type llm_ffn_op;
     enum ggml_unary_op   act_cls = GGML_UNARY_OP_TANH; // activation of the classifier head (RANK)
-
-    // Step35: optional per-layer clamps for (Swi)GLU
-    std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_exp; // clamping for expert FFN
-    std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_shexp; // shared expert
-    std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp;       // dense FFN
 
     // this value n_pattern means that every nth layer is dense (i.e. non-SWA)
     // dense_first means whether the pattern is start with a dense layer
@@ -296,9 +207,6 @@ struct llama_hparams {
     bool is_swa_any() const;
 
     bool is_swa(uint32_t il) const;
-
-
-    void set_recr_pattern(uint32_t n_pattern, bool dense_first = false);
 
     // whether or not the given layer is recurrent (for hybrid models)
     bool is_recr(uint32_t il) const;
@@ -339,8 +247,7 @@ struct llama_hparams {
     // dimension of value embeddings across all k-v heads
     uint32_t n_embd_v_gqa(uint32_t il = 0) const;
 
-    // true if any layer has a different n_embd_k_gqa/n_embd_v_gqa
-    bool is_n_embd_k_gqa_variable() const;
+    // true if any layer has a different n_embd_v_gqa
     bool is_n_embd_v_gqa_variable() const;
 
     // return the maximum n_embd_k_gqa/n_embd_v_gqa across all layers
@@ -355,12 +262,6 @@ struct llama_hparams {
     uint32_t n_embd_s() const;
 
     uint32_t n_pos_per_embd() const;
-
-    // note: currently only support if either all or none of the layers are MLA
-    bool is_mla() const;
-
-    uint32_t n_embd_head_k_mla() const;
-    uint32_t n_embd_head_v_mla() const;
 
     bool has_kv(uint32_t il) const;
 
@@ -411,8 +312,6 @@ struct llama_hparams {
         return false;
     }
 
-
-    bool use_mrope() const;
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");

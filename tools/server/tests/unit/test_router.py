@@ -806,15 +806,15 @@ def test_router_incomplete_sidecars():
     _wait_for_model_status(MODEL_DOWNLOAD_ID, {"downloaded", "unloaded"}, timeout=MODEL_DOWNLOAD_TIMEOUT)
     server.stop()
 
-    # a paused mtp of the cached model, as the record of an earlier run holds it
-    partial_path = os.path.abspath(os.path.join(cache_dir, "test-mtp.gguf.downloadInProgress"))
+    # a paused dspark draft of the cached model, as the record of an earlier run holds it
+    partial_path = os.path.abspath(os.path.join(cache_dir, "dspark-test.gguf.downloadInProgress"))
     with open(partial_path, "w") as f:
         f.write("partial")
     with open(os.path.join(cache_dir, "unfinished-downloads.json"), "w") as f:
         json.dump({"downloads": [{
             "model":    MODEL_DOWNLOAD_ID,
-            "sidecars": ["mtp"],
-            "partials": [{"kind": "mtp", "path": partial_path}],
+            "sidecars": ["dspark"],
+            "partials": [{"kind": "dspark", "path": partial_path}],
         }]}, f)
 
     server.start()
@@ -825,9 +825,9 @@ def test_router_incomplete_sidecars():
         return {item["id"]: item for item in res.body.get("data", [])}[MODEL_DOWNLOAD_ID]
 
     assert entry()["sidecars"] == []
-    assert entry()["incomplete_sidecars"] == ["mtp"]
+    assert entry()["incomplete_sidecars"] == ["dspark"]
 
-    res = server.make_request("DELETE", f"/models?model={MODEL_DOWNLOAD_ID}&sidecar=mtp")
+    res = server.make_request("DELETE", f"/models?model={MODEL_DOWNLOAD_ID}&sidecar=dspark")
     assert res.status_code == 200
     assert res.body.get("success") is True
     assert not os.path.exists(partial_path)
@@ -916,8 +916,8 @@ def test_router_download_drops_stale_partials():
     with open(record_path, "w") as f:
         json.dump({"downloads": [{
             "model":    MODEL_DOWNLOAD_ID,
-            "sidecars": ["mtp"],
-            "partials": [{"kind": "mtp", "path": stale_path}],
+            "sidecars": ["dspark"],
+            "partials": [{"kind": "dspark", "path": stale_path}],
         }]}, f)
 
     server.llama_cache = cache_dir

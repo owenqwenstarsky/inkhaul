@@ -21,22 +21,6 @@ void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
     }
 }
 
-void llama_hparams::set_recr_pattern(uint32_t n_pattern, bool dense_first) {
-    if (dense_first) {
-        for (uint32_t il = 0; il < n_layer(); ++il) {
-            is_recr_impl[il] = n_pattern == 0 || (il % n_pattern != 0);
-        }
-    } else {
-        for (uint32_t il = 0; il < n_layer(); ++il) {
-            is_recr_impl[il] = n_pattern == 0 || (il % n_pattern < (n_pattern - 1));
-        }
-    }
-
-    for (uint32_t il = n_layer(); il < n_layer_all; ++il) {
-        is_recr_impl[il] = false;
-    }
-}
-
 bool llama_hparams::is_swa_any() const {
     for (uint32_t il = 0; il < n_layer_all; ++il) {
         if (is_swa_impl[il]) {
@@ -116,17 +100,7 @@ uint32_t llama_hparams::n_rot(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_embd_inp() const {
-    if (n_embd_inp_impl > 0) {
-        return n_embd_inp_impl;
-    }
-
-    uint32_t n_embd_inp = n_embd;
-
-    if (n_deepstack_layers > 0) {
-        n_embd_inp += n_embd * n_deepstack_layers;
-    }
-
-    return n_embd_inp;
+    return n_embd;
 }
 
 uint32_t llama_hparams::n_embd_inp_enc() const {
@@ -163,17 +137,6 @@ uint32_t llama_hparams::n_embd_v_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
 
     return n_embd_head_v(il) * n_head_kv;
-}
-
-bool llama_hparams::is_n_embd_k_gqa_variable() const {
-    const uint32_t val = n_embd_k_gqa();
-    for (uint32_t il = 0; il < n_layer_all; ++il) {
-        if (val != n_embd_k_gqa(il)) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 bool llama_hparams::is_n_embd_v_gqa_variable() const {
@@ -233,23 +196,6 @@ bool llama_hparams::is_recr(uint32_t il) const {
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
-uint32_t llama_hparams::ple_conv_state() const {
-    if (ple_n_heads == 0 || ple_conv_kernel == 0) {
-        return 0;
-    }
-
-    // dilation equals the n-gram size, matching the reference module
-    return (ple_conv_kernel - 1) * ple_ngram_size * dsv4_hc_mult * n_embd;
-}
-
-bool llama_hparams::is_ple(uint32_t il) const {
-    if (il < n_layer_all) {
-        return is_ple_impl[il];
-    }
-
-    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
-}
-
 uint32_t llama_hparams::n_pos_per_embd() const {
     return (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE)
             ? GGML_MROPE_SECTIONS : 1;
@@ -261,21 +207,6 @@ bool llama_hparams::is_swa(uint32_t il) const {
     }
 
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
-}
-
-bool llama_hparams::is_mla() const {
-    assert((n_embd_head_k_mla_impl == 0 && n_embd_head_v_mla_impl == 0) ||
-           (n_embd_head_k_mla_impl != 0 && n_embd_head_v_mla_impl != 0));
-
-    return n_embd_head_k_mla_impl != 0 && n_embd_head_v_mla_impl != 0;
-}
-
-uint32_t llama_hparams::n_embd_head_k_mla() const {
-    return is_mla() ? n_embd_head_k_mla_impl : n_embd_head_k();
-}
-
-uint32_t llama_hparams::n_embd_head_v_mla() const {
-    return is_mla() ? n_embd_head_v_mla_impl : n_embd_head_v();
 }
 
 bool llama_hparams::has_kv(uint32_t il) const {
@@ -300,8 +231,4 @@ bool llama_hparams::has_rope(uint32_t il) const {
 
 uint32_t llama_hparams::n_layer() const {
     return n_layer_all;
-}
-
-bool llama_hparams::use_mrope() const {
-    return rope_sections[0] > 0 && rope_sections[1] > 0;
 }
