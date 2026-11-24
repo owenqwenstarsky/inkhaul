@@ -96,5 +96,6 @@ jobs:
           cd build
           # Metal Paravirtual devices are difficult to support -> disable
           # ref: https://github.com/ggml-org/llama.cpp/pull/19802#issuecomment-4013704023
-          ctest -L main -E "test-llama-archs|test-llama-context|test-speculative-rejection-sampling" --verbose --timeout 900
+          # test-thread-safety: LongHaul needs MUL_MAT_ID on the GPU, the Paravirtual device has no simdgroup reduction
+          ctest -L main -E "test-llama-archs|test-llama-context|test-speculative-rejection-sampling|test-thread-safety" --verbose --timeout 900
 
