@@ -1,6 +1,6 @@
 # LongHaul
 
-LongHaul runs Inkling 2 MoE models on a Mac with less RAM than the model needs. The MoE experts stay in the GGUF file on disk. A fixed-size cache in RAM keeps the experts that were used recently and often. Everything else (attention, router, norms, embeddings, output) is loaded as usual.
+LongHaul runs Inkling 2 MoE models on a Mac or an NVIDIA GPU with less memory than the model needs. The MoE experts stay in the GGUF file on disk. A fixed-size cache in GPU memory (unified memory on a Mac, VRAM with CUDA) keeps the experts that were used recently and often. Everything else (attention, router, norms, embeddings, output) is loaded as usual.
 
 LongHaul is always on for models with experts on disk. Only the cache size can be set:
 
@@ -13,12 +13,18 @@ LongHaul is always on for models with experts on disk. Only the cache size can b
 ## How it works
 
 - The expert tensors are memory mapped but never read through the mapping, so they use address space, not RAM.
-- Each MoE layer looks up its selected experts in the cache. A miss is read from the file with `pread` and `F_NOCACHE`, so the macOS file cache does not keep a second copy. The misses of a layer are read by 4 threads at once, each through its own 8 MiB staging buffer, into the cache, which is a Metal buffer. `LLAMA_LONGHAUL_IO_THREADS` sets the number of threads (1 to 64; 1 reads on the compute thread only).
+- Each MoE layer looks up its selected experts in the cache. A miss is read from the file with `pread`, so that the OS file cache does not keep a second copy: on macOS the file is opened with `F_NOCACHE`, on Linux each read is dropped from the page cache with `POSIX_FADV_DONTNEED` (and readahead is off). On Windows the reads go through the file cache. The misses of a layer are read by 4 threads at once, each through its own 8 MiB staging buffer, into the cache, which is a Metal or CUDA buffer. `LLAMA_LONGHAUL_IO_THREADS` sets the number of threads (1 to 64; 1 reads on the compute thread only).
+- With CUDA the staging buffers are pinned host memory, so the uploads to the GPU run at full PCIe speed.
 - The cache keeps experts by recency and frequency (`src/llama-moe-cache.cpp`). In `inkling2_loop` models the passes of the loop core share the slots of their physical layer, so an expert used in several passes is cached once.
 - Prompt processing also reads through the cache. If the cache cannot hold the experts that one ubatch selects in a layer, `n_ubatch` is reduced at startup (logged as a warning). A larger cache gives larger ubatches and faster prompt processing.
-- A Metal GPU is required, with all layers on it (the default `-ngl`).
+- A Metal or CUDA GPU is required, with all layers on it (the default `-ngl`). LongHaul supports one GPU: on a machine with several CUDA GPUs, select one with `-dev CUDA0` (or `-sm none -mg N`).
+- `--fit` reduces the context size if needed, but it does not offload fewer layers or move experts to the CPU. If the model does not fit, use a smaller `-lhc` or context.
 
-The budget covers the expert cache only. The resident weights, the KV cache and the compute buffers come on top.
+The budget covers the expert cache only. The resident weights, the KV cache, the compute buffers and the staging buffers (32 MiB) come on top.
+
+## CUDA
+
+On a discrete GPU the expert cache, the resident weights and the KV cache are in VRAM; the experts on disk use no RAM. A GPU with enough VRAM can hold every expert: set `-lhc` to the size of the experts (about 16 GiB for Mini Q4_K) and after the first reads every expert is a hit. Below that, the hit rate and the SSD speed set the generation speed as on a Mac.
 
 ## Sizing for Inkling 2 Mini
 
