@@ -437,9 +437,23 @@ endfunction()
 function(ggml_add_cpu_backend_variant tag_name)
     set(GGML_CPU_TAG_NAME ${tag_name})
     # other: OPENMP LLAMAFILE CPU_HBM
-    foreach (feat ${ARGN})
-        set(GGML_INTERNAL_${feat} ON)
-    endforeach()
+    if (GGML_SYSTEM_ARCH STREQUAL "x86")
+        foreach (feat NATIVE
+                      SSE42
+                      AVX AVX2 BMI2 AVX_VNNI FMA F16C
+                      AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16
+                      AMX_TILE AMX_INT8 AMX_BF16)
+            set(GGML_${feat} OFF)
+        endforeach()
+
+        foreach (feat ${ARGN})
+            set(GGML_${feat} ON)
+        endforeach()
+    else()
+        foreach (feat ${ARGN})
+            set(GGML_INTERNAL_${feat} ON)
+        endforeach()
+    endif()
 
     ggml_add_cpu_backend_variant_impl(${tag_name})
 endfunction()
@@ -452,7 +466,33 @@ if (GGML_CPU_ALL_VARIANTS)
     elseif (GGML_CPU_ARM_ARCH)
         message(FATAL_ERROR "Cannot use both GGML_CPU_ARM_ARCH and GGML_CPU_ALL_VARIANTS")
     endif()
-    if (GGML_SYSTEM_ARCH STREQUAL "ARM" AND APPLE)
+    if (GGML_SYSTEM_ARCH STREQUAL "x86")
+        ggml_add_cpu_backend_variant(x64)
+        ggml_add_cpu_backend_variant(sse42              SSE42)
+        ggml_add_cpu_backend_variant(sandybridge        SSE42 AVX)
+        if (NOT MSVC)
+            # __FMA__ and __F16C__ are not defined in MSVC, however they are implied with AVX2/AVX512
+            ggml_add_cpu_backend_variant(ivybridge      SSE42 AVX F16C)
+            ggml_add_cpu_backend_variant(piledriver     SSE42 AVX F16C FMA)
+        endif()
+        ggml_add_cpu_backend_variant(haswell            SSE42 AVX F16C FMA AVX2 BMI2)
+        ggml_add_cpu_backend_variant(skylakex           SSE42 AVX F16C FMA AVX2 BMI2 AVX512)
+        ggml_add_cpu_backend_variant(cannonlake         SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI)
+        ggml_add_cpu_backend_variant(cascadelake        SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VNNI)
+        ggml_add_cpu_backend_variant(icelake            SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI)
+        if (NOT MSVC)
+            # MSVC 2022 doesn't support BF16 intrinsics without `/arch:AVX10.1` ?!
+            # https://learn.microsoft.com/en-us/cpp/intrinsics/x64-amd64-intrinsics-list?view=msvc-170
+            # https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64?view=msvc-170
+            ggml_add_cpu_backend_variant(cooperlake     SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VNNI AVX512_BF16)
+            ggml_add_cpu_backend_variant(zen4           SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16)
+        endif()
+        ggml_add_cpu_backend_variant(alderlake          SSE42 AVX F16C FMA AVX2 BMI2 AVX_VNNI)
+        if (NOT MSVC)
+            # MSVC doesn't support AMX
+            ggml_add_cpu_backend_variant(sapphirerapids SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 AMX_TILE AMX_INT8)
+        endif()
+    elseif (GGML_SYSTEM_ARCH STREQUAL "ARM" AND APPLE)
         ggml_add_cpu_backend_variant(apple_m1             DOTPROD)
         ggml_add_cpu_backend_variant(apple_m2_m3          DOTPROD MATMUL_INT8)
         ggml_add_cpu_backend_variant(apple_m4             DOTPROD MATMUL_INT8 NOSVE SME)
