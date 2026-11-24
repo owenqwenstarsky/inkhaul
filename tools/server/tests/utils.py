@@ -26,6 +26,7 @@ from typing import (
     Iterator,
     List,
     Literal,
+    Sequence,
     Tuple,
     Set,
 )
@@ -811,7 +812,7 @@ class ServerPreset:
         return server
 
 
-def parallel_function_calls(function_list: List[Tuple[Callable[..., Any], Tuple[Any, ...]]]) -> List[Any]:
+def parallel_function_calls(function_list: Sequence[Tuple[Callable[..., Any], Tuple[Any, ...]]]) -> List[Any]:
     """
     Run multiple functions in parallel and return results in the same order as calls. Equivalent to Promise.all in JS.
 

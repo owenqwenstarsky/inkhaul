@@ -685,4 +685,3 @@ class LlamaHfVocab(Vocab):
 
     def __repr__(self) -> str:
         return f"<LlamaHfVocab with {self.vocab_size_base} base tokens and {len(self.added_tokens_list)} added tokens>"
-
