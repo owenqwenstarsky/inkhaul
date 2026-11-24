@@ -32,16 +32,10 @@ int main() {
             }
         }, &errors);
 
-        for (llm_arch arch : { LLM_ARCH_DEEPSEEK2, LLM_ARCH_DEEPSEEK32, LLM_ARCH_DEEPSEEK4,
-                LLM_ARCH_DEEPSEEK41, LLM_ARCH_GLM_DSA, LLM_ARCH_GLM5_NEXT, LLM_ARCH_DOTS3NOTE,
-                LLM_ARCH_MISTRAL_LARGE4, LLM_ARCH_HY_V4, LLM_ARCH_MINIMAX_M3, LLM_ARCH_QWEN4EXP,
-                LLM_ARCH_DFLASH }) {
-            std::unique_ptr<llama_model> model(llama_model_create(arch, llama_model_default_params()));
+        // the DSpark drafter has no FP8 cache
+        {
+            std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_DFLASH, llama_model_default_params()));
             init_model(*model, 1);
-            if (arch == LLM_ARCH_DEEPSEEK2) {
-                model->hparams.n_embd_head_k_mla_impl = 4;
-                model->hparams.n_embd_head_v_mla_impl = 4;
-            }
 
             for (ggml_type type_k : { GGML_TYPE_F16, GGML_TYPE_F8_E4M3 }) {
                 for (ggml_type type_v : { GGML_TYPE_F16, GGML_TYPE_F8_E4M3 }) {
@@ -54,11 +48,7 @@ int main() {
                     errors.clear();
                     llama_context * ctx = llama_init_from_model(model.get(), params);
                     GGML_ASSERT(ctx == nullptr);
-                    if (type_k == type_v || (!model->hparams.is_mla() && arch != LLM_ARCH_DEEPSEEK4 && arch != LLM_ARCH_DEEPSEEK41)) {
-                        GGML_ASSERT(errors.find("FP8 cache is not supported for architecture") != std::string::npos);
-                    } else {
-                        GGML_ASSERT(errors.find("model does not support different K") != std::string::npos);
-                    }
+                    GGML_ASSERT(errors.find("FP8 cache is not supported for architecture") != std::string::npos);
                 }
             }
         }
@@ -67,8 +57,8 @@ int main() {
     }
 
     {
-        std::unique_ptr<llama_model> target(llama_model_create(LLM_ARCH_GEMMA4, llama_model_default_params()));
-        std::unique_ptr<llama_model> assistant(llama_model_create(LLM_ARCH_GEMMA4_ASSISTANT, llama_model_default_params()));
+        std::unique_ptr<llama_model> target(llama_model_create(LLM_ARCH_INKLING2, llama_model_default_params()));
+        std::unique_ptr<llama_model> assistant(llama_model_create(LLM_ARCH_INKLING2, llama_model_default_params()));
         init_model(*target, 3);
         init_model(*assistant, 2);
 
@@ -108,7 +98,7 @@ int main() {
 
     // seq_rm removes [p0, p1) of one sequence, a negative bound is open
     {
-        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_INKLING2, llama_model_default_params()));
         init_model(*model, 1);
 
         llama_kv_cache kv(*model, false, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,

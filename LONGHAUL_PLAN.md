@@ -2,7 +2,7 @@
 
 Goal: run Inkling 2 Mini on an M5 MacBook (24 GB unified memory) by keeping the routed expert weights on disk and holding only a fixed-size expert cache in RAM (default 512 MiB, set with one flag, always on). Then strip the fork down to Inkling 2 on Apple Silicon.
 
-Status: approved. Phase 1 (LongHaul core) is implemented and passes the code-level tests (see 12). Phases 2-5 are open.
+Status: approved. Phases 1 and 2 are committed (see 12, 13). Phase 3 is in progress and uncommitted (see 14). Phases 4-5 are open.
 
 Target: [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF). The model is not downloaded or run during this work.
 
@@ -316,3 +316,38 @@ Verified on Metal (code-level tests only, no real model):
 
 - Item 1 (parallel reads) is implemented: a persistent pool in `llama-moe-cache.cpp`, default 4 threads, `LLAMA_LONGHAUL_IO_THREADS` (1-64), one 8 MiB staging buffer per thread (32 MiB in total, as before). The uploads to the bank are serialized with a mutex. Tested for equal logits with 1, 4 and 16 threads, and the pool alone under ThreadSanitizer. **Not measured**: the default of 4 comes from the SSD's queue depth, not from a benchmark, since the model is not run here. Measure it with `llama-bench` and `LLAMA_LONGHAUL_IO_THREADS=1/2/4/8`.
 - Items 2-4 (direct reads into the Metal buffer, eviction tuning, prefill numbers) need profiles, traces or benchmarks of the real model, so they wait until you can run it.
+
+## 14. Phase 3 status (in progress, uncommitted)
+
+Done (steps 1-9 of section 7, and the speculative part of step 13):
+
+- Tests: `test-llama-archs` keeps Inkling2, Inkling2-loop and the LongHaul cases. `test-quant-type-selection` is build-only, because its snapshot needs `--generate`, which fetches the Mini header. `eval-callback` runs on the generated `inkling2-moe.gguf` on the GPU. The tokenizer tests are build-only. The FP8 KV test is dropped.
+- Tensor split mode: `LLAMA_SPLIT_MODE_TENSOR` stays in `llama.h` for ABI reasons but fails at load time. It is removed from `-sm`, fit and llama-bench.
+- `llama-arch`, `llama-model`, `llama-hparams`, `llama-graph` and `llama-quant`: pruned to what Inkling2, Inkling2-loop, DSpark and CLIP use.
+  - The per-tensor `.scale` and input-scale tensors stay, so files that carry them still load.
+  - A `prism.hadamard.version` key is rejected at load time.
+  - A `nextn_predict_layers` > 0 is rejected at load time.
+- MTP, EAGLE3, DFlash2 and LiliCorr are removed:
+  - The spec types, their drafts in `common/speculative.cpp`, `--mtp`, `--eagle3`, imatrix `--nextn`/`-md`, and the mtp/eagle3 download sidecars.
+  - Files named `mtp-*` or `eagle3-*` are still kept out of model selection.
+  - `draft-dflash` stays as an alias that runs the DSpark draft.
+- Public API removed:
+  - `LLAMA_CONTEXT_TYPE_MTP` and `llama_model_params::load_mtp`.
+  - `llama_model_n_layer_nextn`, `llama_set_nextn_layer_offset` and `llama_model_dflash_selector_top_k`.
+  - The DFlash variants other than DSpark.
+  - The state embedding API (`llama_batch_ext_set_embd_state[_row]`, `llama_set_ctx_state_src`).
+  - The h_nextn device buffer (`llama_set_embeddings_nextn_dev`, `llama_{get,set}_embeddings_nextn_rows`).
+- Public API kept for DSpark: `llama_set_embeddings_nextn`, `llama_get_embeddings_nextn[_ith]`, the layer input buffers and `llama_batch_ext_add_embd_row`.
+- mtmd: `inkling2v` is the only encoder left, and `mtmd-helper-gen.cpp` is a stub. Unlike step 14, the ffmpeg video helper is kept.
+
+Open: the rest of steps 9-16:
+
+- Control-vector API.
+- Vocab.
+- Legacy chat templates.
+- Other parsers and the ASR/TTS helpers.
+- mtmd: the optional tensors of other models in `mtmd-model.cpp` (deepstack, lfm3vl, MoE, sinks).
+- Python and gguf-py.
+- Templates and docs, including `docs/speculative.md`, `examples/speculative-simple/README.md` and `tools/server/tests/README.md`.
+- `tools/server/tests/unit/test_spec_methods.py`. Its targets are other archs, so it goes.
+- The never-assigned hparams that remain in shared code.

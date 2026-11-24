@@ -1239,10 +1239,7 @@ void server_decision_context::fill_task(
     if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM2_D1 ||
         type == COMMON_DECISION_TYPE_H2O_LIGHTNING || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI) {
         if (!media.empty()) {
-            // the d1 reference sees the frames of a video, not its soundtrack
-            mtmd_helper_init_opt opt = init_opt;
-            opt.video_params.no_soundtrack = is_lfm3_d1();
-            task.tokens = process_mtmd_prompt(mctx, prompt, media, opt);
+            task.tokens = process_mtmd_prompt(mctx, prompt, media, init_opt);
             return;
         }
     }

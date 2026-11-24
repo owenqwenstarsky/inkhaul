@@ -308,16 +308,11 @@ llama_kv_cache::llama_kv_cache(
                     model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
         }
 
-        bool attn_rot_k =
+        const bool attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
-
-        // always create Hadamard rotation tensors for lightning indexer keys
-        if (model.lid_k_hdmd() && hparams.n_embd_head_k_full == hparams.indexer_head_size) {
-            attn_rot_k = true;
-        }
 
         const bool attn_rot_v =
             !attn_rot_disable &&
@@ -1223,10 +1218,6 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
-    if (model.arch == LLM_ARCH_STEP35) {
-        return false;
-    }
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }

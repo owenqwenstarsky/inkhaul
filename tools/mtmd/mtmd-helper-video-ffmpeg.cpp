@@ -139,12 +139,9 @@ struct ffmpeg_video {
     std::string ffmpeg_bin;
     std::string ffprobe_bin;
 
-    uint32_t src_width     = 0;
-    uint32_t src_height    = 0;
-    double   video_start_s = 0.0;
+    uint32_t src_width  = 0;
+    uint32_t src_height = 0;
 
-    std::vector<float>   pcm;
-    size_t               pcm_start = 0;
     std::vector<uint8_t> skip_buf;
 
     // must be destroyed before input_buf, which its feeder thread reads
@@ -161,7 +158,7 @@ struct ffmpeg_video {
         std::vector<const char *> cmd = {
             ffprobe_bin.c_str(),
             "-v", "quiet",
-            "-show_entries", "stream=width,height,sample_aspect_ratio,r_frame_rate,nb_frames,duration,start_time:stream_side_data=rotation",
+            "-show_entries", "stream=width,height,sample_aspect_ratio,r_frame_rate,nb_frames,duration:stream_side_data=rotation",
             "-select_streams", "v:0",
             "-of", "default=noprint_wrappers=1",
         };
@@ -214,8 +211,6 @@ struct ffmpeg_video {
                 info.n_frames = atoi(val);
             } else if (strcmp(key, "duration") == 0 && strcmp(val, "N/A") != 0) {
                 info.duration = (float)atof(val);
-            } else if (strcmp(key, "start_time") == 0 && strcmp(val, "N/A") != 0) {
-                video_start_s = atof(val);
             } else if (strcmp(key, "sample_aspect_ratio") == 0) {
                 if (sscanf(val, "%d:%d", &sar_num, &sar_den) != 2) {
                     sar_num = sar_den = 1; // N/A
@@ -240,37 +235,6 @@ struct ffmpeg_video {
             std::swap(info.width, info.height);
         }
         return info.width > 0 && info.height > 0 && info.fps > 0.0f;
-    }
-
-    void load_soundtrack(int rate) {
-        const std::string rate_str = std::to_string(rate);
-        std::vector<const char *> cmd = {ffmpeg_bin.c_str(), "-nostdin"};
-        cmd.reserve(20); // GCC 11 -Wstringop-overflow false positive on the inserts below otherwise
-        if (is_buf_input()) {
-            cmd.insert(cmd.end(), {"-read_ahead_limit", "-1"});
-        }
-        cmd.insert(cmd.end(), {"-i", is_buf_input() ? "cache:pipe:0" : path.c_str(), "-map", "0:a:0", "-vn", "-ac", "1",
-                               "-ar", rate_str.c_str(), "-f", "f32le", "pipe:1", "-loglevel", "error", nullptr});
-        subprocess_handle audio_sp;
-        if (subprocess_create(cmd.data(), subprocess_option_search_user_path | subprocess_option_inherit_environment,
-                              &audio_sp.proc) != 0) {
-            LOG_WRN("%s: failed to launch ffmpeg for the soundtrack\n", __func__);
-            return;
-        }
-        audio_sp.created = true;
-        audio_sp.alive   = true;
-        if (is_buf_input()) {
-            audio_sp.start_feeder(input_buf);
-        }
-        float block[4096];
-        size_t n;
-        while ((n = fread(block, sizeof(float), 4096, audio_sp.stdout_pipe())) > 0) {
-            pcm.insert(pcm.end(), block, block + n);
-        }
-        audio_sp.stop();
-
-        // align to the first video frame
-        pcm_start = std::min(pcm.size(), (size_t) std::max(0.0, std::nearbyint(video_start_s * rate)));
     }
 
     bool start(uint32_t width, uint32_t height, float fps) {
@@ -391,20 +355,8 @@ bool ffmpeg_read_frame(void * state, unsigned char * rgb, uint32_t width, uint32
     if (!v->sp.alive) {
         return false;
     }
-    if (!v->pcm.empty()) {
-        std::vector<float>().swap(v->pcm); // no longer needed
-    }
     LOG_DBG("%s: reading a frame, expecting %zu bytes (%ux%u)\n", __func__, (size_t) width * height * 3, width, height);
     return v->read(rgb, (size_t) width * height * 3);
-}
-
-const float * ffmpeg_read_audio(void * state, int sample_rate, size_t * n_samples) {
-    auto * v = static_cast<ffmpeg_video *>(state);
-    v->pcm.clear();
-    v->pcm_start = 0;
-    v->load_soundtrack(sample_rate);
-    *n_samples = v->pcm.size() - v->pcm_start;
-    return *n_samples > 0 ? v->pcm.data() + v->pcm_start : nullptr;
 }
 
 void ffmpeg_close(void * state) {
@@ -418,7 +370,6 @@ const mtmd_helper_video_decoder * mtmd_helper_video_decoder_ffmpeg() {
         /* open       */ ffmpeg_open,
         /* start      */ ffmpeg_start,
         /* read_frame */ ffmpeg_read_frame,
-        /* read_audio */ ffmpeg_read_audio,
         /* close      */ ffmpeg_close,
         /* user_data  */ nullptr,
     };

@@ -1,5 +1,6 @@
 // thread safety test
-// - Loads a copy of the same model on each GPU, plus a copy on the CPU, all in parallel
+// - Loads a copy of the same model on each GPU, plus a layer split copy, all in parallel
+//   (no CPU copy: LongHaul reads the experts into a GPU cache)
 // - Creates n_parallel (--parallel) contexts per model
 // - Runs inference in parallel on each context
 
@@ -47,7 +48,7 @@ int main(int argc, char ** argv) {
         }
     }
     const int gpu_dev_count = (int)gpus.size();
-    const int num_models = gpu_dev_count + 1 + 1; // GPUs + 1 CPU model + 1 layer split
+    const int num_models = gpu_dev_count + 1; // GPUs + 1 layer split
     //const int num_models = std::max(1, gpu_dev_count);
     const int num_contexts = std::max(1, params.n_parallel);
 
@@ -63,9 +64,6 @@ int main(int argc, char ** argv) {
             if (m < gpu_dev_count) {
                 mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
                 mparams.devices = gpus[m].data();
-            } else if (m == gpu_dev_count) {
-                mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
-                mparams.main_gpu = -1; // CPU model
             } else {
                 mparams.split_mode = LLAMA_SPLIT_MODE_LAYER;
             }

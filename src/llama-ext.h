@@ -28,7 +28,6 @@ LLAMA_API llm_arch llama_arch_from_string(const std::string & name);
 // the arch-resolved GGUF key of a KV id, e.g. LLM_KV_CONTEXT_LENGTH -> "llama.context_length"
 LLAMA_API std::string llama_arch_kv_name(llm_arch arch, llm_kv key);
 
-LLAMA_API bool llama_arch_supports_sm_tensor(llm_arch arch);
 
 LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
 

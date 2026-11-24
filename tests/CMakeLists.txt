@@ -136,37 +136,12 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
-# build test-tokenizer-0 target once and add many tests
+# the tokenizer tests take a vocab-only GGUF, none is checked in for Inkling (see LONGHAUL_PLAN.md)
 llama_build(test-tokenizer-0.cpp)
 
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge        LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-deepseek-coder  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-deepseek-coder.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-deepseek-llm    LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-deepseek-llm.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-falcon          LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-falcon.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-gemma-4         LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gemma-4.gguf --check-decode)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-gpt-2           LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-llama-bpe       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-llama-spm       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-spm.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-mpt             LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-mpt.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-phi-3           LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-phi-3.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen2           LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen35          LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact          LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
-
-if (NOT WIN32)
-    llama_test_cmd(
-        ${CMAKE_CURRENT_SOURCE_DIR}/test-tokenizers-repo.sh
-        NAME test-tokenizers-ggml-vocabs
-        LABEL behavior
-        WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-        ARGS https://huggingface.co/ggml-org-dev/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
-    )
-endif()
-
 if (LLAMA_LLGUIDANCE)
-    llama_build_and_test(test-grammar-llguidance.cpp  LABEL "main behavior"  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
+    # takes a vocab-only GGUF as its argument
+    llama_build(test-grammar-llguidance.cpp)
 endif ()
 
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
@@ -206,24 +181,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-gbnf-validator.cpp LINK llama)
 
-    # build test-tokenizer-1-bpe target once and add many tests
     llama_build(test-tokenizer-1-bpe.cpp)
-
-    # TODO: disabled due to slowness
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-aquila     LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-aquila.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-falcon     LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-falcon.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-gpt-2      LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-gpt-neox   LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-neox.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-llama-bpe  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf --ignore-merges)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-mpt        LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-mpt.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-refact     LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-starcoder  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
-
-    # build test-tokenizer-1-spm target once and add many tests
-    llama_build(test-tokenizer-1-spm.cpp)
-
-    llama_test(test-tokenizer-1-spm  NAME test-tokenizer-1-llama-spm  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-spm.gguf)
-    #llama_test(test-tokenizer-1-spm  NAME test-tokenizer-1-baichuan  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-baichuan.gguf)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
@@ -235,13 +193,11 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
     file(MAKE_DIRECTORY "${FP8_MODEL_DIR}")
     llama_test(test-llama-archs NAME test-generate-fp8-models LABEL "main behavior backend"
-        ARGS -a llama -s 1 -o "${FP8_MODEL_DIR}")
+        ARGS -a inkling2 -s 1 -o "${FP8_MODEL_DIR}")
     set_tests_properties(test-generate-fp8-models PROPERTIES FIXTURES_SETUP fp8-models)
     llama_test(test-fp8 NAME test-fp8-requantize LABEL "main behavior backend"
         ARGS --models "${FP8_MODEL_DIR}")
-    llama_test(test-fp8 NAME test-fp8-kv LABEL "main behavior backend"
-        ARGS --models "${FP8_MODEL_DIR}" --kv)
-    set_tests_properties(test-fp8-requantize test-fp8-kv PROPERTIES FIXTURES_REQUIRED fp8-models)
+    set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
 endif()
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
@@ -264,7 +220,7 @@ llama_test(
     test-llama-archs
     NAME test-generate-speculative-target
     LABEL main
-    ARGS -a llama -s 999 -o "${SPEC_TARGET_DIR}"
+    ARGS -a inkling2 -s 999 -o "${SPEC_TARGET_DIR}"
 )
 set_tests_properties(
     test-generate-speculative-target
@@ -274,7 +230,7 @@ set_tests_properties(
 # To avoid recreating the model use the fixture exclude any option:
 # -FA "^speculative-model$"
 llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
-    -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+    -m "${SPEC_TARGET_DIR}/inkling2-moe.gguf")
 set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
 
 # Test context state handling across all architectures, using the generated dummy models
@@ -324,33 +280,18 @@ llama_build_and_test(
     LABEL behavior
 )
 
-if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
-    set(MODEL_NAME "stories15M-q4_0.gguf")
-    set(MODEL_HASH "SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739")
-else()
-    set(MODEL_NAME "stories15M-be.Q4_0.gguf")
-    set(MODEL_HASH "SHA256=9aec857937849d976f30397e97eb1cabb53eb9dcb1ce4611ba8247fb5f44c65d")
-endif()
-set(MODEL_DEST "${CMAKE_BINARY_DIR}/${MODEL_NAME}")
+# the context state cases and the thread safety test against the generated Inkling2 model
+set(MODEL_DEST "${MODEL_DIR}/inkling2-moe.gguf")
 
-add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
-    -DREPO=ggml-org-dev/stories15M
-    -DDEST=${MODEL_DEST}
-    -DNAME=${MODEL_NAME}
-    -DHASH=${MODEL_HASH}
-    -P ${PROJECT_SOURCE_DIR}/cmake/download-models.cmake
-)
-set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
-
-# the context state cases against a real model, the sweep above uses the generated dummy ones
 llama_test(test-llama-context  NAME test-llama-context-model  LABEL "model behavior backend"  ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-llama-context-model PROPERTIES FIXTURES_REQUIRED test-download-model)
+set_tests_properties(test-llama-context-model PROPERTIES FIXTURES_REQUIRED generate-models)
 
 llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
-set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
+set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED generate-models)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
-llama_build_and_test(test-quantize-target.cpp  LABEL "main behavior backend"  LINK llama)
+llama_build_and_test(test-quantize-target.cpp  LABEL "main behavior backend"  LINK llama  ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-quantize-target PROPERTIES FIXTURES_REQUIRED generate-models)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -418,7 +359,8 @@ if (TARGET cpp-httplib)
         llama_test(test-gguf-model-data  LABEL "model behavior")
 
         # test-quant-type-selection requires gguf-model-data for remote model metadata
-        llama_build_and_test(test-quant-type-selection.cpp  LABEL "model behavior"  LINK llama)
+        # build-only: its Inkling snapshot must be generated with --generate (fetches the GGUF header)
+        llama_build(test-quant-type-selection.cpp LINK llama)
         target_link_libraries(test-quant-type-selection PRIVATE gguf-model-data)
         target_compile_definitions(test-quant-type-selection PRIVATE
             SNAPSHOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/snapshots")

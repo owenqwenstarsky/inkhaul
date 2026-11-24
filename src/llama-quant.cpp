@@ -304,26 +304,6 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize expert gating tensors
     quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
 
-    // do not quantize the i32 token-id -> expert-id routing table (DeepSeek-V4)
-    quantize &= name.find("ffn_gate_tid2eid.weight") == std::string::npos;
-
-    // Engram gate is an elementwise weight (ggml_mul), not a matmul operand
-    quantize &= name.find("engram_gate.weight") == std::string::npos;
-
-    // these are very small (e.g. 4x4)
-    quantize &= name.find("altup")  == std::string::npos;
-    quantize &= name.find("laurel") == std::string::npos;
-
-    // these are not too big so keep them as it is
-    quantize &= name.find("per_layer_model_proj") == std::string::npos;
-
-    // limite: very small gates and dense connection mixers
-    if (arch == LLM_ARCH_LIMITE) {
-        quantize &= name.find("attn_gate.weight")    == std::string::npos;
-        quantize &= name.find("attn_ve_gate.weight") == std::string::npos;
-        quantize &= name.find("mudd_")               == std::string::npos;
-    }
-
     // inkling2: short conv kernels, clip scales, residual mix queries, the relative bias projection and the loop tensors
     if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
         quantize &= name.find("_conv.weight")         == std::string::npos;
@@ -333,110 +313,9 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find(".loop_")               == std::string::npos;
     }
 
-    // zaya1: the top-1 router and the grouped conv kernels stay F32
-    if (arch == LLM_ARCH_ZAYA1) {
-        quantize &= name.find("ffn_router_")  == std::string::npos;
-        quantize &= name.find("cca_conv_grp") == std::string::npos;
-    }
-
-    // do not quantize positional embeddings and token types (BERT)
-    quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
-    quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
-
-    // do not quantize Mamba/Kimi's small conv1d weights
-    quantize &= name.find("ssm_conv1d") == std::string::npos;
-    quantize &= name.find("shortconv.conv.weight") == std::string::npos;
-
-    // do not quantize LFM3-VL's depthwise conv kernels, CONV_2D_DW takes F32 kernels
-    quantize &= name.find("conv2d_spatial.weight") == std::string::npos;
-
-    // do not quantize LFM3-Audio's encoder convs, depthwise convs and the codec FSQ
-    quantize &= name.rfind("a.conv1d.", 0) != 0;
-    quantize &= name.find("conv_dw") == std::string::npos;
-    quantize &= name.rfind("a.gen.wav.quant.", 0) != 0;
-
-    // do not quantize MiniMax's indexer projection weights, they are tiny
-    quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
-    quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
-
-    // metis16: small control tensors that steer every layer; the stream and hc_ tables (ne[0] = 4) would fall back to F16
-    if (arch == LLM_ARCH_METIS16) {
-        quantize &= name.rfind("depth_mem_", 0) == std::string::npos;
-        quantize &= name.rfind("cont_", 0)      == std::string::npos;
-        quantize &= name.find("stream_embd")    == std::string::npos;
-        quantize &= name.find("attn_pass_lora") == std::string::npos;
-        quantize &= name.find("ffn_exp_embd")   == std::string::npos;
-        quantize &= name.find("hc_")            == std::string::npos;
-    }
-
-    // kimi-k31: the indexer picks the top-k cells, so keep its projections accurate
-    if (arch == LLM_ARCH_KIMI_K31) {
-        quantize &= name.find("indexer.attn_q_b") == std::string::npos;
-        quantize &= name.find("indexer.attn_k")   == std::string::npos;
-        quantize &= name.find("indexer.proj")     == std::string::npos;
-    }
-
-    // glm5-next
-    if (arch == LLM_ARCH_GLM5_NEXT) {
-        quantize &= name.find("hc_")                     == std::string::npos;
-        quantize &= name.find("indexer.attn_q_b")        == std::string::npos;
-        quantize &= name.find("indexer.attn_k")          == std::string::npos;
-        quantize &= name.find("indexer.proj")            == std::string::npos;
-        quantize &= name.find("indexer_compressor_gate") == std::string::npos;
-        quantize &= name.find("indexer_compressor_ape")  == std::string::npos;
-        quantize &= name.find("ssm_f_a.weight")          == std::string::npos;
-        quantize &= name.find("ssm_f_b.weight")          == std::string::npos;
-        quantize &= name.find("ssm_g_a.weight")          == std::string::npos;
-        quantize &= name.find("ssm_g_b.weight")          == std::string::npos;
-        quantize &= name.find("ssm_beta.weight")         == std::string::npos;
-        quantize &= name.find("attn_kv_a_mqa.weight")    == std::string::npos;
-        quantize &= name.find("attn_k_b.weight")         == std::string::npos;
-        quantize &= name.find("attn_v_b.weight")         == std::string::npos;
-    }
-
-    // xing4_0: do not quantize the MHC hyper-connection gate matrices
-    // (the 1D hc_*_base / hc_*_scale tensors are already excluded by the n_dims < 2 rule)
-    if (arch == LLM_ARCH_XING4_0) {
-        quantize &= name.find("hc_") == std::string::npos;
-    }
-
-    // the decision head of vllm-decision2 is small and computed in F32
-    if (arch == LLM_ARCH_VLLM_DECISION2) {
-        quantize &= name.compare(0, 9, "decision.") != 0;
-    }
-
-    // do not quantize RWKV's small yet 2D weights
-    quantize &= name.find("time_mix_first.weight") == std::string::npos;
-    quantize &= name.find("time_mix_w0.weight") == std::string::npos;
-    quantize &= name.find("time_mix_w1.weight") == std::string::npos;
-    quantize &= name.find("time_mix_w2.weight") == std::string::npos;
-    quantize &= name.find("time_mix_v0.weight") == std::string::npos;
-    quantize &= name.find("time_mix_v1.weight") == std::string::npos;
-    quantize &= name.find("time_mix_v2.weight") == std::string::npos;
-    quantize &= name.find("time_mix_a0.weight") == std::string::npos;
-    quantize &= name.find("time_mix_a1.weight") == std::string::npos;
-    quantize &= name.find("time_mix_a2.weight") == std::string::npos;
-    quantize &= name.find("time_mix_g1.weight") == std::string::npos;
-    quantize &= name.find("time_mix_g2.weight") == std::string::npos;
-    quantize &= name.find("time_mix_decay_w1.weight") == std::string::npos;
-    quantize &= name.find("time_mix_decay_w2.weight") == std::string::npos;
-    quantize &= name.find("time_mix_lerp_fused.weight") == std::string::npos;
-
-    // do not quantize relative position bias (T5)
-    quantize &= name.find("attn_rel_b.weight") == std::string::npos;
-
-    // do not quantize specific multimodal tensors
+    // inkling2v: do not quantize the position and patch embeddings
     quantize &= name.find(".position_embd") == std::string::npos;
-    quantize &= name.find("sam.pos_embd")   == std::string::npos;
-    quantize &= name.find("sam.neck.")      == std::string::npos;
-    quantize &= name.find("sam.net_")       == std::string::npos;
-    quantize &= name.find(".rel_pos")       == std::string::npos;
     quantize &= name.find(".patch_embd")    == std::string::npos;
-    quantize &= name.find(".patch_merger")  == std::string::npos;
-
-    // audio codebook
-    quantize &= name.find("a.rvq.codebook")  == std::string::npos;
-    quantize &= name.find("mm.a.code_embd")  == std::string::npos;
 
     return quantize;
 }
@@ -498,7 +377,6 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     const std::string name = ggml_get_name(tensor);
 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
-    const llm_arch arch = qs.model.arch;
     auto use_more_bits = [](const int i_layer, const int n_layers) -> bool {
         return i_layer < n_layers / 8 || i_layer >= 7 * n_layers / 8 || (i_layer - n_layers / 8) % 3 == 2;
     };
@@ -515,30 +393,6 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         return std::make_pair(i_layer, n_layer);
     };
 
-    // by default, for glm5-next, don't let these tensors be quantized below Q8_0
-    if (arch == LLM_ARCH_GLM5_NEXT && (
-        name.find("attn_q_a")      != std::string::npos ||
-        name.find("attn_q_b")      != std::string::npos ||
-        name.find("nextn.eh_proj") != std::string::npos))
-    {
-        switch (new_type) {
-            case GGML_TYPE_F32:
-            case GGML_TYPE_BF16:
-            case GGML_TYPE_F16:
-                break;
-            default:
-                return GGML_TYPE_Q8_0;
-        }
-    }
-
-    // bumping to q8_0 is preferred since these tensors are not really big
-    // TODO: nemotron 3 super shares ffn_latent and afmoe, bailingmoe3, dots3note, hy-v4, kimi-k3 and laguna share attn_gate.
-    //       Widening the guard is likely a win there too, but it changes their files, so it wants a perplexity comparison per architecture first.
-    if (arch == LLM_ARCH_MUSE_SPARK && (category == TENSOR_CATEGORY_FFN_LATENT || category == TENSOR_CATEGORY_ATTENTION_GATE)) {
-        auto bits_per_weight = [](ggml_type t) { return 8.0 * ggml_type_size(t) / ggml_blck_size(t); };
-        if (ggml_is_quantized(new_type) && bits_per_weight(new_type) < bits_per_weight(GGML_TYPE_Q8_0)) { new_type = GGML_TYPE_Q8_0; }
-    }
-
     // for arches that share the same tensor between the token embeddings and the output,
     // we quantize the token embeddings with the quantization of the output tensor
     if (category == TENSOR_CATEGORY_OUTPUT || (qs.has_tied_embeddings && category == TENSOR_CATEGORY_TOKEN_EMBD)) {
@@ -550,7 +404,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
                 new_type = GGML_TYPE_Q8_0;
             }
-            else if (arch == LLM_ARCH_FALCON || nx % qk_k != 0) {
+            else if (nx % qk_k != 0) {
                 new_type = GGML_TYPE_Q8_0;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
@@ -625,12 +479,6 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         else if ((ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M) &&
                 use_more_bits(qs.i_attention_wv, qs.n_attention_wv)) { new_type = GGML_TYPE_Q6_K; }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S && qs.i_attention_wv < 4) { new_type = GGML_TYPE_Q5_K; }
-        if (qs.model.type == LLM_TYPE_70B) {
-            // In the 70B model we have 8 heads sharing the same attn_v weights. As a result, the attn_v.weight tensor is
-            // 8x smaller compared to attn_q.weight. Hence, we can get a nice boost in quantization accuracy with
-            // nearly negligible increase in model size by quantizing this tensor with more bits:
-            if (new_type == GGML_TYPE_Q3_K || new_type == GGML_TYPE_Q4_K) { new_type = GGML_TYPE_Q5_K; }
-        }
         if (qs.model.hparams.n_expert == 8) {
             // for the 8-expert model, bumping this to Q8_0 trades just ~128MB
             // TODO: explore better strategies
@@ -655,24 +503,20 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K_S) { if (i_layer < n_layer/8) new_type = GGML_TYPE_Q4_K; }
         else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS && !qs.has_imatrix) { new_type = i_layer < n_layer / 8 ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K; }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M) {
-            new_type = i_layer < n_layer/16 ? GGML_TYPE_Q5_K
-                     : arch != LLM_ARCH_FALCON || use_more_bits(i_layer, n_layer) ? GGML_TYPE_Q4_K
-                     : GGML_TYPE_Q3_K;
+            new_type = i_layer < n_layer/16 ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
         }
         else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_M && (i_layer < n_layer / 8 || (qs.model.hparams.n_expert == 8 && use_more_bits(i_layer, n_layer)))) {
             new_type = GGML_TYPE_Q4_K;
         }
-        else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) { new_type = arch == LLM_ARCH_FALCON ? GGML_TYPE_Q4_K : GGML_TYPE_Q5_K; }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) { new_type = GGML_TYPE_Q5_K; }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M) {
-            if (arch == LLM_ARCH_FALCON) {
-                new_type = i_layer < n_layer / 16 ? GGML_TYPE_Q6_K : use_more_bits(i_layer, n_layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
-            } else if (use_more_bits(i_layer, n_layer)) { new_type = GGML_TYPE_Q6_K; }
+            if (use_more_bits(i_layer, n_layer)) { new_type = GGML_TYPE_Q6_K; }
         }
         else if (i_layer < n_layer / 8 && (ftype == LLAMA_FTYPE_MOSTLY_IQ4_NL || ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS) && !qs.has_imatrix) {
             new_type = GGML_TYPE_Q5_K;
         }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M && use_more_bits(i_layer, n_layer)) { new_type = GGML_TYPE_Q6_K; }
-        else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S && arch != LLM_ARCH_FALCON && i_layer < n_layer/8) { new_type = GGML_TYPE_Q5_K; }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S && i_layer < n_layer/8) { new_type = GGML_TYPE_Q5_K; }
         else if ((ftype == LLAMA_FTYPE_MOSTLY_Q4_0 || ftype == LLAMA_FTYPE_MOSTLY_Q5_0) && qs.has_imatrix && i_layer < n_layer / 8) {
             // Safeguard against instability in the initial ffn_down layers, which can occur with Q4_0/Q5_0 quantization even when an imatrix is used.
             // The rationale is two-fold: first, to guarantee that the resulting quantization remains consistent with the pre-imatrix state,
@@ -682,20 +526,18 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
         ++qs.i_ffn_down;
     } else if (category == TENSOR_CATEGORY_ATTENTION_OUTPUT) {
-        if (arch != LLM_ARCH_FALCON) {
-            if (qs.model.hparams.n_expert == 8) {
-                if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K   || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
-                    ftype == LLAMA_FTYPE_MOSTLY_Q3_K_S || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ4_NL  ||
-                    ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S || ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ3_S  ||
-                    ftype == LLAMA_FTYPE_MOSTLY_IQ3_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS) { new_type = GGML_TYPE_Q5_K; }
-            } else {
-                if      (ftype == LLAMA_FTYPE_MOSTLY_Q2_K   ) { new_type = GGML_TYPE_Q3_K; }
-                else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) { new_type = GGML_TYPE_IQ3_S; }
-                else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M ) { new_type = GGML_TYPE_Q4_K; }
-                else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L ) { new_type = GGML_TYPE_Q5_K; }
-                else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_M  ) { new_type = GGML_TYPE_Q4_K; }
-            }
-        } else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) { new_type = GGML_TYPE_Q4_K; }
+        if (qs.model.hparams.n_expert == 8) {
+            if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K   || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
+                ftype == LLAMA_FTYPE_MOSTLY_Q3_K_S || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ4_NL  ||
+                ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S || ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ3_S  ||
+                ftype == LLAMA_FTYPE_MOSTLY_IQ3_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS) { new_type = GGML_TYPE_Q5_K; }
+        } else {
+            if      (ftype == LLAMA_FTYPE_MOSTLY_Q2_K   ) { new_type = GGML_TYPE_Q3_K; }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) { new_type = GGML_TYPE_IQ3_S; }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M ) { new_type = GGML_TYPE_Q4_K; }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L ) { new_type = GGML_TYPE_Q5_K; }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_M  ) { new_type = GGML_TYPE_Q4_K; }
+        }
     }
     else if (category == TENSOR_CATEGORY_ATTENTION_QKV) {
         if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L || ftype == LLAMA_FTYPE_MOSTLY_IQ3_M) { new_type = GGML_TYPE_Q4_K; }
@@ -3168,7 +3010,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     const llama_model_kv_override * kv_overrides = params->kv_overrides;
     std::vector<std::string> splits = {};
     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, /*load_mtp*/ true, kv_overrides, nullptr);
+        fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
 
     auto mparams = llama_model_default_params();
@@ -3763,8 +3605,6 @@ llama_model * llama_quant_model_from_metadata(const llama_quant_model_desc * des
     auto * model = llama_model_create(arch, mparams);
     model->arch = arch;
 
-    // infer llm_type: only LLM_TYPE_70B matters for quantization logic
-    if (model->arch == LLM_ARCH_LLAMA && desc->n_layer == 80 && desc->n_head != desc->n_head_kv) { model->type = LLM_TYPE_70B; }
 
     model->hparams.n_embd = desc->n_embd;
     model->hparams.n_embd_head_k_full = desc->n_embd_head_k;

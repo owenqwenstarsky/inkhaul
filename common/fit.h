@@ -14,12 +14,10 @@ enum common_params_fit_status {
 
 // a second model that shares the devices of the main model, e.g. a draft model
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
-//   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
 struct common_fit_extra_model {
     std::vector<std::string> paths_model;
     llama_model_params * mparams;
     llama_context_params * cparams;
-    bool shares_model;
 };
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
@@ -104,7 +102,6 @@ common_device_memory_data_vec common_get_device_memory_data(
          const llama_context_params * cparams,
     std::vector<ggml_backend_dev_t> & devs,
                            uint32_t & hp_ngl,
-                           uint32_t & hp_ngl_skip,
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);

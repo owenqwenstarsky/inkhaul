@@ -23,15 +23,9 @@ set(LLAMA_CORE_SOURCES
     llama-io.cpp
     llama-kv-cache.cpp
     llama-kv-cache-iswa.cpp
-    llama-kv-cache-dsa.cpp
-    llama-kv-cache-dsa-iswa.cpp
-    llama-kv-cache-msa.cpp
-    llama-kv-cache-dsv4.cpp
     llama-memory.cpp
     llama-moe-cache.cpp
-    llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
-    llama-memory-hybrid-idx.cpp
     llama-memory-recurrent.cpp
     llama-mmap.cpp
     llama-model-loader.cpp

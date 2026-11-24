@@ -94,7 +94,6 @@ struct llama_context {
     float * get_embeddings_layer_inp(uint32_t lid);
 
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
-    ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -128,15 +127,6 @@ struct llama_context {
     // whether decode accepts entries whose embd is a row of ctx_other's layer input device buffer
     bool supports_embd_row() const;
 
-    // h_nextn device buffer, see llama_set_embeddings_nextn_dev()
-    bool set_embeddings_nextn_dev(bool value);
-    bool get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out);
-    bool set_h_nextn_rows(int64_t row0, int64_t n_rows, const float * data);
-
-    // state rows read from the h_nextn device buffer of ctx_src, see llama_set_ctx_state_src()
-    bool set_ctx_state_src(llama_context * ctx_src);
-    bool supports_state_row() const;
-    void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -261,9 +251,6 @@ private:
     // (re)allocate the device buffer for cparams.embeddings_layer_inp_dev
     void layer_inp_dev_alloc();
 
-    // (re)allocate the device buffer for cparams.embeddings_nextn_dev, false if it does not fit
-    bool h_nextn_dev_alloc();
-
     ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
     //
@@ -341,7 +328,6 @@ private:
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 
-    llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
@@ -473,19 +459,6 @@ private:
     ggml_backend_event_ptr ev_layer_inp_read;
     bool ev_layer_inp_read_recorded = false;
 
-    // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
-    // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s
-    // ordered with the reader context like the layer input buffer
-    ggml_context_ptr        ctx_h_nextn_dev;
-    ggml_backend_buffer_ptr buf_h_nextn_dev;
-    ggml_tensor *           h_nextn_dev = nullptr;
-    ggml_backend_dev_t      h_nextn_dev_dev = nullptr;
-    ggml_backend_t          h_nextn_backend = nullptr;
-    ggml_backend_event_ptr  ev_h_nextn_written;
-    ggml_backend_event_ptr  ev_h_nextn_read;
-    bool ev_h_nextn_written_recorded = false;
-    bool ev_h_nextn_read_recorded    = false;
-
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
@@ -494,8 +467,6 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
-    // true after the prism.hadamard coverage check passes on a reserved graph
-    bool hadamard_verified = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

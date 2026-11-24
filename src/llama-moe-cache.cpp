@@ -467,9 +467,6 @@ struct llama_moe_cache::impl {
         if (devices.empty()) {
             throw std::runtime_error("LongHaul requires a GPU backend (Metal) for the expert cache");
         }
-        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-            throw std::runtime_error("LongHaul does not support tensor parallelism");
-        }
         if (model.hparams.n_expert == 0 || n_expert_used == 0) {
             throw std::runtime_error("LongHaul requires a MoE model");
         }

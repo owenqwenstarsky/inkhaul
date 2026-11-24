@@ -202,7 +202,7 @@ extern "C" {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
         LLAMA_SPLIT_MODE_ROW    = 2, // split layers and KV across GPUs, use tensor parallelism if supported
-        LLAMA_SPLIT_MODE_TENSOR = 3,
+        LLAMA_SPLIT_MODE_TENSOR = 3, // not supported, model loading fails
     };
 
     enum llama_load_mode {
@@ -225,16 +225,12 @@ extern "C" {
 
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
-        LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
 
     // the head on the block of a DFlash draft model
     enum llama_dflash_variant {
-        LLAMA_DFLASH_VARIANT_NONE     = -1, // not a DFlash draft model
-        LLAMA_DFLASH_VARIANT_DFLASH   = 0,
-        LLAMA_DFLASH_VARIANT_DFLASH2  = 1,
-        LLAMA_DFLASH_VARIANT_DSPARK   = 2,
-        LLAMA_DFLASH_VARIANT_LILICORR = 3,
+        LLAMA_DFLASH_VARIANT_NONE   = -1, // not a DFlash draft model
+        LLAMA_DFLASH_VARIANT_DSPARK =  2,
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
@@ -364,7 +360,6 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
-        bool load_mtp;        // whether to load MTP layers
     };
 
     struct llama_sampler_seq_config {
@@ -600,7 +595,6 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
@@ -693,15 +687,11 @@ extern "C" {
             const llama_model_quantize_params * params);
 
     //
-    // NextN / speculative draft model queries
+    // speculative draft model queries
     //
 
     // the DFlash variant the model loader picked from the head of the draft
     LLAMA_API enum llama_dflash_variant llama_model_dflash_variant(const struct llama_model * model);
-
-    // DFlash2 selector: number of candidate tokens the draft keeps per block position from its logits
-    // (the packed lattice also holds the top_k x top_k pairwise transition scores); 0 if the model has no selector head
-    LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
 
     // returns pointer to the target-model layer indices
     LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
@@ -1060,25 +1050,10 @@ extern "C" {
                                                int32_t   idx,
                                      struct llama_embd   embd);
 
-    // Set the "state" embedding for the token at index idx in the batch
-    // "state" here means extra hidden state carried over from a previous stage, e.g.:
-    //   - MTP: state from N layers of the target model
-    //   - Qwen3 VL (deepstack): state from N layers of the vision encoder
-    //   - LiliCorr: context embeddings for the transformers
-    // Returns false if the context does not take a state embedding (MTP and LiliCorr contexts do)
-    LLAMA_API bool llama_batch_ext_set_embd_state(
-                                struct llama_batch_ext * batch,
-                                               int32_t   idx,
-                                     struct llama_embd   embd);
-
     // Add an entry whose embedding is row `row` of the layer input device buffer of ctx_other.
     // All entries of the batch must be of this kind. Positions are set with llama_batch_ext_set_pos(), n_pos_per_embd of them.
     // Returns the batch index (>= 0), or the llama_batch_ext_add() error codes.
     LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
-
-    // The state of entry idx is row `row` of the h_nextn device buffer of the context set with llama_set_ctx_state_src().
-    // All entries of a batch have a state row, or none.
-    LLAMA_API bool llama_batch_ext_set_embd_state_row(struct llama_batch_ext * batch, int32_t idx, int32_t row);
 
     // Set if output embeddings should be available for the token at index idx in the batch
     // Note: for now, this is equivalent to setting the output logits
@@ -1186,11 +1161,6 @@ extern "C" {
     // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
     LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
-    // Select which appended NextN block the DECODER_MTP graph runs (offset past
-    // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
-    // chain multiple trained NextN heads. Default 0 (first head).
-    LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
-
     // Get all nextn embeddings, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
@@ -1210,20 +1180,6 @@ extern "C" {
     // Whether decode accepts entries added with llama_batch_ext_add_embd_row()
     // (needs a DFlash/DSpark decoder context whose ctx_other has a layer input device buffer).
     LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
-
-    // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer
-    // [n_embd_out, n_batch + n_seq_max] instead of host memory: row r < n_batch is the token at batch index r of the last decode,
-    // row n_batch + s is free for the caller, e.g. for seq s (see llama_set_embeddings_nextn_rows()).
-    // Returns false if the buffer cannot be used, the rows are then extracted to host memory.
-    LLAMA_API bool llama_set_embeddings_nextn_dev(struct llama_context * ctx, bool value);
-
-    // Copy rows of the h_nextn device buffer to or from host memory, ordered after the last decode and its readers
-    LLAMA_API bool llama_get_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, float * out);
-    LLAMA_API bool llama_set_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, const float * data);
-
-    // Read the state rows of batches (see llama_batch_ext_set_embd_state_row()) from the h_nextn device buffer of ctx_src.
-    // Returns whether decode accepts batches with state rows.
-    LLAMA_API bool llama_set_ctx_state_src(struct llama_context * ctx, struct llama_context * ctx_src);
 
     // The paired context (llama_context_params::ctx_other), e.g. the target context of a draft context; may be nullptr
     LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);

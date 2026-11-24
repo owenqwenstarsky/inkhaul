@@ -60,10 +60,7 @@ enum mtmd_input_chunk_type {
 
 // how the frames and timestamps of a video are laid out in the prompt
 enum mtmd_video_template {
-    MTMD_VIDEO_TEMPLATE_DEFAULT,   // "Video:" prefix, then a "[XmY.YYs]" timestamp every N ms
-    MTMD_VIDEO_TEMPLATE_LFM3,      // "<X.X seconds>" before every group of 2 frames
-    MTMD_VIDEO_TEMPLATE_LFM3_OMNI, // same as LFM3, then the soundtrack of each group, as an audio bitmap after its frames
-    MTMD_VIDEO_TEMPLATE_QWEN3VL,   // "<X.X seconds>" before every group of 2 frames, no markers around the whole video
+    MTMD_VIDEO_TEMPLATE_DEFAULT, // "Video:" prefix, then a "[XmY.YYs]" timestamp every N ms
 };
 
 // opaque types
@@ -87,7 +84,6 @@ struct mtmd_input_part {
     const struct mtmd_input_text * text;
     const struct mtmd_bitmap * bitmap;
 };
-
 
 //
 // C API
@@ -216,7 +212,6 @@ MTMD_API void         mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id);
 MTMD_API void         mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool mergeable);
 // on a frame: video frames must be both mergeable and is_video
 // on a lazy bitmap: the expanded chunks are one video, wrapped by the model's video begin/end tokens
-//                   with MTMD_VIDEO_TEMPLATE_LFM3_OMNI, its audio bitmaps are the pieces of one soundtrack, in order
 MTMD_API void         mtmd_bitmap_set_is_video(mtmd_bitmap * bitmap, bool is_video);
 // transcript of an audio bitmap is optional, some TTS models use it to clone the speaker voice more closely (--tts-speaker-text)
 MTMD_API void         mtmd_bitmap_set_transcript(mtmd_bitmap * bitmap, const char * transcript);
@@ -289,7 +284,6 @@ MTMD_API mtmd_input_chunk * mtmd_input_chunk_get_placeholder(const mtmd_input_ch
 MTMD_API int32_t            mtmd_input_chunk_save(const mtmd_input_chunk * chunk, char * out_buf, size_t out_len, size_t * expected_out_len);
 // returns nullptr on failure
 MTMD_API mtmd_input_chunk * mtmd_input_chunk_load(const char * buf, size_t len);
-
 
 // mtmd_image_tokens
 //
@@ -366,7 +360,6 @@ MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
 // llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
 
-
 // batch encoding API
 // chunks are not owned by the batch, they will not be freed by mtmd_batch_free()
 // batch is valid for a given context, cannot be shared across contexts
@@ -385,7 +378,6 @@ MTMD_API int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk
 // returns 1 on generic error
 MTMD_API int32_t mtmd_batch_encode(mtmd_batch * batch);
 MTMD_API float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * chunk);
-
 
 // Set callback for all future logging events.
 // If this is not called, or NULL is supplied, everything is output on stderr.
@@ -508,7 +500,6 @@ MTMD_API int32_t mtmd_gen_audio_g2p(const mtmd_context * ctx, const char * word,
 // predefined voice with this name as a voice bitmap, to pass as speaker reference
 // returns nullptr if there is no such voice, the caller must free it
 MTMD_API mtmd_bitmap * mtmd_gen_audio_get_voice(const mtmd_context * ctx, const char * name);
-
 
 enum mtmd_gen_process_type {
     MTMD_GEN_PROCESS_TYPE_GEN_CODE, // h_state to semantic (codes, mel-spectrogram, etc.)

@@ -47,40 +47,18 @@ enum llama_rope_section_order {
 // forward declaration; full definition in llama-graph.h
 enum llm_ffn_op_type : int;
 
-struct llama_hparams_posnet {
-    uint32_t n_embd;
-    uint32_t n_layer;
-};
-
-struct llama_hparams_convnext {
-    uint32_t n_embd;
-    uint32_t n_layer;
-};
-
 struct llama_hparams {
     // note: use the `_impl` suffix to avoid name conflict between members and getters
     //       for example: n_embd_out() vs n_embd_out_impl
 
     bool vocab_only;
     bool rope_finetuned;
-    bool use_par_res;
-    bool swin_norm;
-    bool norm_before_residual = false;
-    bool norm_before_fc       = false;
 
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;
     uint32_t n_layer_all;
-    uint32_t n_layer_nextn = 0;
-    uint32_t n_layer_decision = 0; // trailing blocks that form the decision head
-
-    // granite-switch: index of the single-head "router" KV layer that encodes
-    // per-token adapter selection. -1 when the model has no such layer.
-    int32_t  router_layer = -1;
     uint32_t n_expert = 0;
     uint32_t n_rel_attn_bkts = 0;
-    uint32_t n_value_expert      = 0; // MoVA value experts (K2 Horizon)
-    uint32_t n_value_expert_used = 0;
 
     // TODO: this needs to be reworked
     int32_t  n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
@@ -102,10 +80,6 @@ struct llama_hparams {
     uint32_t n_embd_head_k_mla_impl = 0;
     uint32_t n_embd_head_v_mla_impl = 0;
 
-    // for WavTokenizer
-    struct llama_hparams_posnet   posnet;
-    struct llama_hparams_convnext convnext;
-
     uint32_t n_shortconv_l_cache  = 0;
     uint32_t n_sconv_channels     = 0;
 
@@ -118,59 +92,27 @@ struct llama_hparams {
     // per-layer top-k expert routing count
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_expert_used_arr;
 
-    uint32_t n_layer_dense_lead = 0;
-    uint32_t n_lora_q           = 0;
-    uint32_t n_lora_kv          = 0;
-    uint32_t n_ff_shexp         = 0;
-    uint32_t n_ff_chexp         = 0;
-    uint32_t n_expert_shared    = 0;
     uint32_t n_norm_groups      = 0;
     uint32_t n_expert_groups    = 0;
     uint32_t n_group_used       = 0;
-    uint32_t n_group_experts    = 0;
 
-    // MLA + SWA (i.e. dots3note)
-    uint32_t n_lora_kv_swa           = 0;
-    uint32_t n_embd_head_k_mla_swa   = 0;
-    uint32_t n_embd_head_v_mla_swa   = 0;
-
-    float    expert_group_scale   = 0.05f;
     float    expert_weights_scale = 0.0f;
-    bool     expert_weights_norm  = false;
     float    expert_weights_norm_eps = 0.0f; // > 0: weights / (sum + eps), else the sum is clamped
     bool     expert_router_f32    = false;   // compute the router logits in F32
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
-    uint32_t moe_every_n_layers   = 0;
-    uint32_t moe_latent_size      = 0;
 
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;
 
-    // post norms use their own epsilon
-    float f_post_norm_eps = 0.0f;
-
     float f_attn_logit_softcapping   = 50.0f;
-    float f_router_logit_softcapping = 30.0f;
     float f_final_logit_softcapping  = 30.0f;
-
-    // for RWKV
-    uint32_t rescale_every_n_layers = 0;
-    uint32_t time_mix_extra_dim     = 0;
-    uint32_t time_decay_extra_dim   = 0;
-    uint32_t wkv_head_size          = 0;
-    uint32_t token_shift_count      = 2;
-    uint32_t n_lora_decay           = 0;
-    uint32_t n_lora_iclr            = 0;
-    uint32_t n_lora_value_res_mix   = 0;
-    uint32_t n_lora_gate            = 0;
 
     float    rope_attn_factor = 1.0f;
     float    rope_freq_base_train;
     float    rope_freq_base_train_swa  = 10000.0f;
     float    rope_freq_scale_train;
     float    rope_freq_scale_train_swa = 1.0f;
-    float    rope_scaling_alpha        = 0.0f;  // NTK-aware alpha for XDRoPE
 
     uint32_t n_ctx_orig_yarn;
     float    rope_yarn_log_mul = 0.0f;
@@ -212,47 +154,14 @@ struct llama_hparams {
     uint32_t ssm_d_state = 0;
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
-    float    ssm_norm_eps = 0.0f; // 0 = use f_norm_rms_eps
-
-    // for MiniMax-Text-01 linear attention
-    uint32_t n_embd_head_la = 0;
 
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
-    bool     kda_safe_gate = false;
-
-    // for ZAYA1 CCA layers: q + k channels in the conv state
-    uint32_t n_cca_qk = 0;
-
-    // for ZAYA1: width of the router MLP
-    uint32_t n_router_hidden = 0;
 
     // kimi-k3
-    uint32_t n_expert_latent      = 0;      // routed_expert_hidden_size (0 = experts run at n_embd)
     uint32_t attn_res_block_size  = 0;      // 0 = no cross-layer attention residuals
-    float    kda_gate_lower_bound = -INFINITY;
     float    situ_beta            = 1.0f;
     float    situ_linear_beta     = 0.0f;   // 0 = no linear-beta transform on the up branch
-
-    // hrm-text (looped H/L stacks)
-    uint32_t n_hrm_layers_per_stack = 0;
-    uint32_t n_hrm_h_cycles = 0;
-    uint32_t n_hrm_l_cycles = 0;
-    bool     hrm_prefix_lm = false;
-
-    // metis16 (passes over shared layers, depth memory)
-    uint32_t metis_n_pass         = 0;
-    uint32_t metis_n_mem          = 0;
-    uint32_t metis_n_route        = 0;
-    uint32_t metis_pass_lora_rank = 0;
-    float    metis_cont_limit     = 0.0f;
-
-    // limite
-    float    f_xsa_eps = 0.0f;
-    std::array<float, 3> final_logit_sigmoid_capping = {}; // scale, shift, temperature
-    uint32_t n_mudd_ff   = 0;
-    uint32_t n_mudd_taps = 0;
-    std::array<int32_t, LLAMA_MAX_LAYERS> mudd_tap_idx; // [n_layer][n_mudd_taps], -1 = no mixing
 
     // inkling2
     uint32_t n_relative        = 0;
@@ -264,27 +173,19 @@ struct llama_hparams {
     float    f_qk_clip         = 0.0f;
     float    f_relative_clip   = 0.0f;
 
-    bool ssm_dt_b_c_rms = false;
-
     float f_clamp_kqv      = 0.0f;
     float f_max_alibi_bias = 0.0f;
     float f_logit_scale    = 0.0f;
 
     // Additional scale factors (Granite/Granite MoE)
-    float f_residual_scale  = 0.0f;
     float f_embedding_scale = 0.0f;
     float f_attention_scale = 0.0f;
-
-    // grok-2
-    float    f_attn_out_scale = 0.0f;
-    uint32_t attn_temp_length = 0;
 
     float    f_attn_value_scale = 0.0f;
 
     bool causal_attn   = true;
     bool use_alibi     = false;
     bool attn_soft_cap = false;
-    bool use_kq_norm   = false;
 
     // for Classifiers
     uint32_t n_cls_out = 1;
@@ -293,32 +194,13 @@ struct llama_hparams {
     uint32_t n_embd_inp_impl = 0;
 
     // encoder input embedding dimension (0 = use n_embd_inp())
-    // e.g. the eagle3 encoder fuses target_layers * target_hidden features
+    // e.g. the dflash encoder fuses target_layers * target_hidden features
     uint32_t n_embd_inp_enc_impl = 0;
 
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
-    uint32_t dflash_block_size       = 0;
-    uint32_t dflash_conv_kernel_size = 0;
-    uint32_t dflash_conv_group_size  = 0;
-    uint32_t dflash_selector_rank    = 0;
-    uint32_t dflash_selector_top_k   = 0;
-    uint32_t lilicorr_hidden_size    = 0;
-    uint32_t lilicorr_candidate_topk = 0;
-    uint32_t lilicorr_num_heads      = 0;
-    uint32_t lilicorr_layers         = 0;
-    float    lilicorr_vector_eps     = 0.0f;
-    float    lilicorr_logit_scale    = 0.0f;
-
-    // llama4 smallthinker
-    uint32_t n_moe_layer_step        = 0;
-    uint32_t n_no_rope_layer_step    = 4;
-    uint32_t n_attn_temp_floor_scale = 0;
-    float    f_attn_temp_scale       = 0.0f;
-    float    f_attn_temp_offset      = 0.0f; // offset position index
-    // use (1 + (pos + offset) / floor_scale) ^ scale instead of the llama4 log form
-    bool     attn_temp_pow           = false;
+    uint32_t dflash_block_size = 0;
 
     // realtime models: number of tokens the output lags behind the audio input
     uint32_t n_tokens_delay          = 0;
@@ -326,65 +208,11 @@ struct llama_hparams {
     // each sequence is paired with an unconditional one
     bool     classifier_free_guidance = false;
 
-    // gemma3n altup
-    uint32_t n_altup      = 4; // altup_num_inputs
-    uint32_t i_altup_act  = 0; // altup_active_idx
-    uint32_t laurel_rank  = 64;
-    uint32_t n_embd_altup = 256;
-
-    // needed for sentence-transformers dense layers
-    uint32_t dense_2_feat_in  = 0;  // in_features of the 2_Dense
-    uint32_t dense_2_feat_out = 0;  // out_features of the 2_Dense
-    uint32_t dense_3_feat_in  = 0;  // in_features of the 3_Dense
-    uint32_t dense_3_feat_out = 0;  // out_features of the 3_Dense
-
-    // xIELU
-    std::array<float, LLAMA_MAX_LAYERS> xielu_alpha_n;
-    std::array<float, LLAMA_MAX_LAYERS> xielu_alpha_p;
-    std::array<float, LLAMA_MAX_LAYERS> xielu_beta;
-    std::array<float, LLAMA_MAX_LAYERS> xielu_eps;
-
     // DSA (deepseek sparse attention)
-    uint32_t indexer_n_head    = 0;
-    uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
-    uint32_t indexer_kpool     = 0; // k-pool size
-    bool     indexer_kpool_select_tail = true;
-    // head-size slots per cached indexer row, the last one holds the pooled key
-    uint32_t indexer_kpool_row = 3;
-    // pools are consecutive cells in sequence order, not runs of consecutive positions
-    bool     indexer_kpool_by_order = false;
-    // MSA
-    uint32_t indexer_block_size  = 0;
-    uint32_t indexer_local_blocks = 0;
-
-    // Indexer is "full" (1) or "shared" (0)
-    // Shared indexers reuse top-k from previous full layer
-    std::array<uint32_t, LLAMA_MAX_LAYERS> is_indexer_full_impl;
 
     // DeepSeek-V4
-    uint32_t dsv4_o_group_count        = 0;
-    uint32_t dsv4_o_lora_rank          = 0;
     uint32_t dsv4_hc_mult              = 0;
-    bool     dsv4_hc_single_pass       = false; // DeepSeek-V4.1 DSpark draft: lagged pre-mix, no hc_head
-    uint32_t dsv4_hc_sinkhorn_iters    = 0;
-    uint32_t dsv4_hash_layer_count     = 0;
-    float    dsv4_compress_rope_base   = 0.0f;
-    float    dsv4_hc_eps               = 0.0f;
-    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
-
-    // deepseek41
-    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_src;   // layer whose compressed KV this layer reads, -1 = none
-    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_src; // layer whose top-k this layer uses, -1 = none
-    int32_t  dsv41_cand_src         = -1;    // -1 = no candidate block selection
-    uint32_t dsv41_cand_topk_blocks = 0;
-    uint32_t dsv41_cand_block_size  = 0;
-
-    // 0 = full rank (DeepSeek-V4)
-    uint32_t hc_low_rank = 0;
-
-    // scale of the hyper-connection post gate (DeepSeek-V4 hardcodes 2.0)
-    float    hc_magnitude = 0.0f;
 
     uint32_t ple_ngram_size      = 0;
     uint32_t ple_heads_per_ngram = 0;
@@ -398,8 +226,6 @@ struct llama_hparams {
     llama_token ple_embd_token   = LLAMA_TOKEN_NULL;
     // hash constant sets, stored back to back: 1 shared by all PLE layers (qwen4exp), or 1 per PLE layer in layer order (deepseek41)
     uint32_t ple_n_modules       = 1;
-    // deepseek41 Engram: the token that pads the n-gram history, an index into llama_model::engram_token_map
-    uint32_t engram_pad_id       = 0;
     // the file lists PLE layer indices, so this is never a per-layer gguf array and can hold one bit per layer
     std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
     // the hash multipliers reach ~2e13 and have to stay 64-bit
@@ -422,24 +248,14 @@ struct llama_hparams {
     // TODO: can be expressed via the `new n_embd_inp_impl` and remove this param
     uint32_t n_deepstack_layers = 0;
 
-    // deepstack layer array (Granite4 Vision)
-    // -1  => no deepstack
-    // >=0 => input embedding index for deepstack injection
-    std::array<int32_t, LLAMA_MAX_LAYERS> deepstack_mapping_arr;
-
-    // gemma4 per-layer embedding
-    uint32_t n_embd_per_layer = 0;
-
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;
-    uint32_t    dec_n_layer        = 0;
 
     enum llama_pooling_type      pooling_type            = LLAMA_POOLING_TYPE_NONE;
     enum llama_pooling_type      pooling_type_cls        = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling before the classifier head (RANK)
     enum llama_rope_type         rope_type               = LLAMA_ROPE_TYPE_NONE;
     enum llama_rope_scaling_type rope_scaling_type_train = LLAMA_ROPE_SCALING_TYPE_NONE;
-
 
     // Resolved FFN gated activation flavor for archs that read
     // `<arch>.hidden_activation` from the GGUF (e.g. ModernBert derivatives).
@@ -481,7 +297,6 @@ struct llama_hparams {
 
     bool is_swa(uint32_t il) const;
 
-    bool is_indexer_full(uint32_t il) const;
 
     void set_recr_pattern(uint32_t n_pattern, bool dense_first = false);
 
@@ -553,7 +368,7 @@ struct llama_hparams {
 
     bool has_rope(uint32_t il) const;
 
-    // number of effective layers (excludes nextn layers)
+    // number of layers
     uint32_t n_layer() const;
 
     // note that this function uses different SWA parameters from those in the hparams

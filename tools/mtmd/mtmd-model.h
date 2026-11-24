@@ -1149,7 +1149,7 @@ struct mtmd_vocos {
 // the weights and hparams of one modality of an mmproj file, read-only once loaded
 struct mtmd_model {
     mtmd_modality modality = MTMD_MODALITY_VISION;
-    projector_type proj_type = PROJECTOR_TYPE_MLP;
+    projector_type proj_type = PROJECTOR_TYPE_UNKNOWN;
     mtmd_hparams hparams;
 
     // runtime requirements declared by the model, applied by mtmd_subcontext
@@ -1224,7 +1224,6 @@ struct mtmd_model {
     ggml_tensor * image_newline = nullptr;
     ggml_tensor * view_seperator = nullptr;
     ggml_tensor * tok_embd_sep = nullptr; // [n_embd_text, n_sep] rows of the text model tok_embd (MiniCPM-V 4.7)
-
 
     // Yi type models with mlp+normalization projection
     ggml_tensor * mm_1_w = nullptr; // Yi type models have 0, 1, 3, 4
@@ -1561,19 +1560,6 @@ struct mtmd_model {
     ggml_tensor * ctc_out_mid_b = nullptr;
     // qformer projector(s)
     std::vector<qf_block> qf_proj_blocks;
-
-    bool audio_has_avgpool() const {
-        return proj_type == PROJECTOR_TYPE_QWEN2A
-            || proj_type == PROJECTOR_TYPE_HIGGS_AUDIO
-            || proj_type == PROJECTOR_TYPE_VOXTRAL
-            || proj_type == PROJECTOR_TYPE_MUSIC_FLAMINGO;
-    }
-
-    bool audio_has_stack_frames() const {
-        return proj_type == PROJECTOR_TYPE_ULTRAVOX
-            || proj_type == PROJECTOR_TYPE_VOXTRAL
-            || proj_type == PROJECTOR_TYPE_MERALION;
-    }
 
     // this should be equal to the embedding dimension of the text model
     int n_mmproj_embd() const;

@@ -267,17 +267,6 @@ static std::string clean_file_name(const std::string & fname) {
     return clean_fname;
 }
 
-struct handle_model_result {
-    bool found_mmproj = false;
-    common_params_model mmproj;
-
-    bool found_mtp = false;
-    common_params_model mtp;
-
-    bool found_preset = false;
-    std::string preset_path;
-};
-
 const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_F32,
     GGML_TYPE_F16,
@@ -341,25 +330,9 @@ common_models_handler common_models_handler_init(const common_params & params, l
     common_download_hf_plan plan_spec;
     common_download_opts opts;
 
-    const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
-                                        params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-
     const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
-
-    const bool spec_type_draft_dflash2 = std::find(params.speculative.types.begin(),
-                                            params.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2) != params.speculative.types.end();
-
-    const bool spec_type_draft_lilicorr = std::find(params.speculative.types.begin(),
-                                             params.speculative.types.end(),
-                                             COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR) != params.speculative.types.end();
-
-    const bool spec_type_draft_eagle3 = std::find(params.speculative.types.begin(),
-                                           params.speculative.types.end(),
-                                           COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params.speculative.types.end();
 
     const bool spec_type_draft_dspark = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -379,9 +352,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
 
     opts.bearer_token    = params.hf_token;
     opts.offline         = params.offline;
-    opts.download_mtp    = spec_type_draft_mtp;
-    opts.download_eagle3 = spec_type_draft_eagle3;
-    opts.download_dflash = spec_type_draft_dflash || spec_type_draft_dflash2 || spec_type_draft_lilicorr;
+    opts.download_dflash = spec_type_draft_dflash;
     opts.download_dspark = spec_type_draft_dspark;
     opts.download_mmproj = use_mmproj && !params.no_mmproj
                         && params.mmproj.path.empty() && params.mmproj.url.empty();
@@ -394,9 +365,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
         // without a requested type, discover every sidecar the draft repo ships to infer the type later
         auto opts_spec = opts;
         if (spec_types_is_default(params)) {
-            opts_spec.download_mtp    = true;
             opts_spec.download_dflash = true;
-            opts_spec.download_eagle3 = true;
             opts_spec.download_dspark = true;
         }
         plan_spec = common_download_get_hf_plan(params.speculative.draft.mparams, opts_spec);
@@ -550,29 +519,18 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 
     // an explicit draft file selection (e.g. -md with -hfd) disables the sidecar resolution of the draft repo
     if (!params.speculative.draft.mparams.hf_file.empty()) {
-        plan_spec.mtp    = {};
         plan_spec.dflash = {};
-        plan_spec.eagle3 = {};
         plan_spec.dspark = {};
     }
 
     // infer the speculative type from the sidecar shipped by the draft repo when none is requested
     if (spec_types_is_default(params)) {
-        if (!plan_spec.mtp.local_path.empty()) {
-            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-            plan_spec.dspark = {};
-            plan_spec.dflash = {};
-            plan_spec.eagle3 = {};
-        } else if (!plan_spec.dspark.local_path.empty()) {
+        if (!plan_spec.dspark.local_path.empty()) {
             // dspark outranks dflash, its sidecar carries the extra Markov head
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
             plan_spec.dflash = {};
-            plan_spec.eagle3 = {};
         } else if (!plan_spec.dflash.local_path.empty()) {
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
-            plan_spec.eagle3 = {};
-        } else if (!plan_spec.eagle3.local_path.empty()) {
-            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 };
         }
     }
 
@@ -586,20 +544,8 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     }
 
     // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
-    const bool spec_sidecar_found = !plan_spec.mtp.local_path.empty() ||
-                                    !plan_spec.dflash.local_path.empty() ||
-                                    !plan_spec.eagle3.local_path.empty() ||
+    const bool spec_sidecar_found = !plan_spec.dflash.local_path.empty() ||
                                     !plan_spec.dspark.local_path.empty();
-    if (!plan_spec.mtp.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan_spec.mtp, opts, [&]() {
-            // only use the discovered MTP head when no draft path is set yet
-            if (params.speculative.draft.mparams.path.empty()) {
-                params.speculative.draft.mparams.path = finalize(plan_spec.mtp);
-            } else {
-                finalize(plan_spec.mtp);
-            }
-        });
-    }
     if (!plan_spec.dflash.local_path.empty() && !had_spec_url) {
         tasks.emplace_back(plan_spec.dflash, opts, [&]() {
             // only use the discovered DFlash sidecar when no draft path is set yet
@@ -607,16 +553,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
                 params.speculative.draft.mparams.path = finalize(plan_spec.dflash);
             } else {
                 finalize(plan_spec.dflash);
-            }
-        });
-    }
-    if (!plan_spec.eagle3.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan_spec.eagle3, opts, [&]() {
-            // only use the discovered Eagle3 sidecar when no draft path is set yet
-            if (params.speculative.draft.mparams.path.empty()) {
-                params.speculative.draft.mparams.path = finalize(plan_spec.eagle3);
-            } else {
-                finalize(plan_spec.eagle3);
             }
         });
     }
@@ -650,16 +586,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             params.mmproj.path = finalize(plan.mmproj);
         });
     }
-    if (!plan.mtp.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan.mtp, opts, [&]() {
-            // only fall back to the discovered MTP head when no draft was explicitly provided
-            if (params.speculative.draft.mparams.empty()) {
-                params.speculative.draft.mparams.path = finalize(plan.mtp);
-            } else {
-                finalize(plan.mtp);
-            }
-        });
-    }
     if (!plan.dflash.local_path.empty() && !had_spec_url) {
         tasks.emplace_back(plan.dflash, opts, [&]() {
             // only fall back to the discovered DFlash sidecar when no draft was explicitly provided
@@ -667,16 +593,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
                 params.speculative.draft.mparams.path = finalize(plan.dflash);
             } else {
                 finalize(plan.dflash);
-            }
-        });
-    }
-    if (!plan.eagle3.local_path.empty() && !had_spec_url) {
-        tasks.emplace_back(plan.eagle3, opts, [&]() {
-            // only fall back to the discovered Eagle3 sidecar when no draft was explicitly provided
-            if (params.speculative.draft.mparams.empty()) {
-                params.speculative.draft.mparams.path = finalize(plan.eagle3);
-            } else {
-                finalize(plan.eagle3);
             }
         });
     }
@@ -2770,12 +2686,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
+        {"-sm", "--split-mode"}, "{none,layer,row}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
-        "- row: split weight across GPUs by rows (parallelized)\n"
-        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
+        "- row: split weight across GPUs by rows (parallelized)",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -2783,8 +2698,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_LAYER;
             } else if (value == "row") {
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
-            } else if (value == "tensor") {
-                params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
             } else {
                 throw std::invalid_argument("invalid value");
             }
@@ -3057,24 +2970,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("HF_TOKEN"));
     add_opt(common_arg(
-        {"--mtp"},
-        "also download the multi-token prediction (MTP) head, if available (default: unused)",
-        [](common_params & params) {
-            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
-        }
-    ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
-    add_opt(common_arg(
         {"--dflash"},
         "also download the DFlash sidecar, if available (default: unused)",
         [](common_params & params) {
             params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
-        }
-    ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
-    add_opt(common_arg(
-        {"--eagle3"},
-        "also download the Eagle3 sidecar, if available (default: unused)",
-        [](common_params & params) {
-            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3);
         }
     ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
     add_opt(common_arg(
@@ -3154,13 +3053,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("collect data for the output tensor (default: %s)", params.process_output ? "true" : "false"),
         [](common_params & params) {
             params.process_output = true;
-        }
-    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
-    add_opt(common_arg(
-        {"--nextn"},
-        string_format("collect data for MTP/NextN layers (default: %s)", params.load_mtp ? "true" : "false"),
-        [](common_params & params) {
-            params.load_mtp = true;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
@@ -4285,7 +4177,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.path = value;
             params.speculative.draft.mparams.hf_file = value; // will be used if --spec-draft-hf is set
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_IMATRIX}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",

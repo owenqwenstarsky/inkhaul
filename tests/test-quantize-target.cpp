@@ -24,11 +24,6 @@
 #include <signal.h>
 #endif
 
-static const uint32_t n_vocab = 256;
-static const uint32_t n_embd  = 256;
-static const uint32_t n_ff    = 512;
-static const uint32_t n_head  = 2;
-static const uint32_t n_layer = 4;
 static const float target_bpw = 4.5f;
 static bool verbose = false;
 
@@ -40,19 +35,19 @@ static void set_tensor_data(ggml_tensor * tensor, void * /*userdata*/) {
     ggml_backend_tensor_set(tensor, data.data(), 0, ggml_nbytes(tensor));
 }
 
-// test model
-static bool save_model(const std::string & fname) {
+// test model: the hparams of a generated Inkling2 model (test-llama-archs), widened to 256 so that the matrices take K-quants
+static bool save_model(const std::string & fname_template, const std::string & fname) {
+    gguf_context_ptr tmpl(gguf_init_from_file(fname_template.c_str(), { /*.no_alloc =*/ true, /*.ctx =*/ nullptr }));
+    if (!tmpl) { return false; }
     gguf_context_ptr meta(gguf_init_empty());
-    gguf_set_val_str(meta.get(), "general.architecture",                   "llama");
-    gguf_set_val_u32(meta.get(), "llama.vocab_size",                       n_vocab);
-    gguf_set_val_u32(meta.get(), "llama.context_length",                   256);
-    gguf_set_val_u32(meta.get(), "llama.embedding_length",                 n_embd);
-    gguf_set_val_u32(meta.get(), "llama.feed_forward_length",              n_ff);
-    gguf_set_val_u32(meta.get(), "llama.block_count",                      n_layer);
-    gguf_set_val_u32(meta.get(), "llama.attention.head_count",             n_head);
-    gguf_set_val_u32(meta.get(), "llama.attention.head_count_kv",          n_head);
-    gguf_set_val_f32(meta.get(), "llama.attention.layer_norm_rms_epsilon", 1e-5f);
-    gguf_set_val_str(meta.get(), "tokenizer.ggml.model",                   "none");
+    gguf_set_kv(meta.get(), tmpl.get());
+    const char * arch = gguf_get_val_str(meta.get(), gguf_find_key(meta.get(), "general.architecture"));
+    for (const char * key : { "embedding_length", "features_length", "expert_feed_forward_length", "feed_forward_length" }) {
+        const std::string name = std::string(arch) + "." + key;
+        if (gguf_find_key(meta.get(), name.c_str()) >= 0) {
+            gguf_set_val_u32(meta.get(), name.c_str(), 256);
+        }
+    }
 
     llama_model_params mparams = llama_model_default_params();
     ggml_backend_dev_t devs[] = { nullptr };
@@ -112,10 +107,12 @@ static imatrix_data make_imatrix(const std::string & fname_model, const uint32_t
         const ggml_tensor * tensor = ggml_get_tensor(meta.get(), name);
         if (ggml_n_dims(tensor) < 2 || strcmp(name, "token_embd.weight") == 0) { continue; }
 
+        // one row of values per expert of a 3D tensor
         const int64_t n_per_row = tensor->ne[0];
-        std::vector<float> values(n_per_row);
-        std::vector<float> activations(n_per_row);
-        for (int64_t j = 0; j < n_per_row; j++) {
+        const int64_t n_values  = n_per_row * tensor->ne[2];
+        std::vector<float> values(n_values);
+        std::vector<float> activations(n_values);
+        for (int64_t j = 0; j < n_values; j++) {
             activations[j] = u(gen) - 0.5f;
             values[j] = activations[j] * activations[j] + std::exp(2.0f * u(gen) - 1.0f);
         }
@@ -587,13 +584,17 @@ static void test_pruned_layer(testing & t, const fixture & f) {
     t.assert_equal("scored again with a pruned block, tensors whose type differs from a fresh run", (size_t) 0, count_type_changes(fresh, reused));
 
     // another block pruned, reusing the checkpoint saved for block 1
+    // Inkling2 layers differ in their tensors, so the scored count is compared with a fresh run of the same pruning
     const int32_t prune_other[] = { 2, -1 };
     params.prune_layers = prune_other;
     const quant_run other = quantize(f.fname_model, f.fname_out, f.im, params);
+    params.state_file = nullptr;
+    const quant_run fresh_other = quantize(f.fname_model, f.fname_out, f.im, params);
     t.assert_equal("the pruned run saves its checkpoint", (size_t) 1, count_matches(reused.log, "saved target progress"));
     t.assert_equal("quantize succeeds", 0u, other.rc);
+    t.assert_equal("quantize succeeds", 0u, fresh_other.rc);
     t.assert_equal("a checkpoint for another pruned block is reported", (size_t) 1, count_matches(other.log, "state file does not match this model, imatrix or pruned layers, ignoring"));
-    t.assert_equal("a checkpoint for another pruned block is scored again", count_matches(fresh.log, "processing tensor"), count_matches(other.log, "processing tensor"));
+    t.assert_equal("a checkpoint for another pruned block is scored again", count_matches(fresh_other.log, "processing tensor"), count_matches(other.log, "processing tensor"));
 }
 
 static void test_stats_order(testing & t, const fixture & f) {
@@ -612,8 +613,8 @@ static void test_stats_order(testing & t, const fixture & f) {
 
 static void test_stats_missing(testing & t, const fixture & f) {
     // tensor whose stats vector is cut short or left out
-    const size_t k = std::find(f.im.names.begin(), f.im.names.end(), "blk.1.ffn_down.weight") - f.im.names.begin();
-    t.assert_true("imatrix has blk.1.ffn_down.weight", k < f.im.names.size());
+    const size_t k = std::find(f.im.names.begin(), f.im.names.end(), "blk.1.ffn_down_exps.weight") - f.im.names.begin();
+    t.assert_true("imatrix has blk.1.ffn_down_exps.weight", k < f.im.names.size());
     if (k == f.im.names.size()) { return; }
 
     // pearson under another name
@@ -870,13 +871,13 @@ static void test_type_flags(testing & t, const fixture & f) {
     t.assert_equal("--output-tensor-type alone pins one tensor", (size_t) 1, count_matches(output_only.log, "(pinned)"));
 }
 
-static int run_tests(testing & t, const std::filesystem::path & dir) {
+static int run_tests(testing & t, const std::filesystem::path & dir, const std::string & model) {
     fixture f;
     f.fname_model = (dir / "model-f32.gguf").string();
     f.fname_out   = (dir / "model-out.gguf").string();
     f.fname_state = (dir / "model.bpw_state").string();
-    if (!save_model(f.fname_model)) {
-        fprintf(stderr, "failed to create the model\n");
+    if (!save_model(model, f.fname_model)) {
+        fprintf(stderr, "failed to create the model from %s\n", model.c_str());
         return 1;
     }
 
@@ -925,12 +926,23 @@ int main(int argc, char ** argv) {
     t.verbose = verbose;
     llama_log_set(log_callback, nullptr);
 
-    if (argc > 1) { t.set_filter(argv[1]); }
+    std::string model;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            model = argv[++i];
+        } else {
+            t.set_filter(argv[i]);
+        }
+    }
+    if (model.empty()) {
+        fprintf(stderr, "usage: %s -m model.gguf [filter]\n", argv[0]);
+        return 1;
+    }
 
     llama_backend_init();
     const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("test-quantize-target-" + std::to_string(std::random_device{}()));
     std::filesystem::create_directories(dir);
-    const int ret = run_tests(t, dir);
+    const int ret = run_tests(t, dir, model);
     std::filesystem::remove_all(dir);
     llama_backend_free();
 

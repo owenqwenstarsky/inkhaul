@@ -334,11 +334,6 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         if (!model_tensor) {
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }
-        // build_lora_mm feeds a folded weight's LoRA delta the primal input, so folded matmul weights are fine;
-        // a latent lookup table (token_embd, also the head when the output is tied) stores rotated rows, refuse it
-        if (model.hdmd.inverse_blocks.count(name)) {
-            throw std::runtime_error("LoRA tensor '" + name + "' targets a prism.hadamard latent lookup table, which is not supported");
-        }
 
         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
 

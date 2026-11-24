@@ -407,7 +407,7 @@ static void test_content_types(testing & t) {
     });
 
     t.test("encoder_width", [&](testing & t) {
-        // e.g. eagle3/dflash: extracted features are wider than the decoder input
+        // e.g. dflash: extracted features are wider than the decoder input
         const uint32_t n_embd_enc = 6;
         batch_builder bb(2, nullptr, 4, 1, 0, n_embd_enc);
 
@@ -1109,7 +1109,7 @@ static void test_compat(testing & t) {
     });
 
     t.test("embd_row_width_override", [&](testing & t) {
-        // encoder input (e.g. eagle3/dflash) is wider than the decoder input
+        // encoder input (dflash) is wider than the decoder input
         const uint32_t n_embd_enc = 6;
         float embd[2*n_embd_enc];
         for (int i = 0; i < 2*6; ++i) {
@@ -1135,32 +1135,15 @@ static void test_compat(testing & t) {
     });
 }
 
-static void test_mtp_embd_width(testing & t) {
-    t.test("mtp_keeps_n_embd_inp_and_takes_state_at_n_embd_out", [&](testing & t) {
+static void test_embd_inp_width(testing & t) {
+    t.test("default_uses_n_embd_inp", [&](testing & t) {
         llama_hparams hparams = {};
         hparams.n_embd             = 64;
         hparams.n_deepstack_layers = 2;   // makes n_embd_inp() = 64 + 64*2 = 192
         hparams.n_embd_out_impl    = 96;  // makes n_embd_out() = 96
 
         t.assert_equal("default context uses n_embd_inp (deepstack-aware)",
-                (size_t) 192, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_LLAMA, hparams));
-
-        t.assert_equal("MTP context keeps n_embd_inp for the token embeddings",
-                (size_t) 192, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_LLAMA, hparams));
-
-        t.assert_equal("MTP context takes the target hidden state at n_embd_out",
-                (size_t) 96, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_MTP, hparams));
-
-        t.assert_equal("default context takes no state",
-                (size_t) 0, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_DEFAULT, hparams));
-    });
-
-    t.test("mtp_state_falls_back_to_n_embd_when_no_override", [&](testing & t) {
-        llama_hparams hparams = {};
-        hparams.n_embd = 64; // no deepstack, no n_embd_out_impl override
-
-        t.assert_equal((size_t) 64, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_LLAMA, hparams));
-        t.assert_equal((size_t) 64, llama_batch_ext_select_n_embd_state(LLAMA_CONTEXT_TYPE_MTP, hparams));
+                (size_t) 192, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_INKLING2, hparams));
     });
 
     t.test("dflash_uses_n_embd_inp_enc", [&](testing & t) {
@@ -1173,10 +1156,7 @@ static void test_mtp_embd_width(testing & t) {
                 (size_t) 128, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_DFLASH, hparams));
 
         t.assert_equal("other archs ignore n_embd_inp_enc",
-                (size_t) 64, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_LLAMA, hparams));
-
-        t.assert_equal("MTP context does not change the DFlash input width",
-                (size_t) 128, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_MTP, LLM_ARCH_DFLASH, hparams));
+                (size_t) 64, llama_batch_ext_select_n_embd_inp(LLAMA_CONTEXT_TYPE_DEFAULT, LLM_ARCH_INKLING2, hparams));
     });
 }
 
@@ -1202,7 +1182,7 @@ int main(int argc, char ** argv) {
     t.test("split",          test_split);
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
-    t.test("mtp_embd_width", test_mtp_embd_width);
+    t.test("embd_inp_width", test_embd_inp_width);
 
     return t.summary();
 }

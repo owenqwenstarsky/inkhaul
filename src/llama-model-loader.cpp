@@ -544,7 +544,6 @@ llama_model_loader::llama_model_loader(
         llama_load_mode load_mode,
         bool check_tensors,
         bool no_alloc,
-        bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
@@ -921,7 +920,6 @@ llama_model_loader::llama_model_loader(
 
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
-    this->load_mtp = load_mtp;
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1053,7 +1051,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         case GGML_OP_MUL_MAT_ID:
             {
                 // Used for either MoE expert routing or embedded adapter routing
-                const int n_ids_used = hparams.router_layer >= 0 ? 1 : hparams.n_expert_used_max();
+                const int n_ids_used = hparams.n_expert_used_max();
                 GGML_ASSERT(n_ids_used > 0);
                 ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
                 ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
@@ -1292,14 +1290,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return nullptr;
         }
 
-        // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
-        // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
+        // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID
         ggml_op op;
         if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
-        } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
-                (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
-            op = GGML_OP_MUL_MAT_ID;
         } else {
             op = info.op;
         }

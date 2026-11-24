@@ -7,7 +7,6 @@
 
 #include "common.h"
 
-#include "../../src/llama-ext.h" // llama_arch_from_string
 
 #include <algorithm>
 #include <cmath>
@@ -352,14 +351,6 @@ struct case_rollback_bound : ctx_test {
 
         constexpr llama_pos n_prefix = 16;
 
-        char arch_name[64] = {};
-        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
-        const llm_arch arch = llama_arch_from_string(arch_name);
-
-        // the DSV4 cache rebuilds snapshot d from the state before the ubatch, so d <= n is exact;
-        // the recurrent memory gets snapshots 0..n-1 from ggml_ssm_scan, only for n <= n_rs_seq + 1
-        const bool from_ubatch_start = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41;
-
         const auto make_ctx = [&]() {
             ctx_opts opts;
             opts.n_batch   = 64;
@@ -380,7 +371,8 @@ struct case_rollback_bound : ctx_test {
         }
 
         for (const uint32_t n : { 1u, 2u, n_rs_seq + 1, n_rs_seq + 2 }) {
-            const uint32_t r_max = from_ubatch_start ? std::min(n, n_rs_seq) : (n <= n_rs_seq + 1 ? n - 1 : 0);
+            // the recurrent memory gets snapshots 0..n-1 from ggml_ssm_scan, only for n <= n_rs_seq + 1
+            const uint32_t r_max = n <= n_rs_seq + 1 ? n - 1 : 0;
 
             ctx = make_ctx();
             if (!ctx) {
@@ -420,13 +412,6 @@ struct case_shared_seq_reserve : ctx_test {
         return "sequences sharing cells keep decoding correctly after a seq_cp";
     }
 
-    std::string skip_reason(model_run & mr) const override {
-        if (arch_reserves_single_seq(mr.model)) {
-            return "the shared-seq batch is a multi-seq graph";
-        }
-
-        return ctx_test::skip_reason(mr);
-    }
 
     case_result run(model_run & mr) const override {
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));

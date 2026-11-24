@@ -207,14 +207,12 @@ struct plan_case {
     const std::vector<std::string> files;
     const char * hf_repo;
     const char * hf_file;
-    bool sidecars;        // request mmproj + mtp + dflash + eagle3 + dspark
+    bool sidecars;        // request mmproj + dflash + dspark
     bool order_dependent; // the expected pick depends on the listing order
     const char * primary;
     std::vector<std::string> model_files;
     const char * mmproj;
-    const char * mtp;
     const char * dflash;
-    const char * eagle3;
     const char * dspark;
 };
 
@@ -222,27 +220,27 @@ static const plan_case plan_cases[] = {
     // exact tag picks the matching primary, sidecars follow the tag
     {"flat exact tag", flat, "test/repo:Q8_0", "", true, false,
      "model-Q8_0.gguf", {"model-Q8_0.gguf"},
-     "mmproj-model-Q8_0.gguf", "mtp-model-Q8_0.gguf", "dflash-model-Q8_0.gguf", "", ""},
+     "mmproj-model-Q8_0.gguf", "dflash-model-Q8_0.gguf", ""},
 
     // no tag falls back to the default quant preference
     {"flat default", flat, "test/repo", "", false, false,
      "model-Q4_K_M.gguf", {"model-Q4_K_M.gguf"},
-     "", "", "", "", ""},
+     "", "", ""},
 
     // no tag and no default match falls back to the first model in the listing
     {"unsloth fallback", unsloth, "test/repo", "", true, true,
      "model-UD-Q8_K_XL.gguf", {"model-UD-Q8_K_XL.gguf"},
-     "mmproj-BF16.gguf", "", "", "", ""},
+     "mmproj-BF16.gguf", "", ""},
 
     // explicit hf_file picks that exact file
     {"flat hf_file", flat, "test/repo", "model-BF16.gguf", false, false,
      "model-BF16.gguf", {"model-BF16.gguf"},
-     "", "", "", "", ""},
+     "", "", ""},
 
     // missing hf_file resolves nothing
     {"flat missing hf_file", flat, "test/repo", "nope.gguf", false, false,
      "", {},
-     "", "", "", "", ""},
+     "", "", ""},
 
     // a sharded primary brings all its parts, a subdir primary finds the root sidecar
     {"subdir shards", subdir, "test/repo:Q3_K_M", "", true, false,
@@ -250,82 +248,78 @@ static const plan_case plan_cases[] = {
      {"Q3_K_M/model-Q3_K_M-00001-of-00003.gguf",
       "Q3_K_M/model-Q3_K_M-00002-of-00003.gguf",
       "Q3_K_M/model-Q3_K_M-00003-of-00003.gguf"},
-     "mmproj-model-f16.gguf", "model-mtp-Q8_0.gguf", "", "", ""},
+     "mmproj-model-f16.gguf", "", ""},
 
     // a tag with no matching full model still resolves the requested sidecars
     {"hole tag sidecar", hole, "test/repo:Q4_0", "", true, false,
      "", {},
-     "", "mtp-model-Q4_0.gguf", "dflash-model-Q8_0.gguf", "", ""},
+     "", "dflash-model-Q8_0.gguf", ""},
 
     // the same tag without a requested sidecar resolves nothing
     {"hole tag alone", hole, "test/repo:Q4_0", "", false, false,
      "", {},
-     "", "", "", "", ""},
+     "", "", ""},
 
     // no tag anchors the sidecars on the primary quant
     {"hole default anchor", hole, "test/repo", "", true, false,
      "model-Q4_K_M.gguf", {"model-Q4_K_M.gguf"},
-     "", "mtp-model-Q4_0.gguf", "dflash-model-Q8_0.gguf", "", ""},
+     "", "dflash-model-Q8_0.gguf", ""},
 
-    // the mtp- keyword is case sensitive, a suffix -MTP file is not discovered
+    // a suffix -MTP file is neither a sidecar nor a model
     {"unsloth suffix mtp", unsloth, "test/repo:Q8_K_XL", "", true, false,
      "model-UD-Q8_K_XL.gguf", {"model-UD-Q8_K_XL.gguf"},
-     "mmproj-BF16.gguf", "", "", "", ""},
+     "mmproj-BF16.gguf", "", ""},
 
     // vendor prefixes and the dot quant convention both match the tag,
     // first match wins between two files at the same quant
     {"vendor prefix", vendors, "test/repo:Q8_0", "", false, true,
      "TheDrummer_Model-24B-v4.1-Q8_0.gguf", {"TheDrummer_Model-24B-v4.1-Q8_0.gguf"},
-     "", "", "", "", ""},
+     "", "", ""},
 
     // the tag picks the file carrying it as a full token, never a longer one
     {"twins f16 tag", twins, "test/repo:F16", "", false, false,
      "model-F16.gguf", {"model-F16.gguf"},
-     "", "", "", "", ""},
+     "", "", ""},
 
     {"twins bf16 tag", twins, "test/repo:BF16", "", false, false,
      "model-BF16.gguf", {"model-BF16.gguf"},
-     "", "", "", "", ""},
+     "", "", ""},
 
     {"twins q4_xs tag", twins, "test/repo:Q4_XS", "", false, false,
      "model-Q4_XS.gguf", {"model-Q4_XS.gguf"},
-     "", "", "", "", ""},
+     "", "", ""},
 
     {"twins iq4_xs tag", twins, "test/repo:IQ4_XS", "", false, false,
      "model-IQ4_XS.gguf", {"model-IQ4_XS.gguf"},
-     "", "", "", "", ""},
+     "", "", ""},
 
     // every sidecar type resolves at the tag
     {"quad exact tag", quad, "test/repo:Q8_0", "", true, false,
      "model-Q8_0.gguf", {"model-Q8_0.gguf"},
-     "", "mtp-model-Q8_0.gguf", "dflash-model-Q8_0.gguf", "eagle3-model-Q8_0.gguf", "dspark-model-Q8_0.gguf"},
+     "", "dflash-model-Q8_0.gguf", "dspark-model-Q8_0.gguf"},
 
     // no tag anchors the dspark sidecar on the only full quant
     {"spark default anchor", spark, "test/repo", "", true, false,
      "model-MXFP4.gguf", {"model-MXFP4.gguf"},
-     "", "", "", "", "dspark-model-MXFP4.gguf"},
+     "", "", "dspark-model-MXFP4.gguf"},
 
     // a tag with no matching full model still resolves the exact dspark sidecar
     {"spark tag sidecar", spark, "test/repo:BF16", "", true, false,
      "", {},
-     "", "", "", "", "dspark-model-BF16.gguf"},
+     "", "", "dspark-model-BF16.gguf"},
 };
 
 static void check_plan(const plan_case & c) {
     common_download_opts opts;
     opts.download_mmproj = c.sidecars;
-    opts.download_mtp    = c.sidecars;
     opts.download_dflash = c.sidecars;
-    opts.download_eagle3 = c.sidecars;
     opts.download_dspark = c.sidecars;
 
     auto plan = common_download_get_hf_plan(model_ref(c.hf_repo, c.hf_file), opts);
 
     REQUIRE_EQ(plan.primary.path, c.primary);
     REQUIRE_EQ(plan.mmproj.path,  c.mmproj);
-    REQUIRE_EQ(plan.mtp.path,     c.mtp);
     REQUIRE_EQ(plan.dflash.path,  c.dflash);
-    REQUIRE_EQ(plan.eagle3.path,  c.eagle3);
     REQUIRE_EQ(plan.dspark.path,  c.dspark);
 
     // exact shard set, order insensitive; the primary must be the first split
@@ -392,14 +386,14 @@ static void test_plan_partials() {
 
     g_context = "plan partials";
     g_repos.clear();
-    g_repos["test/partial"] = { "model-Q4_0.gguf", "mmproj-model-F16.gguf", "mtp-model-Q4_0.gguf" };
+    g_repos["test/partial"] = { "model-Q4_0.gguf", "mmproj-model-F16.gguf", "dflash-model-Q4_0.gguf" };
 
-    // the mmproj is complete, the model and its mtp are still to download
+    // the mmproj is complete, the model and its dflash are still to download
     cache_put("test/partial", "mmproj-model-F16.gguf");
 
     common_download_opts opts;
     opts.download_mmproj = true;
-    opts.download_mtp    = true;
+    opts.download_dflash = true;
 
     const auto parts = common_download_plan_partials(common_download_get_hf_plan(model_ref("test/partial:Q4_0"), opts));
 
@@ -407,7 +401,7 @@ static void test_plan_partials() {
     REQUIRE(parts.size() == 2);
     REQUIRE(parts[0].kind.empty());
     REQUIRE(fs::path(parts[0].path).lexically_normal() == (blobs / "0000000000000000000000000000000000000001.downloadInProgress").lexically_normal());
-    REQUIRE_EQ(parts[1].kind, "mtp");
+    REQUIRE_EQ(parts[1].kind, "dflash");
     REQUIRE(fs::path(parts[1].path).lexically_normal() == (blobs / "0000000000000000000000000000000000000003.downloadInProgress").lexically_normal());
 
     fs::remove_all(cache_dir / "models--test--partial");
@@ -428,7 +422,7 @@ static void test_sidecar_removal() {
 
     cache_put("test/sidecar", "model-Q4_0.gguf");
     cache_put("test/sidecar", "dflash-model-Q4_0.gguf");
-    cache_put("test/sidecar", "mtp-model-Q4_0.gguf");
+    cache_put("test/sidecar", "dspark-model-Q4_0.gguf");
 
     common_download_opts opts;
     opts.download_dflash = true;
@@ -436,7 +430,7 @@ static void test_sidecar_removal() {
     // the selected sidecar goes, the other one and the model stay
     REQUIRE(common_download_remove_sidecars("test/sidecar:Q4_0", opts));
     REQUIRE(!fs::exists(cached("test/sidecar", "dflash-model-Q4_0.gguf")));
-    REQUIRE(fs::exists(cached("test/sidecar", "mtp-model-Q4_0.gguf")));
+    REQUIRE(fs::exists(cached("test/sidecar", "dspark-model-Q4_0.gguf")));
     REQUIRE(fs::exists(cached("test/sidecar", "model-Q4_0.gguf")));
     REQUIRE(!common_download_remove_sidecars("test/sidecar:Q4_0", opts));
 
@@ -456,28 +450,28 @@ static void test_shared_removal() {
     g_context = "shared removal";
     g_repos.clear();
 
-    for (const char * f : { "model-Q8_0.gguf", "model-BF16.gguf", "mmproj-model-BF16.gguf", "mtp-model-BF16.gguf" }) {
+    for (const char * f : { "model-Q8_0.gguf", "model-BF16.gguf", "mmproj-model-BF16.gguf", "dflash-model-BF16.gguf" }) {
         cache_put("test/shared", f);
     }
 
-    // the BF16 model goes, the mmproj and the mtp Q8_0 resolves stay
+    // the BF16 model goes, the mmproj and the dflash Q8_0 resolves stay
     REQUIRE(common_download_remove("test/shared:BF16"));
     REQUIRE(!fs::exists(cached("test/shared", "model-BF16.gguf")));
     REQUIRE(fs::exists(cached("test/shared", "mmproj-model-BF16.gguf")));
-    REQUIRE(fs::exists(cached("test/shared", "mtp-model-BF16.gguf")));
+    REQUIRE(fs::exists(cached("test/shared", "dflash-model-BF16.gguf")));
     REQUIRE(fs::exists(cached("test/shared", "model-Q8_0.gguf")));
 
     fs::remove_all(cache_dir / "models--test--shared");
 
     // with no other tag, the files of the removed tag all go, sidecars included
-    for (const char * f : { "model-BF16.gguf", "mmproj-model-BF16.gguf", "mtp-model-BF16.gguf" }) {
+    for (const char * f : { "model-BF16.gguf", "mmproj-model-BF16.gguf", "dflash-model-BF16.gguf" }) {
         cache_put("test/alone", f);
     }
 
     REQUIRE(common_download_remove("test/alone:BF16"));
     REQUIRE(!fs::exists(cached("test/alone", "model-BF16.gguf")));
     REQUIRE(!fs::exists(cached("test/alone", "mmproj-model-BF16.gguf")));
-    REQUIRE(!fs::exists(cached("test/alone", "mtp-model-BF16.gguf")));
+    REQUIRE(!fs::exists(cached("test/alone", "dflash-model-BF16.gguf")));
     REQUIRE(!common_download_remove("test/alone:BF16"));
 
     fs::remove_all(cache_dir / "models--test--alone");
@@ -502,9 +496,7 @@ struct real_plan {
     const char * primary;
     int          parts;   // number of model files, all splits of the primary
     const char * mmproj;
-    const char * mtp;
     const char * dflash;
-    const char * eagle3;
     const char * dspark;
 };
 
@@ -523,11 +515,11 @@ static const real_repo real_repos[] = {
       {"Muse-Glimmer-30B-Heretic-Q8_0.gguf"},
       {"Muse-Glimmer-30B-Heretic-TQ2_0.gguf"}},
      {
-      {"", "Muse-Glimmer-30B-Heretic-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Muse-Glimmer-30B-Heretic-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Muse-Glimmer-30B-Heretic-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "Muse-Glimmer-30B-Heretic-BF16.gguf", 1, "", "", "", "", ""},
-      {"TQ2_0", "Muse-Glimmer-30B-Heretic-TQ2_0.gguf", 1, "", "", "", "", ""}},
+      {"", "Muse-Glimmer-30B-Heretic-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Muse-Glimmer-30B-Heretic-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Muse-Glimmer-30B-Heretic-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "Muse-Glimmer-30B-Heretic-BF16.gguf", 1, "", "", ""},
+      {"TQ2_0", "Muse-Glimmer-30B-Heretic-TQ2_0.gguf", 1, "", "", ""}},
      {"TQ2_0", "Q8_0", "Q4_K_M", "IQ4_XS", "BF16"}},
 
     {"0bserverx/RVN-Qwen3.8-Flash-Next-Abliterated-Uncensored-GGUF",
@@ -536,10 +528,10 @@ static const real_repo real_repos[] = {
       {"RVN-Qwen3.8-Flash-Next-Q4_K_M", 8},
       {"RVN-Qwen3.8-Flash-Next-Q6_K", 8}},
      {
-      {"", "RVN-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00008.gguf", 8, "", "", "", "", ""},
-      {"Q4_K_M", "RVN-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00008.gguf", 8, "", "", "", "", ""},
-      {"IQ3_M", "RVN-Qwen3.8-Flash-Next-IQ3_M-00001-of-00008.gguf", 8, "", "", "", "", ""},
-      {"Q6_K", "RVN-Qwen3.8-Flash-Next-Q6_K-00001-of-00008.gguf", 8, "", "", "", "", ""}},
+      {"", "RVN-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00008.gguf", 8, "", "", ""},
+      {"Q4_K_M", "RVN-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00008.gguf", 8, "", "", ""},
+      {"IQ3_M", "RVN-Qwen3.8-Flash-Next-IQ3_M-00001-of-00008.gguf", 8, "", "", ""},
+      {"Q6_K", "RVN-Qwen3.8-Flash-Next-Q6_K-00001-of-00008.gguf", 8, "", "", ""}},
      {"Q6_K", "Q4_K_M", "Q4_0", "IQ3_M"}},
 
     {"0xSojalSec/Qwen3.8-Flash-Next-Uncensored-GSQ-RCO-12-GB-GPU",
@@ -550,11 +542,11 @@ static const real_repo real_repos[] = {
       {"mtp-Qwen3.8-Flash-Next-Q8_0.gguf"},
       {"mtp-q2_0.gguf"}},
      {
-      {"", "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "mtp-q2_0.gguf", "", "", ""},
-      {"Q8_0", "", 0, "", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""},
-      {"IQ2_XS", "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "mtp-q2_0.gguf", "", "", ""},
-      {"Q2_0", "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "mtp-q2_0.gguf", "", "", ""},
-      {"BF16", "", 0, "", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""}},
+      {"", "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"Q8_0", "", 0, "", "", ""},
+      {"IQ2_XS", "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"Q2_0", "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q2_0", "IQ3_XXS", "IQ2_XS"}},
 
     {"agentionai/Qwen3.8-Flash-Next-AP-GGUF",
@@ -563,11 +555,11 @@ static const real_repo real_repos[] = {
       {"AP-Q5_K_XL/Qwen3.8-Flash-Next-AP-Q5_K_XL.gguf"},
       {"mmproj-F16.gguf"}},
      {
-      {"", "AP-Q4_K_M/Qwen3.8-Flash-Next-AP-Q4_K_M.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"Q4_K_M", "AP-Q4_K_M/Qwen3.8-Flash-Next-AP-Q4_K_M.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"IQ2_S", "AP-IQ2_S/Qwen3.8-Flash-Next-AP-IQ2_S.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"Q5_K_XL", "AP-Q5_K_XL/Qwen3.8-Flash-Next-AP-Q5_K_XL.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "AP-Q4_K_M/Qwen3.8-Flash-Next-AP-Q4_K_M.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"Q4_K_M", "AP-Q4_K_M/Qwen3.8-Flash-Next-AP-Q4_K_M.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"IQ2_S", "AP-IQ2_S/Qwen3.8-Flash-Next-AP-IQ2_S.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"Q5_K_XL", "AP-Q5_K_XL/Qwen3.8-Flash-Next-AP-Q5_K_XL.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q5_K_XL", "Q4_K_M", "IQ2_S"}},
 
     {"agentionai/Signal-3.8-27B-GGUF",
@@ -576,11 +568,11 @@ static const real_repo real_repos[] = {
       {"Q8_0/Signal-3.8-27B-Q8_0.gguf"},
       {"mmproj-BF16.gguf"}},
      {
-      {"", "AP-Q4_K_M/Signal-3.8-27B-AP-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "AP-Q4_K_M/Signal-3.8-27B-AP-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Q8_0/Signal-3.8-27B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"IQ3_S", "AP-IQ3_S/Signal-3.8-27B-AP-IQ3_S.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "AP-Q4_K_M/Signal-3.8-27B-AP-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "AP-Q4_K_M/Signal-3.8-27B-AP-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Q8_0/Signal-3.8-27B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"IQ3_S", "AP-IQ3_S/Signal-3.8-27B-AP-IQ3_S.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q8_0", "Q4_K_M", "IQ3_S"}},
 
     {"agentionai/Signal-3.8-Flash-Next-GGUF",
@@ -589,10 +581,10 @@ static const real_repo real_repos[] = {
       {"Q8_0/Signal-3.8-Flash-Next-Q8_0.gguf"},
       {"mmproj-F16.gguf"}},
      {
-      {"", "Q8_0/Signal-3.8-Flash-Next-Q8_0.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"Q8_0", "Q8_0/Signal-3.8-Flash-Next-Q8_0.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"IQ4_XS", "AP-IQ4_XS/Signal-3.8-Flash-Next-AP-IQ4_XS.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Q8_0/Signal-3.8-Flash-Next-Q8_0.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"Q8_0", "Q8_0/Signal-3.8-Flash-Next-Q8_0.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"IQ4_XS", "AP-IQ4_XS/Signal-3.8-Flash-Next-AP-IQ4_XS.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q4_K_XL", "IQ4_XS"}},
 
     {"ajgazin/Swift-1.5-Qwen3.8-27B-Uncensored-Dynamic-MTP-GGUF",
@@ -601,9 +593,9 @@ static const real_repo real_repos[] = {
       {"Swift-1.5-Qwen3.8-27B-Uncensored-MTP-BF16.gguf"},
       {"mmproj-BF16.gguf"}},
      {
-      {"", "RCO/Swift-1.5-Qwen3.8-27B-Uncensored-Dynamic-MTP-RCO-IQ2_S.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"IQ2_S", "RCO/Swift-1.5-Qwen3.8-27B-Uncensored-Dynamic-MTP-RCO-IQ2_S.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "Swift-1.5-Qwen3.8-27B-Uncensored-MTP-BF16.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""}},
+      {"", "RCO/Swift-1.5-Qwen3.8-27B-Uncensored-Dynamic-MTP-RCO-IQ2_S.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"IQ2_S", "RCO/Swift-1.5-Qwen3.8-27B-Uncensored-Dynamic-MTP-RCO-IQ2_S.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "Swift-1.5-Qwen3.8-27B-Uncensored-MTP-BF16.gguf", 1, "mmproj-BF16.gguf", "", ""}},
      {"BF16", "Q3_K_XL", "IQ2_S"}},
 
     {"ajgazin/Swift-Qwen3.8-27B-Uncensored-Dynamic-MTP-GGUF",
@@ -612,9 +604,9 @@ static const real_repo real_repos[] = {
       {"Swift-Qwen3.8-27B-Uncensored-MTP-BF16.gguf"},
       {"mmproj-BF16.gguf"}},
      {
-      {"", "Swift-Qwen3.8-27B-Uncensored-Dynamic-MTP-UD-IQ3_S.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-IQ3_S", "Swift-Qwen3.8-27B-Uncensored-Dynamic-MTP-UD-IQ3_S.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "Swift-Qwen3.8-27B-Uncensored-MTP-BF16.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""}},
+      {"", "Swift-Qwen3.8-27B-Uncensored-Dynamic-MTP-UD-IQ3_S.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"UD-IQ3_S", "Swift-Qwen3.8-27B-Uncensored-Dynamic-MTP-UD-IQ3_S.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "Swift-Qwen3.8-27B-Uncensored-MTP-BF16.gguf", 1, "mmproj-BF16.gguf", "", ""}},
      {"BF16", "Q4_K_XL", "IQ3_S"}},
 
     {"AliceThirty/GLM-5.3-Flash-UNCENSORED-GGUF",
@@ -622,16 +614,16 @@ static const real_repo real_repos[] = {
       {"UD-Q3_K_XL/GLM-5.3-Flash-UNCENSORED-FP8-UD-Q3_K_XL", 4},
       {"UD-Q5_K_XL/GLM-5.3-Flash-UNCENSORED-FP8-UD-Q5_K_XL", 5}},
      {
-      {"", "UD-Q3_K_XL/GLM-5.3-Flash-UNCENSORED-FP8-UD-Q3_K_XL-00001-of-00004.gguf", 4, "GLM-5.3-Flash-UNCENSORED-FP8-mmproj-bf16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""},
-      {"UD-Q5_K_XL", "UD-Q5_K_XL/GLM-5.3-Flash-UNCENSORED-FP8-UD-Q5_K_XL-00001-of-00005.gguf", 5, "GLM-5.3-Flash-UNCENSORED-FP8-mmproj-bf16.gguf", "", "", "", ""}},
+      {"", "UD-Q3_K_XL/GLM-5.3-Flash-UNCENSORED-FP8-UD-Q3_K_XL-00001-of-00004.gguf", 4, "GLM-5.3-Flash-UNCENSORED-FP8-mmproj-bf16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""},
+      {"UD-Q5_K_XL", "UD-Q5_K_XL/GLM-5.3-Flash-UNCENSORED-FP8-UD-Q5_K_XL-00001-of-00005.gguf", 5, "GLM-5.3-Flash-UNCENSORED-FP8-mmproj-bf16.gguf", "", ""}},
      {"Q5_K_XL", "Q3_K_XL"}},
 
     {"antirez/glm-5.3-gguf",
      {{"GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"}},
      {
-      {"", "GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf", 1, "", "", "", "", ""},
-      {"UD-IQ2_XXS_ROUTEDIQ2XXS_BLK78Q2K", "GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf", 1, "", "", "", "", ""}},
+      {"", "GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf", 1, "", "", ""},
+      {"UD-IQ2_XXS_ROUTEDIQ2XXS_BLK78Q2K", "GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf", 1, "", "", ""}},
      {"IQ2_XXS_ROUTEDIQ2XXS_BLK78Q2K"}},
 
     {"AtomicChat/Qwen-Image-2.1-Turbo-GGUF",
@@ -639,9 +631,9 @@ static const real_repo real_repos[] = {
       {"Qwen-Image-2.1-Turbo-AD-Q5_K.gguf"},
       {"Qwen-Image-2.1-Turbo-Q8_0.gguf"}},
      {
-      {"", "Qwen-Image-2.1-Turbo-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Qwen-Image-2.1-Turbo-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q2_K", "Qwen-Image-2.1-Turbo-AD-Q2_K.gguf", 1, "", "", "", "", ""}},
+      {"", "Qwen-Image-2.1-Turbo-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "Qwen-Image-2.1-Turbo-Q8_0.gguf", 1, "", "", ""},
+      {"Q2_K", "Qwen-Image-2.1-Turbo-AD-Q2_K.gguf", 1, "", "", ""}},
      {"Q8_0", "Q5_K", "Q2_K"}},
 
     {"AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF",
@@ -651,10 +643,10 @@ static const real_repo real_repos[] = {
       {"mmproj-Qwen-Image-2.1-Turbo-Uncensored-BF16.gguf"},
       {"mmproj-Qwen-Image-2.1-Turbo-Uncensored-F16.gguf"}},
      {
-      {"", "Qwen-Image-2.1-Turbo-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen-Image-2.1-Turbo-Uncensored-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen-Image-2.1-Turbo-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen-Image-2.1-Turbo-Uncensored-BF16.gguf", "", "", "", ""},
-      {"Q2_K", "Qwen-Image-2.1-Turbo-Uncensored-AD-Q2_K.gguf", 1, "mmproj-Qwen-Image-2.1-Turbo-Uncensored-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen-Image-2.1-Turbo-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen-Image-2.1-Turbo-Uncensored-BF16.gguf", "", ""},
+      {"Q8_0", "Qwen-Image-2.1-Turbo-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen-Image-2.1-Turbo-Uncensored-BF16.gguf", "", ""},
+      {"Q2_K", "Qwen-Image-2.1-Turbo-Uncensored-AD-Q2_K.gguf", 1, "mmproj-Qwen-Image-2.1-Turbo-Uncensored-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q8_0", "Q5_K", "Q2_K"}},
 
     {"audio-cpp/Audio-Flamingo-GGUF",
@@ -665,9 +657,9 @@ static const real_repo real_repos[] = {
       {"audio-flamingo-next-q4_k.gguf"},
       {"audio-flamingo-next-q8_0.gguf"}},
      {
-      {"", "audio-flamingo-3-q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "audio-flamingo-3-q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "audio-flamingo-3-bf16.gguf", 1, "", "", "", "", ""}},
+      {"", "audio-flamingo-3-q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "audio-flamingo-3-q8_0.gguf", 1, "", "", ""},
+      {"BF16", "audio-flamingo-3-bf16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K", "BF16"}},
 
     {"bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF",
@@ -677,11 +669,11 @@ static const real_repo real_repos[] = {
       {"DeepSeek-Coder-V2-Lite-Instruct-Q8_0.gguf"},
       {"DeepSeek-Coder-V2-Lite-Instruct-f32.gguf/DeepSeek-Coder-V2-Lite-Instruct-f32", 2}},
      {
-      {"", "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "DeepSeek-Coder-V2-Lite-Instruct-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"IQ2_M", "DeepSeek-Coder-V2-Lite-Instruct-IQ2_M.gguf", 1, "", "", "", "", ""},
-      {"F32", "DeepSeek-Coder-V2-Lite-Instruct-f32.gguf/DeepSeek-Coder-V2-Lite-Instruct-f32-00001-of-00002.gguf", 2, "", "", "", "", ""}},
+      {"", "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "DeepSeek-Coder-V2-Lite-Instruct-Q8_0.gguf", 1, "", "", ""},
+      {"IQ2_M", "DeepSeek-Coder-V2-Lite-Instruct-IQ2_M.gguf", 1, "", "", ""},
+      {"F32", "DeepSeek-Coder-V2-Lite-Instruct-f32.gguf/DeepSeek-Coder-V2-Lite-Instruct-f32-00001-of-00002.gguf", 2, "", "", ""}},
      {"F32", "Q8_0", "Q4_K_M", "Q4_K_L", "IQ2_M"}},
 
     {"bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF",
@@ -691,11 +683,11 @@ static const real_repo real_repos[] = {
       {"DeepSeek-R1-Distill-Qwen-14B-Q8_0.gguf"},
       {"DeepSeek-R1-Distill-Qwen-14B-f32/DeepSeek-R1-Distill-Qwen-14B-f32", 2}},
      {
-      {"", "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "DeepSeek-R1-Distill-Qwen-14B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"IQ2_M", "DeepSeek-R1-Distill-Qwen-14B-IQ2_M.gguf", 1, "", "", "", "", ""},
-      {"F32", "DeepSeek-R1-Distill-Qwen-14B-f32/DeepSeek-R1-Distill-Qwen-14B-f32-00001-of-00002.gguf", 2, "", "", "", "", ""}},
+      {"", "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "DeepSeek-R1-Distill-Qwen-14B-Q8_0.gguf", 1, "", "", ""},
+      {"IQ2_M", "DeepSeek-R1-Distill-Qwen-14B-IQ2_M.gguf", 1, "", "", ""},
+      {"F32", "DeepSeek-R1-Distill-Qwen-14B-f32/DeepSeek-R1-Distill-Qwen-14B-f32-00001-of-00002.gguf", 2, "", "", ""}},
      {"F32", "Q8_0", "Q4_K_M", "Q4_0", "IQ2_M"}},
 
     {"bartowski/Qwen2.5-72B-Instruct-GGUF",
@@ -704,10 +696,10 @@ static const real_repo real_repos[] = {
       {"Qwen2.5-72B-Instruct-Q4_K_M.gguf"},
       {"Qwen2.5-72B-Instruct-Q8_0/Qwen2.5-72B-Instruct-Q8_0", 2}},
      {
-      {"", "Qwen2.5-72B-Instruct-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Qwen2.5-72B-Instruct-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Qwen2.5-72B-Instruct-Q8_0/Qwen2.5-72B-Instruct-Q8_0-00001-of-00002.gguf", 2, "", "", "", "", ""},
-      {"IQ1_M", "Qwen2.5-72B-Instruct-IQ1_M.gguf", 1, "", "", "", "", ""}},
+      {"", "Qwen2.5-72B-Instruct-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Qwen2.5-72B-Instruct-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Qwen2.5-72B-Instruct-Q8_0/Qwen2.5-72B-Instruct-Q8_0-00001-of-00002.gguf", 2, "", "", ""},
+      {"IQ1_M", "Qwen2.5-72B-Instruct-IQ1_M.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M", "Q3_K_L", "IQ1_M"}},
 
     {"batiai/gemma-4-E2B-it-GGUF",
@@ -715,10 +707,10 @@ static const real_repo real_repos[] = {
       {"google-gemma-4-E2B-it-Q6_K.gguf"},
       {"mmproj-BF16.gguf"}},
      {
-      {"", "google-gemma-4-E2B-it-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "google-gemma-4-E2B-it-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q6_K", "google-gemma-4-E2B-it-Q6_K.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "google-gemma-4-E2B-it-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "google-gemma-4-E2B-it-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q6_K", "google-gemma-4-E2B-it-Q6_K.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q6_K", "Q4_K_M"}},
 
     {"batiai/Qwen3.6-27B-GGUF",
@@ -729,18 +721,18 @@ static const real_repo real_repos[] = {
       {"mmproj-Qwen-Qwen3.6-27B-BF16.gguf"},
       {"mmproj-Qwen-Qwen3.6-27B-Q6_K.gguf"}},
      {
-      {"", "Qwen-Qwen3.6-27B-Q4_K_M.gguf", 1, "mmproj-Qwen-Qwen3.6-27B-Q6_K.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen-Qwen3.6-27B-Q4_K_M.gguf", 1, "mmproj-Qwen-Qwen3.6-27B-Q6_K.gguf", "", "", "", ""},
-      {"IQ3_XXS", "Qwen-Qwen3.6-27B-IQ3_XXS.gguf", 1, "mmproj-Qwen-Qwen3.6-27B-Q6_K.gguf", "", "", "", ""},
-      {"Q6_K", "Qwen-Qwen3.6-27B-Q6_K.gguf", 1, "mmproj-Qwen-Qwen3.6-27B-Q6_K.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen-Qwen3.6-27B-Q4_K_M.gguf", 1, "mmproj-Qwen-Qwen3.6-27B-Q6_K.gguf", "", ""},
+      {"Q4_K_M", "Qwen-Qwen3.6-27B-Q4_K_M.gguf", 1, "mmproj-Qwen-Qwen3.6-27B-Q6_K.gguf", "", ""},
+      {"IQ3_XXS", "Qwen-Qwen3.6-27B-IQ3_XXS.gguf", 1, "mmproj-Qwen-Qwen3.6-27B-Q6_K.gguf", "", ""},
+      {"Q6_K", "Qwen-Qwen3.6-27B-Q6_K.gguf", 1, "mmproj-Qwen-Qwen3.6-27B-Q6_K.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q6_K", "Q4_K_M", "Q3_K_M", "IQ3_XXS"}},
 
     {"BattleGhost/Qwen3.8-Flash-Next-UNCENSORED-IQ2_XXS-GGUF",
      {{"Qwen3.8-Flash-Next-UNCENSORED-IQ2_XXS.gguf"}},
      {
-      {"", "Qwen3.8-Flash-Next-UNCENSORED-IQ2_XXS.gguf", 1, "", "", "", "", ""},
-      {"IQ2_XXS", "Qwen3.8-Flash-Next-UNCENSORED-IQ2_XXS.gguf", 1, "", "", "", "", ""}},
+      {"", "Qwen3.8-Flash-Next-UNCENSORED-IQ2_XXS.gguf", 1, "", "", ""},
+      {"IQ2_XXS", "Qwen3.8-Flash-Next-UNCENSORED-IQ2_XXS.gguf", 1, "", "", ""}},
      {"IQ2_XXS"}},
 
     {"befox/WAN2.2-14B-Rapid-AllInOne-GGUF",
@@ -767,10 +759,10 @@ static const real_repo real_repos[] = {
       {"v10/wan2.2-t2v-rapid-aio-v10-Q8_0.gguf"},
       {"v10/wan2.2-t2v-rapid-aio-v10-nsfw-Q8_0.gguf"}},
      {
-      {"", "Mega-v1/wan2.2-rapid-mega-aio-nsfw-v1-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Mega-v1/wan2.2-rapid-mega-aio-nsfw-v1-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q2_K", "Mega-v1/wan2.2-rapid-mega-aio-nsfw-v1-Q2_K.gguf", 1, "", "", "", "", ""},
-      {"Q5_K", "Mega-v3/wan2.2-rapid-mega-aio-v3-Q5_K.gguf", 1, "", "", "", "", ""}},
+      {"", "Mega-v1/wan2.2-rapid-mega-aio-nsfw-v1-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "Mega-v1/wan2.2-rapid-mega-aio-nsfw-v1-Q8_0.gguf", 1, "", "", ""},
+      {"Q2_K", "Mega-v1/wan2.2-rapid-mega-aio-nsfw-v1-Q2_K.gguf", 1, "", "", ""},
+      {"Q5_K", "Mega-v3/wan2.2-rapid-mega-aio-v3-Q5_K.gguf", 1, "", "", ""}},
      {"Q8_0", "Q5_K", "Q2_K"}},
 
     {"Blackfrost-AI/Qwen3.8-27B-ABLITERATED-GGUF",
@@ -782,11 +774,11 @@ static const real_repo real_repos[] = {
       {"mmproj-Qwen3.8-27B-ABLITERATED-F16.gguf"},
       {"mmproj-Qwen3.8-27B-ABLITERATED-Q8_0.gguf"}},
      {
-      {"", "Qwen3.8-27B-ABLITERATED-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-ABLITERATED-Q8_0.gguf", "", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", "", ""},
-      {"Q4_K_M", "Qwen3.8-27B-ABLITERATED-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-ABLITERATED-Q8_0.gguf", "", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", "", ""},
-      {"Q8_0", "Qwen3.8-27B-ABLITERATED-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-ABLITERATED-Q8_0.gguf", "", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", "", ""},
-      {"Q2_K", "Qwen3.8-27B-ABLITERATED-Q2_K.gguf", 1, "mmproj-Qwen3.8-27B-ABLITERATED-Q8_0.gguf", "", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", "", ""},
-      {"BF16", "", 0, "", "", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", "", ""}},
+      {"", "Qwen3.8-27B-ABLITERATED-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-ABLITERATED-Q8_0.gguf", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", ""},
+      {"Q4_K_M", "Qwen3.8-27B-ABLITERATED-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-ABLITERATED-Q8_0.gguf", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", ""},
+      {"Q8_0", "Qwen3.8-27B-ABLITERATED-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-ABLITERATED-Q8_0.gguf", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", ""},
+      {"Q2_K", "Qwen3.8-27B-ABLITERATED-Q2_K.gguf", 1, "mmproj-Qwen3.8-27B-ABLITERATED-Q8_0.gguf", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", ""},
+      {"BF16", "", 0, "", "dflash-Qwen3.8-27B-ABLITERATED-BF16.gguf", ""}},
      {"Q8_0", "Q4_K_S", "Q4_K_M", "Q2_K"}},
 
     {"bloomer010/Ling-3.0-flash-GGUF",
@@ -798,11 +790,11 @@ static const real_repo real_repos[] = {
       {"Ling-3.0-flash-dspark-BF16.gguf"},
       {"Ling-3.0-flash-dspark-Q4_K_M.gguf"}},
      {
-      {"", "Ling-3.0-flash-Q4_K_M.gguf", 1, "", "", "", "", "Ling-3.0-flash-dspark-Q4_K_M.gguf"},
-      {"Q4_K_M", "Ling-3.0-flash-Q4_K_M.gguf", 1, "", "", "", "", "Ling-3.0-flash-dspark-Q4_K_M.gguf"},
-      {"Q8_0", "Ling-3.0-flash-Q8_0.gguf", 1, "", "", "", "", "Ling-3.0-flash-dspark-Q4_K_M.gguf"},
-      {"BF16", "Ling-3.0-flash-BF16.gguf", 1, "", "", "", "", "Ling-3.0-flash-dspark-BF16.gguf"},
-      {"UD-Q8_K_XL", "Ling-3.0-flash-UD-Q8_K_XL.gguf", 1, "", "", "", "", "Ling-3.0-flash-dspark-Q4_K_M.gguf"}},
+      {"", "Ling-3.0-flash-Q4_K_M.gguf", 1, "", "", "Ling-3.0-flash-dspark-Q4_K_M.gguf"},
+      {"Q4_K_M", "Ling-3.0-flash-Q4_K_M.gguf", 1, "", "", "Ling-3.0-flash-dspark-Q4_K_M.gguf"},
+      {"Q8_0", "Ling-3.0-flash-Q8_0.gguf", 1, "", "", "Ling-3.0-flash-dspark-Q4_K_M.gguf"},
+      {"BF16", "Ling-3.0-flash-BF16.gguf", 1, "", "", "Ling-3.0-flash-dspark-BF16.gguf"},
+      {"UD-Q8_K_XL", "Ling-3.0-flash-UD-Q8_K_XL.gguf", 1, "", "", "Ling-3.0-flash-dspark-Q4_K_M.gguf"}},
      {"Q8_K_XL", "Q8_0", "Q4_K_S", "Q4_K_M", "BF16"}},
 
     {"BnhHo/Qwen3.8-27B-Uncensored-GGUF",
@@ -818,12 +810,12 @@ static const real_repo real_repos[] = {
       {"Qwen3.8-27B-Uncensored-noMTP-Q8_0.gguf"},
       {"mmproj-Qwen3.8-27B-Uncensored-F16.gguf"}},
      {
-      {"", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.8-27B-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"IQ2_M", "Qwen3.8-27B-Uncensored-IQ2_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"Q4_0", "Qwen3.8-27B-Uncensored-draft-Q4_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"Q8_0", "Qwen3.8-27B-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"IQ2_M", "Qwen3.8-27B-Uncensored-IQ2_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"Q4_0", "Qwen3.8-27B-Uncensored-draft-Q4_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q5_K_M", "Q4_K_M", "IQ2_M", "Q4_0"}},
 
     {"bottlecapai/ThinkingCap-Qwen3.8-27B-GGUF",
@@ -834,11 +826,11 @@ static const real_repo real_repos[] = {
       {"ThinkingCap-Qwen3.8-27B-f16.gguf"},
       {"mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf"}},
      {
-      {"", "ThinkingCap-Qwen3.8-27B-Q4_K_M.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "ThinkingCap-Qwen3.8-27B-Q4_K_M.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", "", "", ""},
-      {"Q8_0", "ThinkingCap-Qwen3.8-27B-Q8_0.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", "", "", ""},
-      {"IQ4_XS", "ThinkingCap-Qwen3.8-27B-IQ4_XS.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", "", "", ""},
-      {"F16", "ThinkingCap-Qwen3.8-27B-f16.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", "", "", ""}},
+      {"", "ThinkingCap-Qwen3.8-27B-Q4_K_M.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", ""},
+      {"Q4_K_M", "ThinkingCap-Qwen3.8-27B-Q4_K_M.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", ""},
+      {"Q8_0", "ThinkingCap-Qwen3.8-27B-Q8_0.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", ""},
+      {"IQ4_XS", "ThinkingCap-Qwen3.8-27B-IQ4_XS.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", ""},
+      {"F16", "ThinkingCap-Qwen3.8-27B-f16.gguf", 1, "mmproj-ThinkingCap-Qwen3.8-27B-f16.gguf", "", ""}},
      {"F16", "Q8_0", "Q6_K", "Q4_K_M", "IQ4_XS"}},
 
     {"bytkim/Qwen3.8-27B-pi-GGUF",
@@ -853,11 +845,11 @@ static const real_repo real_repos[] = {
       {"mtp/mtp-Qwen3.8-27B-pi-Q4_0.gguf"},
       {"mtp/mtp-Qwen3.8-27B-pi-Q8_0.gguf"}},
      {
-      {"", "Qwen3.8-27B-pi-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-pi-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.8-27B-pi-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-pi-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.8-27B-pi-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-pi-BF16.gguf", "", "", "", ""},
-      {"BF16", "Qwen3.8-27B-pi-BF16.gguf", 1, "mmproj-Qwen3.8-27B-pi-BF16.gguf", "", "", "", ""},
-      {"Q4_0", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.8-27B-pi-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-pi-BF16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.8-27B-pi-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-pi-BF16.gguf", "", ""},
+      {"Q8_0", "Qwen3.8-27B-pi-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-pi-BF16.gguf", "", ""},
+      {"BF16", "Qwen3.8-27B-pi-BF16.gguf", 1, "mmproj-Qwen3.8-27B-pi-BF16.gguf", "", ""},
+      {"Q4_0", "", 0, "", "", ""}},
      {"Q8_0", "Q4_K_M", "Q3_K_M", "BF16"}},
 
     {"CaptainArni/audio.cpp-gguf",
@@ -865,18 +857,18 @@ static const real_repo real_repos[] = {
       {"ACE-Step1.5-GGUF/xl-turbo-q8dit/ace-step-1.5-xl-turbo-q8dit.gguf"},
       {"ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf"}},
      {
-      {"", "ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf", 1, "", "", "", "", ""},
-      {"Q8DIT", "ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf", 1, "", "", "", "", ""},
-      {"BF16", "ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf", 1, "", "", "", "", ""}},
+      {"", "ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf", 1, "", "", ""},
+      {"Q8DIT", "ACE-Step1.5-GGUF/xl-sft-q8dit/ace-step-1.5-xl-sft-q8dit.gguf", 1, "", "", ""},
+      {"BF16", "ACE-Step1.5-GGUF/xl-turbo/ace-step-1.5-xl-turbo-bf16.gguf", 1, "", "", ""}},
      {"BF16", "Q8DIT"}},
 
     {"cesarsal1nas/Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-Q4_K_M-GGUF",
      {{"Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-Q4_K_M.gguf"},
       {"Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-mmproj-F16.gguf"}},
      {
-      {"", "Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-Q4_K_M.gguf", 1, "Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-mmproj-F16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-Q4_K_M.gguf", 1, "Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-mmproj-F16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-Q4_K_M.gguf", 1, "Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-mmproj-F16.gguf", "", ""},
+      {"Q4_K_M", "Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-Q4_K_M.gguf", 1, "Huihui-Qwen3.5-35B-A3B-Claude-4.6-Opus-abliterated-mmproj-F16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q4_K_M"}},
 
     {"chimingw/Qwen3.8-27B-Uncensored-OrcaRouter-GGUF",
@@ -888,12 +880,12 @@ static const real_repo real_repos[] = {
       {"Qwen3.8-27B-Uncensored-OrcaRouter-Q5_K_M.gguf"},
       {"Qwen3.8-27B-Uncensored-OrcaRouter-Q8_0.gguf"}},
      {
-      {"", "Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "MTP/Qwen3.8-27B-Uncensored-OrcaRouter-MTP-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "BF16/Qwen3.8-27B-Uncensored-OrcaRouter-FP8-derived-BF16-00001-of-00002.gguf", 2, "", "", "", "", ""},
-      {"Q5_K_M", "Qwen3.8-27B-Uncensored-OrcaRouter-Q5_K_M.gguf", 1, "", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "MTP/Qwen3.8-27B-Uncensored-OrcaRouter-MTP-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "BF16/Qwen3.8-27B-Uncensored-OrcaRouter-FP8-derived-BF16-00001-of-00002.gguf", 2, "", "", ""},
+      {"Q5_K_M", "Qwen3.8-27B-Uncensored-OrcaRouter-Q5_K_M.gguf", 1, "", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q5_K_M", "Q4_K_M", "BF16"}},
 
     {"ChrisColeTech/qwen-image-edit-uncensored-GGUF",
@@ -901,10 +893,10 @@ static const real_repo real_repos[] = {
       {"split/diffusion_models/qwen-image-edit-2511-uncensored-Q8_0.gguf"},
       {"split/text_encoders/Qwen2.5-VL-7B-Instruct-q4_0.gguf"}},
      {
-      {"", "split/diffusion_models/qwen-image-edit-2511-uncensored-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "split/diffusion_models/qwen-image-edit-2511-uncensored-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "split/diffusion_models/qwen-image-edit-2511-uncensored-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q4_0", "split/text_encoders/Qwen2.5-VL-7B-Instruct-q4_0.gguf", 1, "", "", "", "", ""}},
+      {"", "split/diffusion_models/qwen-image-edit-2511-uncensored-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "split/diffusion_models/qwen-image-edit-2511-uncensored-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "split/diffusion_models/qwen-image-edit-2511-uncensored-Q8_0.gguf", 1, "", "", ""},
+      {"Q4_0", "split/text_encoders/Qwen2.5-VL-7B-Instruct-q4_0.gguf", 1, "", "", ""}},
      {"Q4_0", "Q8_0", "Q4_K_M"}},
 
     {"city96/FLUX.1-dev-gguf",
@@ -912,9 +904,9 @@ static const real_repo real_repos[] = {
       {"flux1-dev-Q4_K_S.gguf"},
       {"flux1-dev-Q8_0.gguf"}},
      {
-      {"", "flux1-dev-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "flux1-dev-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "flux1-dev-F16.gguf", 1, "", "", "", "", ""}},
+      {"", "flux1-dev-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "flux1-dev-Q8_0.gguf", 1, "", "", ""},
+      {"F16", "flux1-dev-F16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_S", "F16"}},
 
     {"culturerevolt/gemma-4-12b-heretic-abliterated-GGUF",
@@ -924,18 +916,18 @@ static const real_repo real_repos[] = {
       {"gemma-4-12b-heretic-abliterated-Q8_0.gguf"},
       {"gemma-4-12b-heretic-mmproj-f16.gguf"}},
      {
-      {"", "gemma-4-12b-heretic-Q4_K_M.gguf", 1, "gemma-4-12b-heretic-mmproj-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "gemma-4-12b-heretic-Q4_K_M.gguf", 1, "gemma-4-12b-heretic-mmproj-f16.gguf", "", "", "", ""},
-      {"Q8_0", "gemma-4-12b-heretic-abliterated-Q8_0.gguf", 1, "gemma-4-12b-heretic-mmproj-f16.gguf", "", "", "", ""},
-      {"IQ3_XS", "gemma-4-12b-heretic-IQ3_XS.gguf", 1, "gemma-4-12b-heretic-mmproj-f16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "gemma-4-12b-heretic-Q4_K_M.gguf", 1, "gemma-4-12b-heretic-mmproj-f16.gguf", "", ""},
+      {"Q4_K_M", "gemma-4-12b-heretic-Q4_K_M.gguf", 1, "gemma-4-12b-heretic-mmproj-f16.gguf", "", ""},
+      {"Q8_0", "gemma-4-12b-heretic-abliterated-Q8_0.gguf", 1, "gemma-4-12b-heretic-mmproj-f16.gguf", "", ""},
+      {"IQ3_XS", "gemma-4-12b-heretic-IQ3_XS.gguf", 1, "gemma-4-12b-heretic-mmproj-f16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q5_K_M", "Q4_K_M", "IQ3_XS"}},
 
     {"CypherTroopers/CPH-Community-7B",
      {{"cph-community-7b-q4_k_m.gguf"}},
      {
-      {"", "cph-community-7b-q4_k_m.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "cph-community-7b-q4_k_m.gguf", 1, "", "", "", "", ""}},
+      {"", "cph-community-7b-q4_k_m.gguf", 1, "", "", ""},
+      {"Q4_K_M", "cph-community-7b-q4_k_m.gguf", 1, "", "", ""}},
      {"Q4_K_M"}},
 
     {"DamRsn/muscriptor-gguf",
@@ -943,8 +935,8 @@ static const real_repo real_repos[] = {
       {"v1/muscriptor-medium-f16.gguf"},
       {"v1/muscriptor-small-f16.gguf"}},
      {
-      {"", "v1/muscriptor-large-f16.gguf", 1, "", "", "", "", ""},
-      {"F16", "v1/muscriptor-large-f16.gguf", 1, "", "", "", "", ""}},
+      {"", "v1/muscriptor-large-f16.gguf", 1, "", "", ""},
+      {"F16", "v1/muscriptor-large-f16.gguf", 1, "", "", ""}},
      {"F16"}},
 
     {"DavidAU/LFM2.5-2.6B-Qwen3.8-Turbo-Brilliance-Power-X12-NEO-MAX-GGUF",
@@ -954,9 +946,9 @@ static const real_repo real_repos[] = {
       {"LFM2.5-2.6B-Q3.8-TBrilliance-NEO-Q6_K.gguf"},
       {"LFM2.5-2.6B-Q3.8-TBrilliance-NEO-Q8_0.gguf"}},
      {
-      {"", "LFM2.5-2.6B-Q3.8-TBrilliance-NEO-MAX-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "LFM2.5-2.6B-Q3.8-TBrilliance-NEO-MAX-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "LFM2.5-2.6B-Q3.8-TBrilliance-BF16.gguf", 1, "", "", "", "", ""}},
+      {"", "LFM2.5-2.6B-Q3.8-TBrilliance-NEO-MAX-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "LFM2.5-2.6B-Q3.8-TBrilliance-NEO-MAX-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "LFM2.5-2.6B-Q3.8-TBrilliance-BF16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q6_K", "BF16"}},
 
     {"DavidAU/OpenAi-GPT-oss-20b-HERETIC-uncensored-NEO-Imatrix-gguf",
@@ -978,10 +970,10 @@ static const real_repo real_repos[] = {
       {"OpenAI-20B-NEOPlus-Uncensored-Q5_1.gguf"},
       {"OpenAI-20B-NEOPlus-Uncensored-Q8_0.gguf"}},
      {
-      {"", "OpenAI-20B-NEO-CODE-DI-Uncensored-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "OpenAI-20B-NEO-CODE-DI-Uncensored-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q5_1", "OpenAI-20B-NEO-CODE-DI-Uncensored-Q5_1.gguf", 1, "", "", "", "", ""},
-      {"IQ4_NL", "OpenAI-20B-NEO-CODEPlus-Uncensored-IQ4_NL.gguf", 1, "", "", "", "", ""}},
+      {"", "OpenAI-20B-NEO-CODE-DI-Uncensored-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "OpenAI-20B-NEO-CODE-DI-Uncensored-Q8_0.gguf", 1, "", "", ""},
+      {"Q5_1", "OpenAI-20B-NEO-CODE-DI-Uncensored-Q5_1.gguf", 1, "", "", ""},
+      {"IQ4_NL", "OpenAI-20B-NEO-CODEPlus-Uncensored-IQ4_NL.gguf", 1, "", "", ""}},
      {"Q8_0", "Q5_1", "IQ4_NL"}},
 
     {"DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF",
@@ -1000,12 +992,12 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-MTP-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-MTP-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-MTP-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"IQ2_M", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-plusIQ-NEO-MAX-MTP-bf16.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-MTP-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-MTP-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-MTP-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"IQ2_M", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-plusIQ-NEO-MAX-MTP-bf16.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "BF16", "Q4_K_S", "Q4_K_M", "IQ2_M"}},
 
     {"DavidAU/Qwen3.6-27B-Heretic-Uncensored-FINETUNE-NEO-CODE-Di-IMatrix-MAX-GGUF",
@@ -1016,18 +1008,18 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-HIGH-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q6_K", "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q6_K.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-HIGH-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q6_K", "Qwen3.6-27B-NEO-CODE-HERE-2T-OT-Q6_K.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q6_K", "Q4_K_M", "Q8_0"}},
 
     {"dcostenco/smollm2-360m-aac-watch",
      {{"smollm2-360m-aac-q3ks.gguf"}},
      {
-      {"", "smollm2-360m-aac-q3ks.gguf", 1, "", "", "", "", ""},
-      {"Q3KS", "smollm2-360m-aac-q3ks.gguf", 1, "", "", "", "", ""}},
+      {"", "smollm2-360m-aac-q3ks.gguf", 1, "", "", ""},
+      {"Q3KS", "smollm2-360m-aac-q3ks.gguf", 1, "", "", ""}},
      {"Q3KS"}},
 
     {"DeepBeepMeep/LTX-2",
@@ -1035,23 +1027,23 @@ static const real_repo real_repos[] = {
       {"ltx-2.3-22b-distilled-Q6_K_light.gguf"},
       {"ltx-2.3-22b-distilled-Q8_0_light.gguf"}},
      {
-      {"", "ltx-2.3-22b-distilled-Q4_K_M_light.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M_LIGHT", "ltx-2.3-22b-distilled-Q4_K_M_light.gguf", 1, "", "", "", "", ""},
-      {"Q8_0_LIGHT", "ltx-2.3-22b-distilled-Q8_0_light.gguf", 1, "", "", "", "", ""}},
+      {"", "ltx-2.3-22b-distilled-Q4_K_M_light.gguf", 1, "", "", ""},
+      {"Q4_K_M_LIGHT", "ltx-2.3-22b-distilled-Q4_K_M_light.gguf", 1, "", "", ""},
+      {"Q8_0_LIGHT", "ltx-2.3-22b-distilled-Q8_0_light.gguf", 1, "", "", ""}},
      {"Q8_0_LIGHT", "Q6_K_LIGHT", "Q4_K_M_LIGHT"}},
 
     {"defog/sqlcoder-7b-2",
      {{"sqlcoder-7b-q5_k_m.gguf"}},
      {
-      {"", "sqlcoder-7b-q5_k_m.gguf", 1, "", "", "", "", ""},
-      {"Q5_K_M", "sqlcoder-7b-q5_k_m.gguf", 1, "", "", "", "", ""}},
+      {"", "sqlcoder-7b-q5_k_m.gguf", 1, "", "", ""},
+      {"Q5_K_M", "sqlcoder-7b-q5_k_m.gguf", 1, "", "", ""}},
      {"Q5_K_M"}},
 
     {"dgflash/FLUX.1-dev-4bit-gguf",
      {{"flux1-dev-Q4_K_S.gguf"}},
      {
-      {"", "flux1-dev-Q4_K_S.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_S", "flux1-dev-Q4_K_S.gguf", 1, "", "", "", "", ""}},
+      {"", "flux1-dev-Q4_K_S.gguf", 1, "", "", ""},
+      {"Q4_K_S", "flux1-dev-Q4_K_S.gguf", 1, "", "", ""}},
      {"Q4_K_S"}},
 
     {"empero-ai/Qwythos-27B-v1-GGUF",
@@ -1065,11 +1057,11 @@ static const real_repo real_repos[] = {
       {"Qwythos-27B-Q8_0.gguf"},
       {"mmproj-Qwythos-27B-F16.gguf"}},
      {
-      {"", "Qwythos-27B-MTP-Q4_K_M.gguf", 1, "mmproj-Qwythos-27B-F16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwythos-27B-MTP-Q4_K_M.gguf", 1, "mmproj-Qwythos-27B-F16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwythos-27B-MTP-Q8_0.gguf", 1, "mmproj-Qwythos-27B-F16.gguf", "", "", "", ""},
-      {"BF16", "Qwythos-27B-BF16.gguf", 1, "mmproj-Qwythos-27B-F16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwythos-27B-MTP-Q4_K_M.gguf", 1, "mmproj-Qwythos-27B-F16.gguf", "", ""},
+      {"Q4_K_M", "Qwythos-27B-MTP-Q4_K_M.gguf", 1, "mmproj-Qwythos-27B-F16.gguf", "", ""},
+      {"Q8_0", "Qwythos-27B-MTP-Q8_0.gguf", 1, "mmproj-Qwythos-27B-F16.gguf", "", ""},
+      {"BF16", "Qwythos-27B-BF16.gguf", 1, "mmproj-Qwythos-27B-F16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q5_K_M", "Q4_K_M", "BF16"}},
 
     {"empero-ai/Qwythos-9B-v2-GGUF",
@@ -1083,10 +1075,10 @@ static const real_repo real_repos[] = {
       {"Qwythos-9B-v2-Q8_0.gguf"},
       {"mmproj-Qwythos-9B-v2-BF16.gguf"}},
      {
-      {"", "Qwythos-9B-v2-MTP-Q4_K_M.gguf", 1, "mmproj-Qwythos-9B-v2-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwythos-9B-v2-MTP-Q4_K_M.gguf", 1, "mmproj-Qwythos-9B-v2-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwythos-9B-v2-MTP-Q8_0.gguf", 1, "mmproj-Qwythos-9B-v2-BF16.gguf", "", "", "", ""},
-      {"BF16", "Qwythos-9B-v2-BF16.gguf", 1, "mmproj-Qwythos-9B-v2-BF16.gguf", "", "", "", ""}},
+      {"", "Qwythos-9B-v2-MTP-Q4_K_M.gguf", 1, "mmproj-Qwythos-9B-v2-BF16.gguf", "", ""},
+      {"Q4_K_M", "Qwythos-9B-v2-MTP-Q4_K_M.gguf", 1, "mmproj-Qwythos-9B-v2-BF16.gguf", "", ""},
+      {"Q8_0", "Qwythos-9B-v2-MTP-Q8_0.gguf", 1, "mmproj-Qwythos-9B-v2-BF16.gguf", "", ""},
+      {"BF16", "Qwythos-9B-v2-BF16.gguf", 1, "mmproj-Qwythos-9B-v2-BF16.gguf", "", ""}},
      {"Q8_0", "Q5_K_M", "Q4_K_M", "BF16"}},
 
     {"FINAL-Bench/POCKET-35B-GGUF",
@@ -1094,34 +1086,34 @@ static const real_repo real_repos[] = {
       {"POCKET-35B-Q3_K_M.gguf"},
       {"POCKET-35B-Q4_K_M.gguf"}},
      {
-      {"", "POCKET-35B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "POCKET-35B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"IQ1_M", "POCKET-35B-IQ1_M.gguf", 1, "", "", "", "", ""}},
+      {"", "POCKET-35B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "POCKET-35B-Q4_K_M.gguf", 1, "", "", ""},
+      {"IQ1_M", "POCKET-35B-IQ1_M.gguf", 1, "", "", ""}},
      {"Q4_K_M", "Q3_K_M", "IQ1_M"}},
 
     {"FINAL-Bench/POCKET-Darwin-180B-GGUF",
      {{"POCKET-Darwin-180B-UD-Q4_K_XL", 4}},
      {
-      {"", "POCKET-Darwin-180B-UD-Q4_K_XL-00001-of-00004.gguf", 4, "", "", "", "", ""},
-      {"UD-Q4_K_XL", "POCKET-Darwin-180B-UD-Q4_K_XL-00001-of-00004.gguf", 4, "", "", "", "", ""}},
+      {"", "POCKET-Darwin-180B-UD-Q4_K_XL-00001-of-00004.gguf", 4, "", "", ""},
+      {"UD-Q4_K_XL", "POCKET-Darwin-180B-UD-Q4_K_XL-00001-of-00004.gguf", 4, "", "", ""}},
      {"Q4_K_XL"}},
 
     {"FunAudioLLM/Fun-ASR-Nano-2512-GGUF",
      {{"fun-asr-nano-2512-f16.gguf"},
       {"fun-asr-nano-2512-q8_0.gguf"}},
      {
-      {"", "fun-asr-nano-2512-q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "fun-asr-nano-2512-q8_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "fun-asr-nano-2512-f16.gguf", 1, "", "", "", "", ""}},
+      {"", "fun-asr-nano-2512-q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "fun-asr-nano-2512-q8_0.gguf", 1, "", "", ""},
+      {"F16", "fun-asr-nano-2512-f16.gguf", 1, "", "", ""}},
      {"Q8_0", "F16"}},
 
     {"GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF",
      {{"Q4/GLM-5.3-Flash-Uncensored-GSQ-RCO-Q4.gguf"},
       {"Q8/GLM-5.3-Flash-Uncensored-Q8_0.gguf"}},
      {
-      {"", "Q8/GLM-5.3-Flash-Uncensored-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Q8/GLM-5.3-Flash-Uncensored-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q4", "Q4/GLM-5.3-Flash-Uncensored-GSQ-RCO-Q4.gguf", 1, "", "", "", "", ""}},
+      {"", "Q8/GLM-5.3-Flash-Uncensored-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "Q8/GLM-5.3-Flash-Uncensored-Q8_0.gguf", 1, "", "", ""},
+      {"Q4", "Q4/GLM-5.3-Flash-Uncensored-GSQ-RCO-Q4.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4"}},
 
     {"ggml-org/embeddinggemma-2-GGUF",
@@ -1130,9 +1122,9 @@ static const real_repo real_repos[] = {
       {"mmproj-embeddinggemma-2-BF16.gguf"},
       {"mmproj-embeddinggemma-2-Q8_0.gguf"}},
      {
-      {"", "embeddinggemma-2-Q8_0.gguf", 1, "mmproj-embeddinggemma-2-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "embeddinggemma-2-Q8_0.gguf", 1, "mmproj-embeddinggemma-2-Q8_0.gguf", "", "", "", ""},
-      {"BF16", "embeddinggemma-2-BF16.gguf", 1, "mmproj-embeddinggemma-2-BF16.gguf", "", "", "", ""}},
+      {"", "embeddinggemma-2-Q8_0.gguf", 1, "mmproj-embeddinggemma-2-Q8_0.gguf", "", ""},
+      {"Q8_0", "embeddinggemma-2-Q8_0.gguf", 1, "mmproj-embeddinggemma-2-Q8_0.gguf", "", ""},
+      {"BF16", "embeddinggemma-2-BF16.gguf", 1, "mmproj-embeddinggemma-2-BF16.gguf", "", ""}},
      {"Q8_0", "BF16"}},
 
     {"ggml-org/gemma-3-4b-it-GGUF",
@@ -1141,10 +1133,10 @@ static const real_repo real_repos[] = {
       {"gemma-3-4b-it-f16.gguf"},
       {"mmproj-model-f16.gguf"}},
      {
-      {"", "gemma-3-4b-it-Q4_K_M.gguf", 1, "mmproj-model-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "gemma-3-4b-it-Q4_K_M.gguf", 1, "mmproj-model-f16.gguf", "", "", "", ""},
-      {"Q8_0", "gemma-3-4b-it-Q8_0.gguf", 1, "mmproj-model-f16.gguf", "", "", "", ""},
-      {"F16", "gemma-3-4b-it-f16.gguf", 1, "mmproj-model-f16.gguf", "", "", "", ""}},
+      {"", "gemma-3-4b-it-Q4_K_M.gguf", 1, "mmproj-model-f16.gguf", "", ""},
+      {"Q4_K_M", "gemma-3-4b-it-Q4_K_M.gguf", 1, "mmproj-model-f16.gguf", "", ""},
+      {"Q8_0", "gemma-3-4b-it-Q8_0.gguf", 1, "mmproj-model-f16.gguf", "", ""},
+      {"F16", "gemma-3-4b-it-f16.gguf", 1, "mmproj-model-f16.gguf", "", ""}},
      {"F16", "Q8_0", "Q4_K_M"}},
 
     {"ggml-org/gemma-4-12B-it-GGUF",
@@ -1157,9 +1149,9 @@ static const real_repo real_repos[] = {
       {"mtp-gemma-4-12B-it-Q4_0.gguf"},
       {"mtp-gemma-4-12B-it-Q8_0.gguf"}},
      {
-      {"", "gemma-4-12B-it-Q8_0.gguf", 1, "mmproj-gemma-4-12B-it-Q8_0.gguf", "mtp-gemma-4-12B-it-Q8_0.gguf", "", "", ""},
-      {"Q8_0", "gemma-4-12B-it-Q8_0.gguf", 1, "mmproj-gemma-4-12B-it-Q8_0.gguf", "mtp-gemma-4-12B-it-Q8_0.gguf", "", "", ""},
-      {"BF16", "gemma-4-12B-it-BF16.gguf", 1, "mmproj-gemma-4-12B-it-BF16.gguf", "mtp-gemma-4-12B-it-BF16.gguf", "", "", ""}},
+      {"", "gemma-4-12B-it-Q8_0.gguf", 1, "mmproj-gemma-4-12B-it-Q8_0.gguf", "", ""},
+      {"Q8_0", "gemma-4-12B-it-Q8_0.gguf", 1, "mmproj-gemma-4-12B-it-Q8_0.gguf", "", ""},
+      {"BF16", "gemma-4-12B-it-BF16.gguf", 1, "mmproj-gemma-4-12B-it-BF16.gguf", "", ""}},
      {"Q8_0", "Q4_0", "BF16"}},
 
     {"ggml-org/gemma-4-26B-A4B-it-GGUF",
@@ -1174,9 +1166,9 @@ static const real_repo real_repos[] = {
       {"mtp-gemma-4-26B-A4B-it-Q4_0.gguf"},
       {"mtp-gemma-4-26B-A4B-it-Q8_0.gguf"}},
      {
-      {"", "gemma-4-26B-A4B-it-Q8_0.gguf", 1, "mmproj-gemma-4-26B-A4B-it-Q8_0.gguf", "mtp-gemma-4-26B-A4B-it-Q8_0.gguf", "dflash-gemma-4-26B-A4B-it-Q8_0.gguf", "", ""},
-      {"Q8_0", "gemma-4-26B-A4B-it-Q8_0.gguf", 1, "mmproj-gemma-4-26B-A4B-it-Q8_0.gguf", "mtp-gemma-4-26B-A4B-it-Q8_0.gguf", "dflash-gemma-4-26B-A4B-it-Q8_0.gguf", "", ""},
-      {"BF16", "gemma-4-26B-A4B-it-BF16.gguf", 1, "mmproj-gemma-4-26B-A4B-it-BF16.gguf", "mtp-gemma-4-26B-A4B-it-BF16.gguf", "dflash-gemma-4-26B-A4B-it-BF16.gguf", "", ""}},
+      {"", "gemma-4-26B-A4B-it-Q8_0.gguf", 1, "mmproj-gemma-4-26B-A4B-it-Q8_0.gguf", "dflash-gemma-4-26B-A4B-it-Q8_0.gguf", ""},
+      {"Q8_0", "gemma-4-26B-A4B-it-Q8_0.gguf", 1, "mmproj-gemma-4-26B-A4B-it-Q8_0.gguf", "dflash-gemma-4-26B-A4B-it-Q8_0.gguf", ""},
+      {"BF16", "gemma-4-26B-A4B-it-BF16.gguf", 1, "mmproj-gemma-4-26B-A4B-it-BF16.gguf", "dflash-gemma-4-26B-A4B-it-BF16.gguf", ""}},
      {"Q8_0", "Q4_0", "BF16"}},
 
     {"ggml-org/gemma-4-E2B-it-GGUF",
@@ -1189,18 +1181,18 @@ static const real_repo real_repos[] = {
       {"mtp-gemma-4-E2B-it-Q4_0.gguf"},
       {"mtp-gemma-4-E2B-it-Q8_0.gguf"}},
      {
-      {"", "gemma-4-E2B-it-Q8_0.gguf", 1, "mmproj-gemma-4-E2B-it-Q8_0.gguf", "mtp-gemma-4-E2B-it-Q8_0.gguf", "", "", ""},
-      {"Q8_0", "gemma-4-E2B-it-Q8_0.gguf", 1, "mmproj-gemma-4-E2B-it-Q8_0.gguf", "mtp-gemma-4-E2B-it-Q8_0.gguf", "", "", ""},
-      {"BF16", "gemma-4-E2B-it-BF16.gguf", 1, "mmproj-gemma-4-E2B-it-BF16.gguf", "mtp-gemma-4-E2B-it-BF16.gguf", "", "", ""}},
+      {"", "gemma-4-E2B-it-Q8_0.gguf", 1, "mmproj-gemma-4-E2B-it-Q8_0.gguf", "", ""},
+      {"Q8_0", "gemma-4-E2B-it-Q8_0.gguf", 1, "mmproj-gemma-4-E2B-it-Q8_0.gguf", "", ""},
+      {"BF16", "gemma-4-E2B-it-BF16.gguf", 1, "mmproj-gemma-4-E2B-it-BF16.gguf", "", ""}},
      {"Q8_0", "Q4_0", "BF16"}},
 
     {"ggml-org/GLM-4.7-Flash-GGUF",
      {{"GLM-4.7-Flash-Q4_K.gguf"},
       {"GLM-4.7-Flash-Q8_0.gguf"}},
      {
-      {"", "GLM-4.7-Flash-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "GLM-4.7-Flash-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q4_K", "GLM-4.7-Flash-Q4_K.gguf", 1, "", "", "", "", ""}},
+      {"", "GLM-4.7-Flash-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "GLM-4.7-Flash-Q8_0.gguf", 1, "", "", ""},
+      {"Q4_K", "GLM-4.7-Flash-Q4_K.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K"}},
 
     {"ggml-org/GLM-OCR-GGUF",
@@ -1208,9 +1200,9 @@ static const real_repo real_repos[] = {
       {"GLM-OCR-f16.gguf"},
       {"mmproj-GLM-OCR-Q8_0.gguf"}},
      {
-      {"", "GLM-OCR-Q8_0.gguf", 1, "mmproj-GLM-OCR-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "GLM-OCR-Q8_0.gguf", 1, "mmproj-GLM-OCR-Q8_0.gguf", "", "", "", ""},
-      {"F16", "GLM-OCR-f16.gguf", 1, "mmproj-GLM-OCR-Q8_0.gguf", "", "", "", ""}},
+      {"", "GLM-OCR-Q8_0.gguf", 1, "mmproj-GLM-OCR-Q8_0.gguf", "", ""},
+      {"Q8_0", "GLM-OCR-Q8_0.gguf", 1, "mmproj-GLM-OCR-Q8_0.gguf", "", ""},
+      {"F16", "GLM-OCR-f16.gguf", 1, "mmproj-GLM-OCR-Q8_0.gguf", "", ""}},
      {"F16", "Q8_0"}},
 
     {"ggml-org/gpt-oss-120b-GGUF",
@@ -1218,10 +1210,10 @@ static const real_repo real_repos[] = {
       {"eagle3-gpt-oss-120b-Q8_0.gguf"},
       {"gpt-oss-120b-MXFP4.gguf"}},
      {
-      {"", "gpt-oss-120b-MXFP4.gguf", 1, "", "", "", "eagle3-gpt-oss-120b-Q8_0.gguf", ""},
-      {"Q8_0", "", 0, "", "", "", "eagle3-gpt-oss-120b-Q8_0.gguf", ""},
-      {"MXFP4", "gpt-oss-120b-MXFP4.gguf", 1, "", "", "", "eagle3-gpt-oss-120b-Q8_0.gguf", ""},
-      {"BF16", "", 0, "", "", "", "eagle3-gpt-oss-120b-BF16.gguf", ""}},
+      {"", "gpt-oss-120b-MXFP4.gguf", 1, "", "", ""},
+      {"Q8_0", "", 0, "", "", ""},
+      {"MXFP4", "gpt-oss-120b-MXFP4.gguf", 1, "", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"MXFP4"}},
 
     // F16 and BF16 in one repo, the F16 tag must not pick the BF16 file
@@ -1231,19 +1223,19 @@ static const real_repo real_repos[] = {
       {"Llama-2-7B-Q4_0.gguf"},
       {"Llama-2-7B-Q8_0.gguf"}},
      {
-      {"", "Llama-2-7B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Llama-2-7B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q4_0", "Llama-2-7B-Q4_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "Llama-2-7B-F16.gguf", 1, "", "", "", "", ""},
-      {"BF16", "Llama-2-7B-BF16.gguf", 1, "", "", "", "", ""}},
+      {"", "Llama-2-7B-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "Llama-2-7B-Q8_0.gguf", 1, "", "", ""},
+      {"Q4_0", "Llama-2-7B-Q4_0.gguf", 1, "", "", ""},
+      {"F16", "Llama-2-7B-F16.gguf", 1, "", "", ""},
+      {"BF16", "Llama-2-7B-BF16.gguf", 1, "", "", ""}},
      {"F16", "Q4_0", "Q8_0", "BF16"}},
 
     {"ggml-org/MiMo-V2.6-Distill-Qwen-9B-GGUF",
      {{"MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf"},
       {"mmproj-MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf"}},
      {
-      {"", "MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", 1, "mmproj-MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", 1, "mmproj-MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", "", "", "", ""}},
+      {"", "MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", 1, "mmproj-MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", "", ""},
+      {"Q8_0", "MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", 1, "mmproj-MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", "", ""}},
      {"Q8_0"}},
 
     {"ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
@@ -1254,9 +1246,9 @@ static const real_repo real_repos[] = {
       {"mtp-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"},
       {"mtp-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf"}},
      {
-      {"", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", 1, "", "mtp-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", "", "", ""},
-      {"Q8_0", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", 1, "", "mtp-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", "", "", ""},
-      {"BF16", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16.gguf", 1, "", "mtp-NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16.gguf", "", "", ""}},
+      {"", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_0", "BF16"}},
 
     {"ggml-org/Qwen2.5-Omni-3B-GGUF",
@@ -1266,10 +1258,10 @@ static const real_repo real_repos[] = {
       {"mmproj-Qwen2.5-Omni-3B-Q8_0.gguf"},
       {"mmproj-Qwen2.5-Omni-3B-f16.gguf"}},
      {
-      {"", "Qwen2.5-Omni-3B-Q4_K_M.gguf", 1, "mmproj-Qwen2.5-Omni-3B-Q8_0.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen2.5-Omni-3B-Q4_K_M.gguf", 1, "mmproj-Qwen2.5-Omni-3B-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen2.5-Omni-3B-Q8_0.gguf", 1, "mmproj-Qwen2.5-Omni-3B-Q8_0.gguf", "", "", "", ""},
-      {"F16", "Qwen2.5-Omni-3B-f16.gguf", 1, "mmproj-Qwen2.5-Omni-3B-f16.gguf", "", "", "", ""}},
+      {"", "Qwen2.5-Omni-3B-Q4_K_M.gguf", 1, "mmproj-Qwen2.5-Omni-3B-Q8_0.gguf", "", ""},
+      {"Q4_K_M", "Qwen2.5-Omni-3B-Q4_K_M.gguf", 1, "mmproj-Qwen2.5-Omni-3B-Q8_0.gguf", "", ""},
+      {"Q8_0", "Qwen2.5-Omni-3B-Q8_0.gguf", 1, "mmproj-Qwen2.5-Omni-3B-Q8_0.gguf", "", ""},
+      {"F16", "Qwen2.5-Omni-3B-f16.gguf", 1, "mmproj-Qwen2.5-Omni-3B-f16.gguf", "", ""}},
      {"F16", "Q8_0", "Q4_K_M"}},
 
     {"ggml-org/Qwen2.5-VL-32B-Instruct-GGUF",
@@ -1279,10 +1271,10 @@ static const real_repo real_repos[] = {
       {"mmproj-Qwen2.5-VL-32B-Instruct-Q8_0.gguf"},
       {"mmproj-Qwen2.5-VL-32B-Instruct-f16.gguf"}},
      {
-      {"", "Qwen2.5-VL-32B-Instruct-Q4_K_M.gguf", 1, "mmproj-Qwen2.5-VL-32B-Instruct-Q8_0.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen2.5-VL-32B-Instruct-Q4_K_M.gguf", 1, "mmproj-Qwen2.5-VL-32B-Instruct-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen2.5-VL-32B-Instruct-Q8_0.gguf", 1, "mmproj-Qwen2.5-VL-32B-Instruct-Q8_0.gguf", "", "", "", ""},
-      {"F16", "Qwen2.5-VL-32B-Instruct-f16-00001-of-00002.gguf", 2, "mmproj-Qwen2.5-VL-32B-Instruct-f16.gguf", "", "", "", ""}},
+      {"", "Qwen2.5-VL-32B-Instruct-Q4_K_M.gguf", 1, "mmproj-Qwen2.5-VL-32B-Instruct-Q8_0.gguf", "", ""},
+      {"Q4_K_M", "Qwen2.5-VL-32B-Instruct-Q4_K_M.gguf", 1, "mmproj-Qwen2.5-VL-32B-Instruct-Q8_0.gguf", "", ""},
+      {"Q8_0", "Qwen2.5-VL-32B-Instruct-Q8_0.gguf", 1, "mmproj-Qwen2.5-VL-32B-Instruct-Q8_0.gguf", "", ""},
+      {"F16", "Qwen2.5-VL-32B-Instruct-f16-00001-of-00002.gguf", 2, "mmproj-Qwen2.5-VL-32B-Instruct-f16.gguf", "", ""}},
      {"F16", "Q8_0", "Q4_K_M"}},
 
     {"ggml-org/Qwen3-1.7B-GGUF",
@@ -1290,10 +1282,10 @@ static const real_repo real_repos[] = {
       {"Qwen3-1.7B-Q8_0.gguf"},
       {"Qwen3-1.7B-f16.gguf"}},
      {
-      {"", "Qwen3-1.7B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Qwen3-1.7B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Qwen3-1.7B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "Qwen3-1.7B-f16.gguf", 1, "", "", "", "", ""}},
+      {"", "Qwen3-1.7B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Qwen3-1.7B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Qwen3-1.7B-Q8_0.gguf", 1, "", "", ""},
+      {"F16", "Qwen3-1.7B-f16.gguf", 1, "", "", ""}},
      {"F16", "Q8_0", "Q4_K_M"}},
 
     {"ggml-org/Qwen3-ASR-1.7B-GGUF",
@@ -1302,9 +1294,9 @@ static const real_repo real_repos[] = {
       {"mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"},
       {"mmproj-Qwen3-ASR-1.7B-bf16.gguf"}},
      {
-      {"", "Qwen3-ASR-1.7B-Q8_0.gguf", 1, "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3-ASR-1.7B-Q8_0.gguf", 1, "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf", "", "", "", ""},
-      {"BF16", "Qwen3-ASR-1.7B-bf16.gguf", 1, "mmproj-Qwen3-ASR-1.7B-bf16.gguf", "", "", "", ""}},
+      {"", "Qwen3-ASR-1.7B-Q8_0.gguf", 1, "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf", "", ""},
+      {"Q8_0", "Qwen3-ASR-1.7B-Q8_0.gguf", 1, "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf", "", ""},
+      {"BF16", "Qwen3-ASR-1.7B-bf16.gguf", 1, "mmproj-Qwen3-ASR-1.7B-bf16.gguf", "", ""}},
      {"BF16", "Q8_0"}},
 
     {"ggml-org/Qwen3.6-27B-GGUF",
@@ -1319,11 +1311,11 @@ static const real_repo real_repos[] = {
       {"mtp-Qwen3.6-27B-Q4_0.gguf"},
       {"mtp-Qwen3.6-27B-Q8_0.gguf"}},
      {
-      {"", "Qwen3.6-27B-Q4_K_M.gguf", 1, "mmproj-Qwen3.6-27B-Q8_0.gguf", "mtp-Qwen3.6-27B-Q4_0.gguf", "dflash-Qwen3.6-27B-Q8_0.gguf", "", ""},
-      {"Q4_K_M", "Qwen3.6-27B-Q4_K_M.gguf", 1, "mmproj-Qwen3.6-27B-Q8_0.gguf", "mtp-Qwen3.6-27B-Q4_0.gguf", "dflash-Qwen3.6-27B-Q8_0.gguf", "", ""},
-      {"Q8_0", "Qwen3.6-27B-Q8_0.gguf", 1, "mmproj-Qwen3.6-27B-Q8_0.gguf", "mtp-Qwen3.6-27B-Q8_0.gguf", "dflash-Qwen3.6-27B-Q8_0.gguf", "", ""},
-      {"BF16", "Qwen3.6-27B-BF16.gguf", 1, "mmproj-Qwen3.6-27B-BF16.gguf", "mtp-Qwen3.6-27B-BF16.gguf", "dflash-Qwen3.6-27B-BF16.gguf", "", ""},
-      {"Q4_0", "", 0, "", "mtp-Qwen3.6-27B-Q4_0.gguf", "dflash-Qwen3.6-27B-Q8_0.gguf", "", ""}},
+      {"", "Qwen3.6-27B-Q4_K_M.gguf", 1, "mmproj-Qwen3.6-27B-Q8_0.gguf", "dflash-Qwen3.6-27B-Q8_0.gguf", ""},
+      {"Q4_K_M", "Qwen3.6-27B-Q4_K_M.gguf", 1, "mmproj-Qwen3.6-27B-Q8_0.gguf", "dflash-Qwen3.6-27B-Q8_0.gguf", ""},
+      {"Q8_0", "Qwen3.6-27B-Q8_0.gguf", 1, "mmproj-Qwen3.6-27B-Q8_0.gguf", "dflash-Qwen3.6-27B-Q8_0.gguf", ""},
+      {"BF16", "Qwen3.6-27B-BF16.gguf", 1, "mmproj-Qwen3.6-27B-BF16.gguf", "dflash-Qwen3.6-27B-BF16.gguf", ""},
+      {"Q4_0", "", 0, "", "dflash-Qwen3.6-27B-Q8_0.gguf", ""}},
      {"Q8_0", "Q4_K_M", "BF16"}},
 
     {"ggml-org/Qwen3.8-27B-GGUF",
@@ -1339,11 +1331,11 @@ static const real_repo real_repos[] = {
       {"mtp-Qwen3.8-27B-Q4_0.gguf"},
       {"mtp-Qwen3.8-27B-Q8_0.gguf"}},
      {
-      {"", "Qwen3.8-27B-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Q8_0.gguf", "mtp-Qwen3.8-27B-Q4_0.gguf", "dflash-Qwen3.8-27B-Q4_0.gguf", "", ""},
-      {"Q4_K_M", "Qwen3.8-27B-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Q8_0.gguf", "mtp-Qwen3.8-27B-Q4_0.gguf", "dflash-Qwen3.8-27B-Q4_0.gguf", "", ""},
-      {"Q8_0", "Qwen3.8-27B-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Q8_0.gguf", "mtp-Qwen3.8-27B-Q8_0.gguf", "dflash-Qwen3.8-27B-Q8_0.gguf", "", ""},
-      {"BF16", "Qwen3.8-27B-BF16.gguf", 1, "mmproj-Qwen3.8-27B-BF16.gguf", "mtp-Qwen3.8-27B-BF16.gguf", "dflash-Qwen3.8-27B-BF16.gguf", "", ""},
-      {"Q4_0", "", 0, "", "mtp-Qwen3.8-27B-Q4_0.gguf", "dflash-Qwen3.8-27B-Q4_0.gguf", "", ""}},
+      {"", "Qwen3.8-27B-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Q8_0.gguf", "dflash-Qwen3.8-27B-Q4_0.gguf", ""},
+      {"Q4_K_M", "Qwen3.8-27B-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Q8_0.gguf", "dflash-Qwen3.8-27B-Q4_0.gguf", ""},
+      {"Q8_0", "Qwen3.8-27B-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Q8_0.gguf", "dflash-Qwen3.8-27B-Q8_0.gguf", ""},
+      {"BF16", "Qwen3.8-27B-BF16.gguf", 1, "mmproj-Qwen3.8-27B-BF16.gguf", "dflash-Qwen3.8-27B-BF16.gguf", ""},
+      {"Q4_0", "", 0, "", "dflash-Qwen3.8-27B-Q4_0.gguf", ""}},
      {"Q8_0", "Q4_K_M", "BF16"}},
 
     {"ggml-org/Qwen3.8-Flash-Next-GGUF",
@@ -1355,10 +1347,10 @@ static const real_repo real_repos[] = {
       {"mtp-Qwen3.8-Flash-Next-Q4_0.gguf"},
       {"mtp-Qwen3.8-Flash-Next-Q8_0.gguf"}},
      {
-      {"", "Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-Q8_0.gguf", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""},
-      {"Q8_0", "Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-Q8_0.gguf", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""},
-      {"IQ4_NL", "Qwen3.8-Flash-Next-IQ4_NL-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-Q8_0.gguf", "mtp-Qwen3.8-Flash-Next-Q4_0.gguf", "", "", ""},
-      {"BF16", "", 0, "", "mtp-Qwen3.8-Flash-Next-BF16.gguf", "", "", ""}},
+      {"", "Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-Q8_0.gguf", "", ""},
+      {"Q8_0", "Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-Q8_0.gguf", "", ""},
+      {"IQ4_NL", "Qwen3.8-Flash-Next-IQ4_NL-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-Q8_0.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q8_0", "Q2_K", "IQ4_NL"}},
 
     {"ggml-org/SmolVLM-500M-Instruct-GGUF",
@@ -1367,33 +1359,33 @@ static const real_repo real_repos[] = {
       {"mmproj-SmolVLM-500M-Instruct-Q8_0.gguf"},
       {"mmproj-SmolVLM-500M-Instruct-f16.gguf"}},
      {
-      {"", "SmolVLM-500M-Instruct-Q8_0.gguf", 1, "mmproj-SmolVLM-500M-Instruct-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "SmolVLM-500M-Instruct-Q8_0.gguf", 1, "mmproj-SmolVLM-500M-Instruct-Q8_0.gguf", "", "", "", ""},
-      {"F16", "SmolVLM-500M-Instruct-f16.gguf", 1, "mmproj-SmolVLM-500M-Instruct-f16.gguf", "", "", "", ""}},
+      {"", "SmolVLM-500M-Instruct-Q8_0.gguf", 1, "mmproj-SmolVLM-500M-Instruct-Q8_0.gguf", "", ""},
+      {"Q8_0", "SmolVLM-500M-Instruct-Q8_0.gguf", 1, "mmproj-SmolVLM-500M-Instruct-Q8_0.gguf", "", ""},
+      {"F16", "SmolVLM-500M-Instruct-f16.gguf", 1, "mmproj-SmolVLM-500M-Instruct-f16.gguf", "", ""}},
      {"F16", "Q8_0"}},
 
     {"ggml-org/test-model-stories260K",
      {{"stories260K-f32.gguf"}},
      {
-      {"", "stories260K-f32.gguf", 1, "", "", "", "", ""},
-      {"F32", "stories260K-f32.gguf", 1, "", "", "", "", ""}},
+      {"", "stories260K-f32.gguf", 1, "", "", ""},
+      {"F32", "stories260K-f32.gguf", 1, "", "", ""}},
      {"F32"}},
 
     {"GnLOLot/MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-GGUF",
      {{"MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-F16.gguf"},
       {"MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-Q8_0.gguf"}},
      {
-      {"", "MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-F16.gguf", 1, "", "", "", "", ""}},
+      {"", "MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-Q8_0.gguf", 1, "", "", ""},
+      {"F16", "MiniCPM5-1B-Claude-Opus-Fable5-V2-Thinking-F16.gguf", 1, "", "", ""}},
      {"Q8_0", "F16"}},
 
     {"google/gemma-4-12B-it-qat-q4_0-gguf",
      {{"gemma-4-12b-it-qat-q4_0.gguf"},
       {"mmproj-gemma-4-12b-it-qat-q4_0.gguf"}},
      {
-      {"", "gemma-4-12b-it-qat-q4_0.gguf", 1, "mmproj-gemma-4-12b-it-qat-q4_0.gguf", "", "", "", ""},
-      {"Q4_0", "gemma-4-12b-it-qat-q4_0.gguf", 1, "mmproj-gemma-4-12b-it-qat-q4_0.gguf", "", "", "", ""}},
+      {"", "gemma-4-12b-it-qat-q4_0.gguf", 1, "mmproj-gemma-4-12b-it-qat-q4_0.gguf", "", ""},
+      {"Q4_0", "gemma-4-12b-it-qat-q4_0.gguf", 1, "mmproj-gemma-4-12b-it-qat-q4_0.gguf", "", ""}},
      {"Q4_0"}},
 
     {"handy-computer/multitalker-parakeet-streaming-0.6b-v1-gguf",
@@ -1402,10 +1394,10 @@ static const real_repo real_repos[] = {
       {"bundle/multitalker-parakeet-streaming-0.6b-v1-Q5_K_M.gguf"},
       {"bundle/multitalker-parakeet-streaming-0.6b-v1-Q8_0.gguf"}},
      {
-      {"", "bundle/multitalker-parakeet-streaming-0.6b-v1-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "bundle/multitalker-parakeet-streaming-0.6b-v1-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "bundle/multitalker-parakeet-streaming-0.6b-v1-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "bundle/multitalker-parakeet-streaming-0.6b-v1-F16.gguf", 1, "", "", "", "", ""}},
+      {"", "bundle/multitalker-parakeet-streaming-0.6b-v1-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "bundle/multitalker-parakeet-streaming-0.6b-v1-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "bundle/multitalker-parakeet-streaming-0.6b-v1-Q8_0.gguf", 1, "", "", ""},
+      {"F16", "bundle/multitalker-parakeet-streaming-0.6b-v1-F16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q5_K_M", "Q4_K_M", "F16"}},
 
     {"HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive",
@@ -1414,10 +1406,10 @@ static const real_repo real_repos[] = {
       {"Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"},
       {"mmproj-Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-f16.gguf"}},
      {
-      {"", "Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-IQ3_M.gguf", 1, "mmproj-Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"IQ3_M", "Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-IQ3_M.gguf", 1, "mmproj-Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"Q8_K_P", "Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf", 1, "mmproj-Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-IQ3_M.gguf", 1, "mmproj-Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"IQ3_M", "Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-IQ3_M.gguf", 1, "mmproj-Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"Q8_K_P", "Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf", 1, "mmproj-Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_P", "Q4_K_P", "IQ3_M"}},
 
     {"HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive",
@@ -1426,18 +1418,18 @@ static const real_repo real_repos[] = {
       {"Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"},
       {"mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf"}},
      {
-      {"", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"IQ3_M", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-IQ3_M.gguf", 1, "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"Q8_K_P", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf", 1, "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"Q4_K_M", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"IQ3_M", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-IQ3_M.gguf", 1, "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"Q8_K_P", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf", 1, "mmproj-Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_P", "Q4_K_M", "IQ3_M"}},
 
     {"HauhauCS/GPTOSS-120B-Uncensored-HauhauCS-Aggressive",
      {{"GPTOSS-120B-Uncensored-HauhauCS-Aggressive-MXFP4.gguf"}},
      {
-      {"", "GPTOSS-120B-Uncensored-HauhauCS-Aggressive-MXFP4.gguf", 1, "", "", "", "", ""},
-      {"MXFP4", "GPTOSS-120B-Uncensored-HauhauCS-Aggressive-MXFP4.gguf", 1, "", "", "", "", ""}},
+      {"", "GPTOSS-120B-Uncensored-HauhauCS-Aggressive-MXFP4.gguf", 1, "", "", ""},
+      {"MXFP4", "GPTOSS-120B-Uncensored-HauhauCS-Aggressive-MXFP4.gguf", 1, "", "", ""}},
      {"MXFP4"}},
 
     {"HauhauCS/Qwen3.5-27B-Uncensored-HauhauCS-Aggressive",
@@ -1447,11 +1439,11 @@ static const real_repo real_repos[] = {
       {"Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf"},
       {"mmproj-Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-f16.gguf"}},
      {
-      {"", "Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf", 1, "mmproj-Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"BF16", "Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf", 1, "mmproj-Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"Q8_0", "Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf", 1, "mmproj-Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"BF16", "Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-BF16.gguf", 1, "mmproj-Qwen3.5-27B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q4_K_M", "Q3_K_M", "BF16"}},
 
     {"HauhauCS/Qwen3.5-2B-Uncensored-HauhauCS-Aggressive",
@@ -1461,11 +1453,11 @@ static const real_repo real_repos[] = {
       {"Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf"},
       {"mmproj-Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-f16.gguf"}},
      {
-      {"", "Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf", 1, "mmproj-Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"BF16", "Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-BF16.gguf", 1, "mmproj-Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"Q8_0", "Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf", 1, "mmproj-Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"BF16", "Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-BF16.gguf", 1, "mmproj-Qwen3.5-2B-Uncensored-HauhauCS-Aggressive-f16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q6_K", "Q4_K_M", "BF16"}},
 
     {"HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive",
@@ -1475,17 +1467,17 @@ static const real_repo real_repos[] = {
       {"Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf"},
       {"mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf"}},
      {
-      {"", "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf", 1, "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", "", "", "", ""},
-      {"BF16", "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", 1, "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", "", "", "", ""}},
+      {"", "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf", 1, "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", "", ""},
+      {"Q8_0", "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf", 1, "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", "", ""},
+      {"BF16", "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", 1, "mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf", "", ""}},
      {"Q8_0", "Q6_K", "Q4_K_M", "BF16"}},
 
     {"Hikari07jp/Ternary-Bonsai-27B-Abliterated-LowDeg-GGUF",
      {{"Ternary-Bonsai-27B-Abliterated-LowDeg-Q2_0.gguf"}},
      {
-      {"", "Ternary-Bonsai-27B-Abliterated-LowDeg-Q2_0.gguf", 1, "", "", "", "", ""},
-      {"Q2_0", "Ternary-Bonsai-27B-Abliterated-LowDeg-Q2_0.gguf", 1, "", "", "", "", ""}},
+      {"", "Ternary-Bonsai-27B-Abliterated-LowDeg-Q2_0.gguf", 1, "", "", ""},
+      {"Q2_0", "Ternary-Bonsai-27B-Abliterated-LowDeg-Q2_0.gguf", 1, "", "", ""}},
      {"Q2_0"}},
 
     {"Hob-forge/Kolibri-1-GGUF",
@@ -1494,10 +1486,10 @@ static const real_repo real_repos[] = {
       {"Q5_K_M/Kolibri-1-Q5_K_M", 2},
       {"Q8_0/Kolibri-1-Q8_0", 2}},
      {
-      {"", "Kolibri-1-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Kolibri-1-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Q8_0/Kolibri-1-Q8_0-00001-of-00002.gguf", 2, "", "", "", "", ""},
-      {"Q2_K", "Kolibri-1-Q2_K.gguf", 1, "", "", "", "", ""}},
+      {"", "Kolibri-1-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Kolibri-1-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Q8_0/Kolibri-1-Q8_0-00001-of-00002.gguf", 2, "", "", ""},
+      {"Q2_K", "Kolibri-1-Q2_K.gguf", 1, "", "", ""}},
      {"Q8_0", "Q5_K_M", "Q4_K_M", "Q2_K"}},
 
     {"huihui-ai/Huihui-Agents-A1-abliterated-GGUF",
@@ -1506,10 +1498,10 @@ static const real_repo real_repos[] = {
       {"Agents-A1-abliterated-bf16.gguf"},
       {"mmproj-model-bf16.gguf"}},
      {
-      {"", "Agents-A1-abliterated-Q8_0.gguf", 1, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"Q8_0", "Agents-A1-abliterated-Q8_0.gguf", 1, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"Q4_K", "Agents-A1-abliterated-Q4_K.gguf", 1, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"BF16", "Agents-A1-abliterated-bf16.gguf", 1, "mmproj-model-bf16.gguf", "", "", "", ""}},
+      {"", "Agents-A1-abliterated-Q8_0.gguf", 1, "mmproj-model-bf16.gguf", "", ""},
+      {"Q8_0", "Agents-A1-abliterated-Q8_0.gguf", 1, "mmproj-model-bf16.gguf", "", ""},
+      {"Q4_K", "Agents-A1-abliterated-Q4_K.gguf", 1, "mmproj-model-bf16.gguf", "", ""},
+      {"BF16", "Agents-A1-abliterated-bf16.gguf", 1, "mmproj-model-bf16.gguf", "", ""}},
      {"BF16", "Q8_0", "Q4_K"}},
 
     {"huihui-ai/Huihui-GLM-5.3-Flash-abliterated-GGUF",
@@ -1518,10 +1510,10 @@ static const real_repo real_repos[] = {
       {"UD-Q6_K_XL/GLM-5.3-Flash-UD-Q6_K_XL", 7},
       {"mmproj-model-bf16.gguf"}},
      {
-      {"", "UD-IQ1_M/GLM-5.3-Flash-UD-IQ1_M-00001-of-00003.gguf", 3, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"UD-IQ1_M", "UD-IQ1_M/GLM-5.3-Flash-UD-IQ1_M-00001-of-00003.gguf", 3, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"UD-Q6_K_XL", "UD-Q6_K_XL/GLM-5.3-Flash-UD-Q6_K_XL-00001-of-00007.gguf", 7, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "UD-IQ1_M/GLM-5.3-Flash-UD-IQ1_M-00001-of-00003.gguf", 3, "mmproj-model-bf16.gguf", "", ""},
+      {"UD-IQ1_M", "UD-IQ1_M/GLM-5.3-Flash-UD-IQ1_M-00001-of-00003.gguf", 3, "mmproj-model-bf16.gguf", "", ""},
+      {"UD-Q6_K_XL", "UD-Q6_K_XL/GLM-5.3-Flash-UD-Q6_K_XL-00001-of-00007.gguf", 7, "mmproj-model-bf16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q6_K_XL", "Q2_K_XL", "IQ1_M"}},
 
     {"huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF",
@@ -1533,10 +1525,10 @@ static const real_repo real_repos[] = {
       {"swift-IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS", 2},
       {"unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL", 4}},
      {
-      {"", "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf", 6, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf", 6, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf", 8, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"UD-Q4_K_XL", "unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf", 4, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""}},
+      {"", "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf", 6, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"Q8_0", "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf", 6, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"BF16", "BF16/Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf", 8, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"UD-Q4_K_XL", "unsloth-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf", 4, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""}},
      {"Q4_K_XL", "IQ3_XXS", "Q8_0", "BF16"}},
 
     {"huihui-ai/Qwen2.5-VL-3B-Instruct-abliterated",
@@ -1545,9 +1537,9 @@ static const real_repo real_repos[] = {
       {"GGUF/ggml-model-q8_0.gguf"},
       {"GGUF/mmproj-ggml-model-f16.gguf"}},
      {
-      {"", "GGUF/ggml-model-Q4_K_M.gguf", 1, "GGUF/mmproj-ggml-model-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "GGUF/ggml-model-Q4_K_M.gguf", 1, "GGUF/mmproj-ggml-model-f16.gguf", "", "", "", ""},
-      {"Q8_0", "GGUF/ggml-model-q8_0.gguf", 1, "GGUF/mmproj-ggml-model-f16.gguf", "", "", "", ""}},
+      {"", "GGUF/ggml-model-Q4_K_M.gguf", 1, "GGUF/mmproj-ggml-model-f16.gguf", "", ""},
+      {"Q4_K_M", "GGUF/ggml-model-Q4_K_M.gguf", 1, "GGUF/mmproj-ggml-model-f16.gguf", "", ""},
+      {"Q8_0", "GGUF/ggml-model-q8_0.gguf", 1, "GGUF/mmproj-ggml-model-f16.gguf", "", ""}},
      {"Q8_0", "F16", "Q4_K_M"}},
 
     {"ibm-granite/granite-4.2-30b-GGUF",
@@ -1557,27 +1549,27 @@ static const real_repo real_repos[] = {
       {"granite-4.2-30b-Q8_0.gguf"},
       {"granite-4.2-30b-bf16", 2}},
      {
-      {"", "granite-4.2-30b-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "granite-4.2-30b-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "granite-4.2-30b-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q2_K", "granite-4.2-30b-Q2_K.gguf", 1, "", "", "", "", ""},
-      {"BF16", "granite-4.2-30b-bf16-00001-of-00002.gguf", 2, "", "", "", "", ""}},
+      {"", "granite-4.2-30b-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "granite-4.2-30b-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "granite-4.2-30b-Q8_0.gguf", 1, "", "", ""},
+      {"Q2_K", "granite-4.2-30b-Q2_K.gguf", 1, "", "", ""},
+      {"BF16", "granite-4.2-30b-bf16-00001-of-00002.gguf", 2, "", "", ""}},
      {"BF16", "Q8_0", "Q4_K_S", "Q4_K_M", "Q2_K"}},
 
     {"Isi99999/LTX-Video",
      {{"LTX_2_3/ltx-2.3-22b-dev-Q4_K_M.gguf"}},
      {
-      {"", "LTX_2_3/ltx-2.3-22b-dev-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "LTX_2_3/ltx-2.3-22b-dev-Q4_K_M.gguf", 1, "", "", "", "", ""}},
+      {"", "LTX_2_3/ltx-2.3-22b-dev-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "LTX_2_3/ltx-2.3-22b-dev-Q4_K_M.gguf", 1, "", "", ""}},
      {"Q4_K_M"}},
 
     {"ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF",
      {{"IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M", 2},
       {"mmproj-Qwen3.8-Flash-Next-BF16.gguf"}},
      {
-      {"", "IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"IQ1_M", "IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"IQ1_M", "IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"IQ1_M"}},
 
     {"ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
@@ -1586,10 +1578,10 @@ static const real_repo real_repos[] = {
       {"Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0", 2},
       {"mmproj-Qwen3.8-Flash-Next-BF16.gguf"}},
      {
-      {"", "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"IQ2_XS", "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"Q2_0", "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"IQ2_XS", "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"Q2_0", "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q2_0", "IQ3_XXS", "IQ2_XS"}},
 
     {"Jackrong/Qwopus3.6-27B-v1-preview-GGUF",
@@ -1598,10 +1590,10 @@ static const real_repo real_repos[] = {
       {"Qwopus3.6-27B-v1-preview-Q8_0.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Qwopus3.6-27B-v1-preview-Q4_K_M.gguf", 1, "mmproj-F32.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwopus3.6-27B-v1-preview-Q4_K_M.gguf", 1, "mmproj-F32.gguf", "", "", "", ""},
-      {"Q8_0", "Qwopus3.6-27B-v1-preview-Q8_0.gguf", 1, "mmproj-F32.gguf", "", "", "", ""},
-      {"F32", "", 0, "", "", "", "", ""}},
+      {"", "Qwopus3.6-27B-v1-preview-Q4_K_M.gguf", 1, "mmproj-F32.gguf", "", ""},
+      {"Q4_K_M", "Qwopus3.6-27B-v1-preview-Q4_K_M.gguf", 1, "mmproj-F32.gguf", "", ""},
+      {"Q8_0", "Qwopus3.6-27B-v1-preview-Q8_0.gguf", 1, "mmproj-F32.gguf", "", ""},
+      {"F32", "", 0, "", "", ""}},
      {"Q8_0", "Q6_K", "Q4_K_M"}},
 
     {"Jackrong/Qwopus3.8-27B-Flash-V2-GGUF",
@@ -1610,25 +1602,25 @@ static const real_repo real_repos[] = {
       {"Qwopus3.8-27B-Flash-V2-MTP-Q8_0.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Qwopus3.8-27B-Flash-V2-MTP-Q4_K_M.gguf", 1, "mmproj-F32.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwopus3.8-27B-Flash-V2-MTP-Q4_K_M.gguf", 1, "mmproj-F32.gguf", "", "", "", ""},
-      {"Q8_0", "Qwopus3.8-27B-Flash-V2-MTP-Q8_0.gguf", 1, "mmproj-F32.gguf", "", "", "", ""},
-      {"BF16", "Qwopus3.8-27B-Flash-V2-MTP-BF16.gguf", 1, "mmproj-F32.gguf", "", "", "", ""},
-      {"F32", "", 0, "", "", "", "", ""}},
+      {"", "Qwopus3.8-27B-Flash-V2-MTP-Q4_K_M.gguf", 1, "mmproj-F32.gguf", "", ""},
+      {"Q4_K_M", "Qwopus3.8-27B-Flash-V2-MTP-Q4_K_M.gguf", 1, "mmproj-F32.gguf", "", ""},
+      {"Q8_0", "Qwopus3.8-27B-Flash-V2-MTP-Q8_0.gguf", 1, "mmproj-F32.gguf", "", ""},
+      {"BF16", "Qwopus3.8-27B-Flash-V2-MTP-BF16.gguf", 1, "mmproj-F32.gguf", "", ""},
+      {"F32", "", 0, "", "", ""}},
      {"Q8_0", "Q4_K_M", "BF16"}},
 
     {"JetBrains/Mellum2-12B-A2.5B-Instruct-GGUF-Q4_K_M",
      {{"Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf"}},
      {
-      {"", "Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf", 1, "", "", "", "", ""}},
+      {"", "Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf", 1, "", "", ""}},
      {"Q4_K_M"}},
 
     {"JetBrains/Mellum2-12B-A2.5B-Instruct-GGUF-Q8_0",
      {{"Mellum2-12B-A2.5B-Instruct-Q8_0.gguf"}},
      {
-      {"", "Mellum2-12B-A2.5B-Instruct-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Mellum2-12B-A2.5B-Instruct-Q8_0.gguf", 1, "", "", "", "", ""}},
+      {"", "Mellum2-12B-A2.5B-Instruct-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "Mellum2-12B-A2.5B-Instruct-Q8_0.gguf", 1, "", "", ""}},
      {"Q8_0"}},
 
     {"JetBrains/Mellum2.1-12B-A2.5B-Thinking-GGUF",
@@ -1636,10 +1628,10 @@ static const real_repo real_repos[] = {
       {"Mellum2.1-12B-A2.5B-Thinking-Q4_K_M.gguf"},
       {"Mellum2.1-12B-A2.5B-Thinking-Q8_0.gguf"}},
      {
-      {"", "Mellum2.1-12B-A2.5B-Thinking-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Mellum2.1-12B-A2.5B-Thinking-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Mellum2.1-12B-A2.5B-Thinking-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "Mellum2.1-12B-A2.5B-Thinking-BF16.gguf", 1, "", "", "", "", ""}},
+      {"", "Mellum2.1-12B-A2.5B-Thinking-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Mellum2.1-12B-A2.5B-Thinking-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Mellum2.1-12B-A2.5B-Thinking-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "Mellum2.1-12B-A2.5B-Thinking-BF16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M", "BF16"}},
 
     {"JonathanColetti/Qwen3.8-27B-Uncensored-GGUF",
@@ -1655,13 +1647,13 @@ static const real_repo real_repos[] = {
       {"Qwen3.8-27B-Uncensored-noMTP-Q8_0.gguf"},
       {"mmproj-Qwen3.8-27B-Uncensored-F16.gguf"}},
      {
-      {"", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.8-27B-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"IQ2_M", "Qwen3.8-27B-Uncensored-IQ2_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"Q4_0", "Qwen3.8-27B-Uncensored-draft-Q4_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""},
-      {"mtp", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"Q8_0", "Qwen3.8-27B-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"IQ2_M", "Qwen3.8-27B-Uncensored-IQ2_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"Q4_0", "Qwen3.8-27B-Uncensored-draft-Q4_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-F16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""},
+      {"mtp", "", 0, "", "", ""}},
      {"Q8_0", "Q5_K_M", "Q4_K_M", "IQ2_M", "Q4_0"}},
 
     {"kai-os/Carnice-V2-27b-GGUF",
@@ -1671,18 +1663,18 @@ static const real_repo real_repos[] = {
       {"carnice-v2-27b-Q8_0.gguf"},
       {"carnice-v2-27b-bf16.gguf"}},
      {
-      {"", "carnice-v2-27b-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "carnice-v2-27b-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "carnice-v2-27b-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"IQ2_M", "carnice-v2-27b-IQ2_M.gguf", 1, "", "", "", "", ""},
-      {"BF16", "carnice-v2-27b-bf16.gguf", 1, "", "", "", "", ""}},
+      {"", "carnice-v2-27b-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "carnice-v2-27b-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "carnice-v2-27b-Q8_0.gguf", 1, "", "", ""},
+      {"IQ2_M", "carnice-v2-27b-IQ2_M.gguf", 1, "", "", ""},
+      {"BF16", "carnice-v2-27b-bf16.gguf", 1, "", "", ""}},
      {"BF16", "Q8_0", "Q5_K_M", "Q4_K_M", "IQ2_M"}},
 
     {"KBLab/sentence-bert-swedish-cased",
      {{"Sentence-Bert-Swedish-Cased-124M-BF16.gguf"}},
      {
-      {"", "Sentence-Bert-Swedish-Cased-124M-BF16.gguf", 1, "", "", "", "", ""},
-      {"BF16", "Sentence-Bert-Swedish-Cased-124M-BF16.gguf", 1, "", "", "", "", ""}},
+      {"", "Sentence-Bert-Swedish-Cased-124M-BF16.gguf", 1, "", "", ""},
+      {"BF16", "Sentence-Bert-Swedish-Cased-124M-BF16.gguf", 1, "", "", ""}},
      {"BF16"}},
 
     {"KBlueLeaf/DanTagGen-delta-rev2",
@@ -1690,17 +1682,17 @@ static const real_repo real_repos[] = {
       {"ggml-model-Q8_0.gguf"},
       {"ggml-model-f16.gguf"}},
      {
-      {"", "ggml-model-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "ggml-model-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q6_K", "ggml-model-Q6_K.gguf", 1, "", "", "", "", ""},
-      {"F16", "ggml-model-f16.gguf", 1, "", "", "", "", ""}},
+      {"", "ggml-model-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "ggml-model-Q8_0.gguf", 1, "", "", ""},
+      {"Q6_K", "ggml-model-Q6_K.gguf", 1, "", "", ""},
+      {"F16", "ggml-model-f16.gguf", 1, "", "", ""}},
      {"F16", "Q8_0", "Q6_K"}},
 
     {"KittenML/kitten-tts-2",
      {{"cpp/model-tq2_1.gguf"}},
      {
-      {"", "cpp/model-tq2_1.gguf", 1, "", "", "", "", ""},
-      {"TQ2_1", "cpp/model-tq2_1.gguf", 1, "", "", "", "", ""}},
+      {"", "cpp/model-tq2_1.gguf", 1, "", "", ""},
+      {"TQ2_1", "cpp/model-tq2_1.gguf", 1, "", "", ""}},
      {"TQ2_1"}},
 
     {"LiquidAI/LFM2.5-2.6B-DSpark-GGUF",
@@ -1708,10 +1700,10 @@ static const real_repo real_repos[] = {
       {"LFM2.5-2.6B-DSpark-Q4_K_M.gguf"},
       {"LFM2.5-2.6B-DSpark-Q8_0.gguf"}},
      {
-      {"", "LFM2.5-2.6B-DSpark-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "LFM2.5-2.6B-DSpark-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "LFM2.5-2.6B-DSpark-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "LFM2.5-2.6B-DSpark-F16.gguf", 1, "", "", "", "", ""}},
+      {"", "LFM2.5-2.6B-DSpark-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "LFM2.5-2.6B-DSpark-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "LFM2.5-2.6B-DSpark-Q8_0.gguf", 1, "", "", ""},
+      {"F16", "LFM2.5-2.6B-DSpark-F16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M", "F16"}},
 
     {"LiquidAI/LFM2.5-Audio-1.5B-GGUF",
@@ -1728,45 +1720,45 @@ static const real_repo real_repos[] = {
       {"vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf"},
       {"vocoder-LFM2.5-Audio-1.5B-Q8_0.gguf"}},
      {
-      {"", "LFM2.5-Audio-1.5B-Q8_0.gguf", 1, "mmproj-LFM2.5-Audio-1.5B-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "LFM2.5-Audio-1.5B-Q8_0.gguf", 1, "mmproj-LFM2.5-Audio-1.5B-Q8_0.gguf", "", "", "", ""},
-      {"F16", "LFM2.5-Audio-1.5B-F16.gguf", 1, "mmproj-LFM2.5-Audio-1.5B-F16.gguf", "", "", "", ""}},
+      {"", "LFM2.5-Audio-1.5B-Q8_0.gguf", 1, "mmproj-LFM2.5-Audio-1.5B-Q8_0.gguf", "", ""},
+      {"Q8_0", "LFM2.5-Audio-1.5B-Q8_0.gguf", 1, "mmproj-LFM2.5-Audio-1.5B-Q8_0.gguf", "", ""},
+      {"F16", "LFM2.5-Audio-1.5B-F16.gguf", 1, "mmproj-LFM2.5-Audio-1.5B-F16.gguf", "", ""}},
      {"Q8_0", "Q4_0", "F16"}},
 
     {"llm-jp/llm-jp-4-33b-thinking-gguf",
      {{"llm-jp-4-33b-thinking-BF16.gguf"},
       {"llm-jp-4-33b-thinking-Q4_K_M.gguf"}},
      {
-      {"", "llm-jp-4-33b-thinking-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "llm-jp-4-33b-thinking-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"BF16", "llm-jp-4-33b-thinking-BF16.gguf", 1, "", "", "", "", ""}},
+      {"", "llm-jp-4-33b-thinking-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "llm-jp-4-33b-thinking-Q4_K_M.gguf", 1, "", "", ""},
+      {"BF16", "llm-jp-4-33b-thinking-BF16.gguf", 1, "", "", ""}},
      {"Q4_K_M", "BF16"}},
 
     {"lmg-anon/vntl-llama3-8b-v2-gguf",
      {{"vntl-llama3-8b-v2-hf-q5_k_m.gguf"},
       {"vntl-llama3-8b-v2-hf-q8_0.gguf"}},
      {
-      {"", "vntl-llama3-8b-v2-hf-q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "vntl-llama3-8b-v2-hf-q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q5_K_M", "vntl-llama3-8b-v2-hf-q5_k_m.gguf", 1, "", "", "", "", ""}},
+      {"", "vntl-llama3-8b-v2-hf-q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "vntl-llama3-8b-v2-hf-q8_0.gguf", 1, "", "", ""},
+      {"Q5_K_M", "vntl-llama3-8b-v2-hf-q5_k_m.gguf", 1, "", "", ""}},
      {"Q8_0", "Q5_K_M"}},
 
     {"lmstudio-ai/gemma-2b-it-GGUF",
      {{"gemma-2b-it-q4_k_m.gguf"},
       {"gemma-2b-it-q8_0.gguf"}},
      {
-      {"", "gemma-2b-it-q4_k_m.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "gemma-2b-it-q4_k_m.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "gemma-2b-it-q8_0.gguf", 1, "", "", "", "", ""}},
+      {"", "gemma-2b-it-q4_k_m.gguf", 1, "", "", ""},
+      {"Q4_K_M", "gemma-2b-it-q4_k_m.gguf", 1, "", "", ""},
+      {"Q8_0", "gemma-2b-it-q8_0.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M"}},
 
     {"lmstudio-community/Bonsai-27B-GGUF",
      {{"Bonsai-27B-Q1_0.gguf"},
       {"mmproj-Bonsai-27B-BF16.gguf"}},
      {
-      {"", "Bonsai-27B-Q1_0.gguf", 1, "mmproj-Bonsai-27B-BF16.gguf", "", "", "", ""},
-      {"Q1_0", "Bonsai-27B-Q1_0.gguf", 1, "mmproj-Bonsai-27B-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "Bonsai-27B-Q1_0.gguf", 1, "mmproj-Bonsai-27B-BF16.gguf", "", ""},
+      {"Q1_0", "Bonsai-27B-Q1_0.gguf", 1, "mmproj-Bonsai-27B-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q1_0"}},
 
     {"lmstudio-community/GLM-4.6V-Flash-GGUF",
@@ -1775,17 +1767,17 @@ static const real_repo real_repos[] = {
       {"GLM-4.6V-Flash-Q8_0.gguf"},
       {"mmproj-GLM-4.6V-Flash-F16.gguf"}},
      {
-      {"", "GLM-4.6V-Flash-Q4_K_M.gguf", 1, "mmproj-GLM-4.6V-Flash-F16.gguf", "", "", "", ""},
-      {"Q4_K_M", "GLM-4.6V-Flash-Q4_K_M.gguf", 1, "mmproj-GLM-4.6V-Flash-F16.gguf", "", "", "", ""},
-      {"Q8_0", "GLM-4.6V-Flash-Q8_0.gguf", 1, "mmproj-GLM-4.6V-Flash-F16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "GLM-4.6V-Flash-Q4_K_M.gguf", 1, "mmproj-GLM-4.6V-Flash-F16.gguf", "", ""},
+      {"Q4_K_M", "GLM-4.6V-Flash-Q4_K_M.gguf", 1, "mmproj-GLM-4.6V-Flash-F16.gguf", "", ""},
+      {"Q8_0", "GLM-4.6V-Flash-Q8_0.gguf", 1, "mmproj-GLM-4.6V-Flash-F16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q6_K", "Q4_K_M"}},
 
     {"lmstudio-community/gpt-oss-120b-GGUF",
      {{"gpt-oss-120b-MXFP4", 2}},
      {
-      {"", "gpt-oss-120b-MXFP4-00001-of-00002.gguf", 2, "", "", "", "", ""},
-      {"MXFP4", "gpt-oss-120b-MXFP4-00001-of-00002.gguf", 2, "", "", "", "", ""}},
+      {"", "gpt-oss-120b-MXFP4-00001-of-00002.gguf", 2, "", "", ""},
+      {"MXFP4", "gpt-oss-120b-MXFP4-00001-of-00002.gguf", 2, "", "", ""}},
      {"MXFP4"}},
 
     {"lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF",
@@ -1794,18 +1786,18 @@ static const real_repo real_repos[] = {
       {"Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf"},
       {"Meta-Llama-3.1-8B-Instruct-Q8_0.gguf"}},
      {
-      {"", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"IQ4_XS", "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf", 1, "", "", "", "", ""}},
+      {"", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", 1, "", "", ""},
+      {"IQ4_XS", "Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf", 1, "", "", ""}},
      {"Q8_0", "Q5_K_M", "Q4_K_M", "IQ4_XS"}},
 
     {"lmstudio-community/Muse-Glimmer-30B-GGUF",
      {{"Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf"},
       {"mmproj-Muse-Glimmer-30B-Q4_K_M.gguf"}},
      {
-      {"", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "", "", "", ""},
-      {"Q4_K_M", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "", "", "", ""}},
+      {"", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "", ""},
+      {"Q4_K_M", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "", ""}},
      {"Q4_K_M"}},
 
     {"lmstudio-community/Qwen3-Coder-Next-GGUF",
@@ -1813,18 +1805,18 @@ static const real_repo real_repos[] = {
       {"Qwen3-Coder-Next-Q6_K", 2},
       {"Qwen3-Coder-Next-Q8_0", 3}},
      {
-      {"", "Qwen3-Coder-Next-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Qwen3-Coder-Next-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Qwen3-Coder-Next-Q8_0-00001-of-00003.gguf", 3, "", "", "", "", ""}},
+      {"", "Qwen3-Coder-Next-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Qwen3-Coder-Next-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Qwen3-Coder-Next-Q8_0-00001-of-00003.gguf", 3, "", "", ""}},
      {"Q8_0", "Q6_K", "Q4_K_M"}},
 
     {"LocalAI-io/privacy-filter-multilingual-GGUF",
      {{"privacy-filter-multilingual-f16.gguf"},
       {"privacy-filter-multilingual-q8.gguf"}},
      {
-      {"", "privacy-filter-multilingual-f16.gguf", 1, "", "", "", "", ""},
-      {"F16", "privacy-filter-multilingual-f16.gguf", 1, "", "", "", "", ""},
-      {"Q8", "privacy-filter-multilingual-q8.gguf", 1, "", "", "", "", ""}},
+      {"", "privacy-filter-multilingual-f16.gguf", 1, "", "", ""},
+      {"F16", "privacy-filter-multilingual-f16.gguf", 1, "", "", ""},
+      {"Q8", "privacy-filter-multilingual-q8.gguf", 1, "", "", ""}},
      {"Q8", "F16"}},
 
     {"meta-models/Muse-Glimmer-30B-GGUF",
@@ -1833,9 +1825,9 @@ static const real_repo real_repos[] = {
       {"dflash-Muse-Glimmer-30B-Q4_K_M.gguf"},
       {"mmproj-Muse-Glimmer-30B-Q4_K_M.gguf"}},
      {
-      {"", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "", "dflash-Muse-Glimmer-30B-Q4_K_M.gguf", "", ""},
-      {"Q4_K_M", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "", "dflash-Muse-Glimmer-30B-Q4_K_M.gguf", "", ""},
-      {"Q4_K_XL", "Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "", "dflash-Muse-Glimmer-30B-Q4_K_M.gguf", "", ""}},
+      {"", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "dflash-Muse-Glimmer-30B-Q4_K_M.gguf", ""},
+      {"Q4_K_M", "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "dflash-Muse-Glimmer-30B-Q4_K_M.gguf", ""},
+      {"Q4_K_XL", "Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf", 1, "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf", "dflash-Muse-Glimmer-30B-Q4_K_M.gguf", ""}},
      {"Q4_K_XL", "Q4_K_M"}},
 
     {"migtissera/Tess-4-27B-GGUF",
@@ -1846,17 +1838,17 @@ static const real_repo real_repos[] = {
       {"mtp-Tess-4-27B-Q4_K_M.gguf"},
       {"mtp-Tess-4-27B-Q8_0.gguf"}},
      {
-      {"", "Tess-4-27B-Q4_K_M.gguf", 1, "mmproj-Tess-4-27B-F16.gguf", "mtp-Tess-4-27B-Q4_K_M.gguf", "", "", ""},
-      {"Q4_K_M", "Tess-4-27B-Q4_K_M.gguf", 1, "mmproj-Tess-4-27B-F16.gguf", "mtp-Tess-4-27B-Q4_K_M.gguf", "", "", ""},
-      {"Q8_0", "Tess-4-27B-Q8_0.gguf", 1, "mmproj-Tess-4-27B-F16.gguf", "mtp-Tess-4-27B-Q8_0.gguf", "", "", ""},
-      {"F16", "", 0, "", "mtp-Tess-4-27B-Q8_0.gguf", "", "", ""}},
+      {"", "Tess-4-27B-Q4_K_M.gguf", 1, "mmproj-Tess-4-27B-F16.gguf", "", ""},
+      {"Q4_K_M", "Tess-4-27B-Q4_K_M.gguf", 1, "mmproj-Tess-4-27B-F16.gguf", "", ""},
+      {"Q8_0", "Tess-4-27B-Q8_0.gguf", 1, "mmproj-Tess-4-27B-F16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q6_K", "Q4_K_M"}},
 
     {"mixedbread-ai/mxbai-embed-large-v1",
      {{"gguf/mxbai-embed-large-v1-f16.gguf"}},
      {
-      {"", "gguf/mxbai-embed-large-v1-f16.gguf", 1, "", "", "", "", ""},
-      {"F16", "gguf/mxbai-embed-large-v1-f16.gguf", 1, "", "", "", "", ""}},
+      {"", "gguf/mxbai-embed-large-v1-f16.gguf", 1, "", "", ""},
+      {"F16", "gguf/mxbai-embed-large-v1-f16.gguf", 1, "", "", ""}},
      {"F16"}},
 
     {"mondk/MiniCPM5-2B-Abliterated-Uncensored-GGUF",
@@ -1864,10 +1856,10 @@ static const real_repo real_repos[] = {
       {"minicpm5-2b-abliterated-Q4_K_M.gguf"},
       {"minicpm5-2b-abliterated-Q8_0.gguf"}},
      {
-      {"", "minicpm5-2b-abliterated-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "minicpm5-2b-abliterated-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "minicpm5-2b-abliterated-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "minicpm5-2b-abliterated-F16.gguf", 1, "", "", "", "", ""}},
+      {"", "minicpm5-2b-abliterated-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "minicpm5-2b-abliterated-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "minicpm5-2b-abliterated-Q8_0.gguf", 1, "", "", ""},
+      {"F16", "minicpm5-2b-abliterated-F16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M", "F16"}},
 
     {"NANI-Nithin/K2-Horizon-MoVA-36B-A4B-GGUF",
@@ -1876,10 +1868,10 @@ static const real_repo real_repos[] = {
       {"K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf"},
       {"K2-Horizon-MoVA-36B-A4B-Q8_0.gguf"}},
      {
-      {"", "K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "K2-Horizon-MoVA-36B-A4B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "K2-Horizon-MoVA-36B-A4B-BF16.gguf", 1, "", "", "", "", ""}},
+      {"", "K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "K2-Horizon-MoVA-36B-A4B-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "K2-Horizon-MoVA-36B-A4B-BF16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M", "Q2_0", "BF16"}},
 
     {"ngquocvinh/AliceAI-T5-35B-A0.6B-GGUF",
@@ -1889,11 +1881,11 @@ static const real_repo real_repos[] = {
       {"AliceAI-T5-35B-A0.6B-Q8_0.gguf"},
       {"AliceAI-T5-35B-A0.6B-TQ2_0.gguf"}},
      {
-      {"", "AliceAI-T5-35B-A0.6B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "AliceAI-T5-35B-A0.6B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "AliceAI-T5-35B-A0.6B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "AliceAI-T5-35B-A0.6B-BF16.gguf", 1, "", "", "", "", ""},
-      {"TQ2_0", "AliceAI-T5-35B-A0.6B-TQ2_0.gguf", 1, "", "", "", "", ""}},
+      {"", "AliceAI-T5-35B-A0.6B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "AliceAI-T5-35B-A0.6B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "AliceAI-T5-35B-A0.6B-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "AliceAI-T5-35B-A0.6B-BF16.gguf", 1, "", "", ""},
+      {"TQ2_0", "AliceAI-T5-35B-A0.6B-TQ2_0.gguf", 1, "", "", ""}},
      {"TQ2_0", "Q8_0", "Q4_K_M", "Q3_K_S", "BF16"}},
 
     {"ngquocvinh/NeoHorse-1-4B-GGUF",
@@ -1903,11 +1895,11 @@ static const real_repo real_repos[] = {
       {"NeoHorse-1-4B-Q8_0.gguf"},
       {"NeoHorse-1-4B-TQ2_0.gguf"}},
      {
-      {"", "NeoHorse-1-4B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "NeoHorse-1-4B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "NeoHorse-1-4B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"IQ1_M", "NeoHorse-1-4B-IQ1_M.gguf", 1, "", "", "", "", ""},
-      {"TQ2_0", "NeoHorse-1-4B-TQ2_0.gguf", 1, "", "", "", "", ""}},
+      {"", "NeoHorse-1-4B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "NeoHorse-1-4B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "NeoHorse-1-4B-Q8_0.gguf", 1, "", "", ""},
+      {"IQ1_M", "NeoHorse-1-4B-IQ1_M.gguf", 1, "", "", ""},
+      {"TQ2_0", "NeoHorse-1-4B-TQ2_0.gguf", 1, "", "", ""}},
      {"TQ2_0", "Q8_0", "Q4_K_M", "Q2_K_S", "IQ1_M"}},
 
     {"nif0/Qwen3-VL-32B-Instruct-MiniMax-H3-GGUF",
@@ -1916,17 +1908,17 @@ static const real_repo real_repos[] = {
       {"Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-UD-IQ3_XXS.gguf"},
       {"Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-mmproj-F32.gguf"}},
      {
-      {"", "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-Q4_K_M.gguf", 1, "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-mmproj-F32.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-Q4_K_M.gguf", 1, "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-mmproj-F32.gguf", "", "", "", ""},
-      {"IQ4_XS", "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-IQ4_XS.gguf", 1, "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-mmproj-F32.gguf", "", "", "", ""},
-      {"F32", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-Q4_K_M.gguf", 1, "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-mmproj-F32.gguf", "", ""},
+      {"Q4_K_M", "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-Q4_K_M.gguf", 1, "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-mmproj-F32.gguf", "", ""},
+      {"IQ4_XS", "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-IQ4_XS.gguf", 1, "Qwen3-VL-32B-Instruct-MiniMax-H3-L0-49-mmproj-F32.gguf", "", ""},
+      {"F32", "", 0, "", "", ""}},
      {"IQ3_XXS", "Q4_K_M", "IQ4_XS"}},
 
     {"NikolayKozloff/Meta-Llama-3.1-8B-Instruct-Q8_0-GGUF",
      {{"meta-llama-3.1-8b-instruct-q8_0.gguf"}},
      {
-      {"", "meta-llama-3.1-8b-instruct-q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "meta-llama-3.1-8b-instruct-q8_0.gguf", 1, "", "", "", "", ""}},
+      {"", "meta-llama-3.1-8b-instruct-q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "meta-llama-3.1-8b-instruct-q8_0.gguf", 1, "", "", ""}},
      {"Q8_0"}},
 
     {"noctrex/Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF",
@@ -1938,11 +1930,11 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Huihui-Qwen3-VL-4B-Instruct-abliterated-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Huihui-Qwen3-VL-4B-Instruct-abliterated-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Huihui-Qwen3-VL-4B-Instruct-abliterated-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "Huihui-Qwen3-VL-4B-Instruct-abliterated-BF16.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Huihui-Qwen3-VL-4B-Instruct-abliterated-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "Huihui-Qwen3-VL-4B-Instruct-abliterated-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Huihui-Qwen3-VL-4B-Instruct-abliterated-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "Huihui-Qwen3-VL-4B-Instruct-abliterated-BF16.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q4_K_M", "IQ4_XS", "BF16"}},
 
     {"OBLITERATUS/Gemma-4-12B-OBLITERATED",
@@ -1950,10 +1942,10 @@ static const real_repo real_repos[] = {
       {"Gemma-4-12B-OBLITERATED-Q4_K_M.gguf"},
       {"Gemma-4-12B-OBLITERATED-v2-Q8_0.gguf"}},
      {
-      {"", "Gemma-4-12B-OBLITERATED-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Gemma-4-12B-OBLITERATED-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Gemma-4-12B-OBLITERATED-v2-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "Gemma-4-12B-OBLITERATED-BF16.gguf", 1, "", "", "", "", ""}},
+      {"", "Gemma-4-12B-OBLITERATED-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Gemma-4-12B-OBLITERATED-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Gemma-4-12B-OBLITERATED-v2-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "Gemma-4-12B-OBLITERATED-BF16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M", "BF16"}},
 
     {"OBLITERATUS/gemma-4-E4B-it-OBLITERATED",
@@ -1961,10 +1953,10 @@ static const real_repo real_repos[] = {
       {"gemma-4-E4B-it-OBLITERATED-Q8_0.gguf"},
       {"gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf"}},
      {
-      {"", "gemma-4-E4B-it-OBLITERATED-Q4_K_M.gguf", 1, "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "gemma-4-E4B-it-OBLITERATED-Q4_K_M.gguf", 1, "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf", "", "", "", ""},
-      {"Q8_0", "gemma-4-E4B-it-OBLITERATED-Q8_0.gguf", 1, "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "gemma-4-E4B-it-OBLITERATED-Q4_K_M.gguf", 1, "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf", "", ""},
+      {"Q4_K_M", "gemma-4-E4B-it-OBLITERATED-Q4_K_M.gguf", 1, "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf", "", ""},
+      {"Q8_0", "gemma-4-E4B-it-OBLITERATED-Q8_0.gguf", 1, "gemma-4-E4B-it-OBLITERATED-mmproj-f16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_0", "Q4_K_M"}},
 
     {"OBLITERATUS/Qwen3.8-27B-OBLITERATED",
@@ -1973,11 +1965,11 @@ static const real_repo real_repos[] = {
       {"Qwen3.8-27B-OBLITERATED-Q8_0.gguf"},
       {"mmproj-model-bf16.gguf"}},
      {
-      {"", "Qwen3.8-27B-OBLITERATED-Q4_K_M.gguf", 1, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.8-27B-OBLITERATED-Q4_K_M.gguf", 1, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.8-27B-OBLITERATED-Q8_0.gguf", 1, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"IQ4_XS", "Qwen3.8-27B-OBLITERATED-IQ4_XS.gguf", 1, "mmproj-model-bf16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.8-27B-OBLITERATED-Q4_K_M.gguf", 1, "mmproj-model-bf16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.8-27B-OBLITERATED-Q4_K_M.gguf", 1, "mmproj-model-bf16.gguf", "", ""},
+      {"Q8_0", "Qwen3.8-27B-OBLITERATED-Q8_0.gguf", 1, "mmproj-model-bf16.gguf", "", ""},
+      {"IQ4_XS", "Qwen3.8-27B-OBLITERATED-IQ4_XS.gguf", 1, "mmproj-model-bf16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q8_0", "Q4_K_M", "IQ4_XS"}},
 
     {"openthaigpt/openthaigpt1.5-7b-instruct",
@@ -1985,9 +1977,9 @@ static const real_repo real_repos[] = {
       {"openthaigpt1.5-7B-instruct-Q3KM.gguf"},
       {"openthaigpt1.5-7B-instruct-Q4KM.gguf"}},
      {
-      {"", "openthaigpt1.5-7B-F16.gguf", 1, "", "", "", "", ""},
-      {"F16", "openthaigpt1.5-7B-F16.gguf", 1, "", "", "", "", ""},
-      {"Q4KM", "openthaigpt1.5-7B-instruct-Q4KM.gguf", 1, "", "", "", "", ""}},
+      {"", "openthaigpt1.5-7B-F16.gguf", 1, "", "", ""},
+      {"F16", "openthaigpt1.5-7B-F16.gguf", 1, "", "", ""},
+      {"Q4KM", "openthaigpt1.5-7B-instruct-Q4KM.gguf", 1, "", "", ""}},
      {"Q4KM", "Q3KM", "F16"}},
 
     {"orcarouter/Qwen3.8-27B-Uncensored-GGUF",
@@ -1997,10 +1989,10 @@ static const real_repo real_repos[] = {
       {"Qwen3.8-27B-Uncensored-Q8_0.gguf"},
       {"mmproj-Qwen3.8-27B-Uncensored-f16.gguf"}},
      {
-      {"", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-f16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.8-27B-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-f16.gguf", "", "", "", ""},
-      {"F16", "Qwen3.8-27B-Uncensored-F16-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-27B-Uncensored-f16.gguf", "", "", "", ""}},
+      {"", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-f16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.8-27B-Uncensored-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-f16.gguf", "", ""},
+      {"Q8_0", "Qwen3.8-27B-Uncensored-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-f16.gguf", "", ""},
+      {"F16", "Qwen3.8-27B-Uncensored-F16-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-27B-Uncensored-f16.gguf", "", ""}},
      {"Q8_0", "Q4_K_M", "Q3_K_M", "F16"}},
 
     {"oruk/orukeet",
@@ -2008,9 +2000,9 @@ static const real_repo real_repos[] = {
       {"orukeet-v0.1.0-q8.gguf"},
       {"transcribe-cpp/orukeet-Q8_0.gguf"}},
      {
-      {"", "orukeet-transcribe-cpp-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "orukeet-transcribe-cpp-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8", "orukeet-v0.1.0-q8.gguf", 1, "", "", "", "", ""}},
+      {"", "orukeet-transcribe-cpp-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "orukeet-transcribe-cpp-Q8_0.gguf", 1, "", "", ""},
+      {"Q8", "orukeet-v0.1.0-q8.gguf", 1, "", "", ""}},
      {"Q8_0", "Q8"}},
 
     {"peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP",
@@ -2020,11 +2012,11 @@ static const real_repo real_repos[] = {
       {"mmproj-BF16.gguf"},
       {"mmproj-Q8_0.gguf"}},
      {
-      {"", "Cyber-Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", 1, "mmproj-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "", 0, "", "", "", "", ""},
-      {"UD-IQ3_XXS", "Cyber-Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", 1, "mmproj-Q8_0.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "Cyber-Tiel-Coder-35B-A3B-MTP-UD-Q8_K_XL.gguf", 1, "mmproj-Q8_0.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "Cyber-Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", 1, "mmproj-Q8_0.gguf", "", ""},
+      {"Q8_0", "", 0, "", "", ""},
+      {"UD-IQ3_XXS", "Cyber-Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", 1, "mmproj-Q8_0.gguf", "", ""},
+      {"UD-Q8_K_XL", "Cyber-Tiel-Coder-35B-A3B-MTP-UD-Q8_K_XL.gguf", 1, "mmproj-Q8_0.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q8_K_XL", "Q4_K_S", "IQ3_XXS"}},
 
     {"peculiar-ragdoll/Dirk-Qwen3.8-27B-GGUF",
@@ -2033,10 +2025,10 @@ static const real_repo real_repos[] = {
       {"Dirk-Qwen3.8-27B-UD-Q8_K_XL.gguf"},
       {"mmproj-F16.gguf"}},
      {
-      {"", "Dirk-Qwen3.8-27B-GSQ-RCO-IQ2_S.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"IQ2_S", "Dirk-Qwen3.8-27B-GSQ-RCO-IQ2_S.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "Dirk-Qwen3.8-27B-UD-Q8_K_XL.gguf", 1, "mmproj-F16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Dirk-Qwen3.8-27B-GSQ-RCO-IQ2_S.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"IQ2_S", "Dirk-Qwen3.8-27B-GSQ-RCO-IQ2_S.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"UD-Q8_K_XL", "Dirk-Qwen3.8-27B-UD-Q8_K_XL.gguf", 1, "mmproj-F16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_XL", "Q4_K_S", "IQ2_S"}},
 
     {"peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP",
@@ -2045,10 +2037,10 @@ static const real_repo real_repos[] = {
       {"Tiel-Coder-35B-A3B-MTP-UD-Q8_K_XL.gguf"},
       {"mmproj-BF16.gguf"}},
      {
-      {"", "Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-IQ3_XXS", "Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "Tiel-Coder-35B-A3B-MTP-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"UD-IQ3_XXS", "Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q8_K_XL", "Tiel-Coder-35B-A3B-MTP-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q8_K_XL", "Q4_K_S", "IQ3_XXS"}},
 
     {"perplexity-ai/pplx-computer-qwen-3-8-27b-dflash2-gguf-20260826",
@@ -2057,10 +2049,10 @@ static const real_repo real_repos[] = {
       {"qwen38-27b-Q4_K_M.gguf"},
       {"qwen38-27b-mmproj-f16.gguf"}},
      {
-      {"", "draft/Qwen3.8-27B-DFlash2-Q4_K_M.gguf", 1, "qwen38-27b-mmproj-f16.gguf", "draft/qwen38-27b-mtp-Q8_0.gguf", "", "", ""},
-      {"Q4_K_M", "draft/Qwen3.8-27B-DFlash2-Q4_K_M.gguf", 1, "qwen38-27b-mmproj-f16.gguf", "draft/qwen38-27b-mtp-Q8_0.gguf", "", "", ""},
-      {"Q8_0", "", 0, "", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "draft/Qwen3.8-27B-DFlash2-Q4_K_M.gguf", 1, "qwen38-27b-mmproj-f16.gguf", "", ""},
+      {"Q4_K_M", "draft/Qwen3.8-27B-DFlash2-Q4_K_M.gguf", 1, "qwen38-27b-mmproj-f16.gguf", "", ""},
+      {"Q8_0", "", 0, "", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q4_K_M"}},
 
     {"philbert440/Qwen3.8-27B-Uncensored-Cyber-GGUF",
@@ -2073,19 +2065,19 @@ static const real_repo real_repos[] = {
       {"mtp-Qwen3.8-27B-Uncensored-Cyber-Q4_0.gguf"},
       {"mtp-Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf"}},
      {
-      {"", "Qwen3.8-27B-Uncensored-Cyber-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf", "mtp-Qwen3.8-27B-Uncensored-Cyber-Q4_0.gguf", "", "", ""},
-      {"Q4_K_M", "Qwen3.8-27B-Uncensored-Cyber-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf", "mtp-Qwen3.8-27B-Uncensored-Cyber-Q4_0.gguf", "", "", ""},
-      {"Q8_0", "Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf", "mtp-Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf", "", "", ""},
-      {"BF16", "", 0, "", "mtp-Qwen3.8-27B-Uncensored-Cyber-BF16.gguf", "", "", ""}},
+      {"", "Qwen3.8-27B-Uncensored-Cyber-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.8-27B-Uncensored-Cyber-Q4_K_M.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf", "", ""},
+      {"Q8_0", "Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf", 1, "mmproj-Qwen3.8-27B-Uncensored-Cyber-Q8_0.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q8_0", "Q6_K", "Q4_K_M"}},
 
     {"ProCreations/grug-27b-qat-q4-gguf",
      {{"grug-27b-qat-Q4_K_M.gguf"},
       {"mmproj-grug-27b-f16.gguf"}},
      {
-      {"", "grug-27b-qat-Q4_K_M.gguf", 1, "mmproj-grug-27b-f16.gguf", "", "", "", ""},
-      {"Q4_K_M", "grug-27b-qat-Q4_K_M.gguf", 1, "mmproj-grug-27b-f16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "grug-27b-qat-Q4_K_M.gguf", 1, "mmproj-grug-27b-f16.gguf", "", ""},
+      {"Q4_K_M", "grug-27b-qat-Q4_K_M.gguf", 1, "mmproj-grug-27b-f16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q4_K_M"}},
 
     {"QuantaPlanta/MiMo-V2.6-Flash-MOPD-MXFP4-GGUF",
@@ -2094,9 +2086,9 @@ static const real_repo real_repos[] = {
       {"mmproj-MiMo-V2.6-Flash-MOPD-bf16.gguf"},
       {"mmproj-MiMo-V2.6-Flash-MOPD-f16.gguf"}},
      {
-      {"", "MiMo-V2.6-Flash-MOPD-MXFP4.gguf", 1, "mmproj-MiMo-V2.6-Flash-MOPD-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "", 0, "", "", "", "", ""},
-      {"MXFP4", "MiMo-V2.6-Flash-MOPD-MXFP4.gguf", 1, "mmproj-MiMo-V2.6-Flash-MOPD-Q8_0.gguf", "", "", "", ""}},
+      {"", "MiMo-V2.6-Flash-MOPD-MXFP4.gguf", 1, "mmproj-MiMo-V2.6-Flash-MOPD-Q8_0.gguf", "", ""},
+      {"Q8_0", "", 0, "", "", ""},
+      {"MXFP4", "MiMo-V2.6-Flash-MOPD-MXFP4.gguf", 1, "mmproj-MiMo-V2.6-Flash-MOPD-Q8_0.gguf", "", ""}},
      {"MXFP4"}},
 
     {"Qwen/Qwen3-VL-2B-Instruct-GGUF",
@@ -2106,10 +2098,10 @@ static const real_repo real_repos[] = {
       {"mmproj-Qwen3VL-2B-Instruct-F16.gguf"},
       {"mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"}},
      {
-      {"", "Qwen3VL-2B-Instruct-Q4_K_M.gguf", 1, "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3VL-2B-Instruct-Q4_K_M.gguf", 1, "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3VL-2B-Instruct-Q8_0.gguf", 1, "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf", "", "", "", ""},
-      {"F16", "Qwen3VL-2B-Instruct-F16.gguf", 1, "mmproj-Qwen3VL-2B-Instruct-F16.gguf", "", "", "", ""}},
+      {"", "Qwen3VL-2B-Instruct-Q4_K_M.gguf", 1, "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf", "", ""},
+      {"Q4_K_M", "Qwen3VL-2B-Instruct-Q4_K_M.gguf", 1, "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf", "", ""},
+      {"Q8_0", "Qwen3VL-2B-Instruct-Q8_0.gguf", 1, "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf", "", ""},
+      {"F16", "Qwen3VL-2B-Instruct-F16.gguf", 1, "mmproj-Qwen3VL-2B-Instruct-F16.gguf", "", ""}},
      {"Q8_0", "Q4_K_M", "F16"}},
 
     {"ReadyArt/Serenity-26B-A4B-GGUF",
@@ -2121,11 +2113,11 @@ static const real_repo real_repos[] = {
       {"Serenity-26B-A4B-Q6_K.gguf"},
       {"Serenity-26B-A4B-Q8_0.gguf"}},
      {
-      {"", "Serenity-26B-A4B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Serenity-26B-A4B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Serenity-26B-A4B-HB16-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q6_K", "Serenity-26B-A4B-HB16-Q6_K.gguf", 1, "", "", "", "", ""},
-      {"Q5_K_M", "Serenity-26B-A4B-Q5_K_M.gguf", 1, "", "", "", "", ""}},
+      {"", "Serenity-26B-A4B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Serenity-26B-A4B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Serenity-26B-A4B-HB16-Q8_0.gguf", 1, "", "", ""},
+      {"Q6_K", "Serenity-26B-A4B-HB16-Q6_K.gguf", 1, "", "", ""},
+      {"Q5_K_M", "Serenity-26B-A4B-Q5_K_M.gguf", 1, "", "", ""}},
      {"Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "IQ4_XS"}},
 
     {"realrebelai/KREA-2_GGUFs",
@@ -2135,10 +2127,10 @@ static const real_repo real_repos[] = {
       {"TURBO/Krea-2-Turbo-Q4_K_M.gguf"},
       {"TURBO/Krea-2-Turbo-Q8_0.gguf"}},
      {
-      {"", "BASE/Krea-2-Base-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "BASE/Krea-2-Base-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "BASE/Krea-2-Base-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q3_K_M", "BASE/Krea-2-Base-Q3_K_M.gguf", 1, "", "", "", "", ""}},
+      {"", "BASE/Krea-2-Base-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "BASE/Krea-2-Base-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "BASE/Krea-2-Base-Q8_0.gguf", 1, "", "", ""},
+      {"Q3_K_M", "BASE/Krea-2-Base-Q3_K_M.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M", "Q3_K_M"}},
 
     {"realrebelai/MiniMax-H3_GGUFs",
@@ -2149,10 +2141,10 @@ static const real_repo real_repos[] = {
       {"qwen3vl-32B-MiniMax-H3-Q2_K.gguf"},
       {"qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf"}},
      {
-      {"", "MiniMax-H3-FL2VA-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "MiniMax-H3-FL2VA-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q3_K_M", "MiniMax-H3-FL2VA-Q3_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q2_K", "qwen3vl-32B-MiniMax-H3-Q2_K.gguf", 1, "", "", "", "", ""}},
+      {"", "MiniMax-H3-FL2VA-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "MiniMax-H3-FL2VA-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q3_K_M", "MiniMax-H3-FL2VA-Q3_K_M.gguf", 1, "", "", ""},
+      {"Q2_K", "qwen3vl-32B-MiniMax-H3-Q2_K.gguf", 1, "", "", ""}},
      {"Q4_K_M", "Q2_K", "Q3_K_M"}},
 
     {"realrebelai/Wan-Animate-2_GGUFs",
@@ -2161,10 +2153,10 @@ static const real_repo real_repos[] = {
       {"Distilled/Wan-Animate-2-14B-TURBO-Q4_K_S.gguf"},
       {"Distilled/Wan-Animate-2-14B-TURBO-Q8_0.gguf"}},
      {
-      {"", "Distilled/Wan-Animate-2-14B-TURBO-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Distilled/Wan-Animate-2-14B-TURBO-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Distilled/Wan-Animate-2-14B-TURBO-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q2_K", "Distilled/Wan-Animate-2-14B-TURBO-Q2_K.gguf", 1, "", "", "", "", ""}},
+      {"", "Distilled/Wan-Animate-2-14B-TURBO-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Distilled/Wan-Animate-2-14B-TURBO-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Distilled/Wan-Animate-2-14B-TURBO-Q8_0.gguf", 1, "", "", ""},
+      {"Q2_K", "Distilled/Wan-Animate-2-14B-TURBO-Q2_K.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_S", "Q4_K_M", "Q2_K"}},
 
     {"SC117/gemma-4-26B-A4B-it-qat-heretic-GGUF",
@@ -2172,9 +2164,9 @@ static const real_repo real_repos[] = {
       {"gemma-4-26B-A4B-it-qat-heretic-f16.gguf"},
       {"mmproj-gemma-4-26B-A4B-it-qat-heretic-F16.gguf"}},
      {
-      {"", "gemma-4-26B-A4B-it-qat-heretic-UD-Q4_K_XL.gguf", 1, "mmproj-gemma-4-26B-A4B-it-qat-heretic-F16.gguf", "", "", "", ""},
-      {"UD-Q4_K_XL", "gemma-4-26B-A4B-it-qat-heretic-UD-Q4_K_XL.gguf", 1, "mmproj-gemma-4-26B-A4B-it-qat-heretic-F16.gguf", "", "", "", ""},
-      {"F16", "gemma-4-26B-A4B-it-qat-heretic-f16.gguf", 1, "mmproj-gemma-4-26B-A4B-it-qat-heretic-F16.gguf", "", "", "", ""}},
+      {"", "gemma-4-26B-A4B-it-qat-heretic-UD-Q4_K_XL.gguf", 1, "mmproj-gemma-4-26B-A4B-it-qat-heretic-F16.gguf", "", ""},
+      {"UD-Q4_K_XL", "gemma-4-26B-A4B-it-qat-heretic-UD-Q4_K_XL.gguf", 1, "mmproj-gemma-4-26B-A4B-it-qat-heretic-F16.gguf", "", ""},
+      {"F16", "gemma-4-26B-A4B-it-qat-heretic-f16.gguf", 1, "mmproj-gemma-4-26B-A4B-it-qat-heretic-F16.gguf", "", ""}},
      {"F16", "Q4_K_XL"}},
 
     {"SC117/Spark-X2.5-4B-abliterated-FIT-GGUF",
@@ -2182,9 +2174,9 @@ static const real_repo real_repos[] = {
       {"Spark-X2.5-4B-abliterated-FIT-COMPACT-2.43GiB-Q4_K.gguf"},
       {"Spark-X2.5-4B-abliterated-FIT-QUALITY-3.15GiB-Q6_K.gguf"}},
      {
-      {"", "Spark-X2.5-4B-abliterated-BF16.gguf", 1, "", "", "", "", ""},
-      {"BF16", "Spark-X2.5-4B-abliterated-BF16.gguf", 1, "", "", "", "", ""},
-      {"Q6_K", "Spark-X2.5-4B-abliterated-FIT-QUALITY-3.15GiB-Q6_K.gguf", 1, "", "", "", "", ""}},
+      {"", "Spark-X2.5-4B-abliterated-BF16.gguf", 1, "", "", ""},
+      {"BF16", "Spark-X2.5-4B-abliterated-BF16.gguf", 1, "", "", ""},
+      {"Q6_K", "Spark-X2.5-4B-abliterated-FIT-QUALITY-3.15GiB-Q6_K.gguf", 1, "", "", ""}},
      {"Q6_K", "Q4_K", "BF16"}},
 
     {"SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF",
@@ -2195,11 +2187,11 @@ static const real_repo real_repos[] = {
       {"mtp-Qwen3.8-Flash-Next-Q8_0.gguf"},
       {"mtp-q2_0.gguf"}},
      {
-      {"", "IQ2_XS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "mtp-q2_0.gguf", "", "", ""},
-      {"Q8_0", "", 0, "", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""},
-      {"IQ2_XS", "IQ2_XS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "mtp-q2_0.gguf", "", "", ""},
-      {"IQ3_S", "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "mtp-q2_0.gguf", "", "", ""},
-      {"BF16", "", 0, "", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""}},
+      {"", "IQ2_XS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"Q8_0", "", 0, "", "", ""},
+      {"IQ2_XS", "IQ2_XS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"IQ3_S", "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf", 2, "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"IQ3_S", "Q2_0", "IQ2_XS"}},
 
     {"scragnog/MOSS-Music-8B-Instruct-GGUF",
@@ -2207,9 +2199,9 @@ static const real_repo real_repos[] = {
       {"moss-lm-f16.gguf"},
       {"moss-lm-q8_0.gguf"}},
      {
-      {"", "moss-lm-q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "moss-lm-q8_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "moss-aud-f16.gguf", 1, "", "", "", "", ""}},
+      {"", "moss-lm-q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "moss-lm-q8_0.gguf", 1, "", "", ""},
+      {"F16", "moss-aud-f16.gguf", 1, "", "", ""}},
      {"Q8_0", "F16"}},
 
     {"Snowflake/snowflake-arctic-embed-m-v1.5",
@@ -2217,27 +2209,27 @@ static const real_repo real_repos[] = {
       {"gguf/snowflake-arctic-embed-m-v1.5-q8_0.gguf"},
       {"gguf/snowflake-arctic-embed-m-v1.5-tq2_0.gguf"}},
      {
-      {"", "gguf/snowflake-arctic-embed-m-v1.5-q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "gguf/snowflake-arctic-embed-m-v1.5-q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "gguf/snowflake-arctic-embed-m-v1.5-bf16.gguf", 1, "", "", "", "", ""},
-      {"TQ2_0", "gguf/snowflake-arctic-embed-m-v1.5-tq2_0.gguf", 1, "", "", "", "", ""}},
+      {"", "gguf/snowflake-arctic-embed-m-v1.5-q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "gguf/snowflake-arctic-embed-m-v1.5-q8_0.gguf", 1, "", "", ""},
+      {"BF16", "gguf/snowflake-arctic-embed-m-v1.5-bf16.gguf", 1, "", "", ""},
+      {"TQ2_0", "gguf/snowflake-arctic-embed-m-v1.5-tq2_0.gguf", 1, "", "", ""}},
      {"TQ2_0", "Q8_0", "BF16"}},
 
     {"Solstice-AI/GLM-5.3-Flash-UNCENSORED-mlx-oQ4e-DFlash2",
      {{"mmproj-BF16.gguf"},
       {"speculative/GLM-5.3-Flash-DFlash2-bf16.gguf"}},
      {
-      {"", "speculative/GLM-5.3-Flash-DFlash2-bf16.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "speculative/GLM-5.3-Flash-DFlash2-bf16.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""}},
+      {"", "speculative/GLM-5.3-Flash-DFlash2-bf16.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "speculative/GLM-5.3-Flash-DFlash2-bf16.gguf", 1, "mmproj-BF16.gguf", "", ""}},
      {"BF16"}},
 
     {"superwhisper/s1-mini-GGUF",
      {{"s1-mini-f16.gguf"},
       {"s1-mini-q4_k_m.gguf"}},
      {
-      {"", "s1-mini-q4_k_m.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "s1-mini-q4_k_m.gguf", 1, "", "", "", "", ""},
-      {"F16", "s1-mini-f16.gguf", 1, "", "", "", "", ""}},
+      {"", "s1-mini-q4_k_m.gguf", 1, "", "", ""},
+      {"Q4_K_M", "s1-mini-q4_k_m.gguf", 1, "", "", ""},
+      {"F16", "s1-mini-f16.gguf", 1, "", "", ""}},
      {"Q4_K_M", "F16"}},
 
     {"tencent/Hy-MT2-7B-GGUF",
@@ -2245,19 +2237,19 @@ static const real_repo real_repos[] = {
       {"HY-MT2-7B-Q8_0.gguf"},
       {"Hy-MT2-7B-Q4_K_M.gguf"}},
      {
-      {"", "Hy-MT2-7B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Hy-MT2-7B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "HY-MT2-7B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q6_K", "HY-MT2-7B-Q6_K.gguf", 1, "", "", "", "", ""}},
+      {"", "Hy-MT2-7B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Hy-MT2-7B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "HY-MT2-7B-Q8_0.gguf", 1, "", "", ""},
+      {"Q6_K", "HY-MT2-7B-Q6_K.gguf", 1, "", "", ""}},
      {"Q4_K_M", "Q8_0", "Q6_K"}},
 
     {"TrevorJS/gemma-4-26B-A4B-it-uncensored-GGUF",
      {{"gemma-4-26B-A4B-it-uncensored-Q4_K_M.gguf"},
       {"gemma-4-26B-A4B-it-uncensored-Q8_0.gguf"}},
      {
-      {"", "gemma-4-26B-A4B-it-uncensored-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "gemma-4-26B-A4B-it-uncensored-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "gemma-4-26B-A4B-it-uncensored-Q8_0.gguf", 1, "", "", "", "", ""}},
+      {"", "gemma-4-26B-A4B-it-uncensored-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "gemma-4-26B-A4B-it-uncensored-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "gemma-4-26B-A4B-it-uncensored-Q8_0.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M"}},
 
     {"ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF",
@@ -2267,11 +2259,11 @@ static const real_repo real_repos[] = {
       {"Q8_0/Swift-1.5-Qwen3.8-Flash-Next-Q8_0", 5},
       {"mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf"}},
      {
-      {"", "Q4_K_M/Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf", 3, "mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Q4_K_M/Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf", 3, "mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Q8_0/Swift-1.5-Qwen3.8-Flash-Next-Q8_0-00001-of-00005.gguf", 5, "mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"IQ1_M", "IQ1_M/Swift-1.5-Qwen3.8-Flash-Next-IQ1_M-00001-of-00002.gguf", 2, "mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "Q4_K_M/Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf", 3, "mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"Q4_K_M", "Q4_K_M/Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf", 3, "mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"Q8_0", "Q8_0/Swift-1.5-Qwen3.8-Flash-Next-Q8_0-00001-of-00005.gguf", 5, "mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"IQ1_M", "IQ1_M/Swift-1.5-Qwen3.8-Flash-Next-IQ1_M-00001-of-00002.gguf", 2, "mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q8_0", "Q4_K_M", "Q3_K_L", "IQ1_M"}},
 
     {"unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF",
@@ -2279,10 +2271,10 @@ static const real_repo real_repos[] = {
       {"DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf"},
       {"DeepSeek-R1-Distill-Qwen-32B-Q8_0.gguf"}},
      {
-      {"", "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "DeepSeek-R1-Distill-Qwen-32B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"F16", "DeepSeek-R1-Distill-Qwen-32B-F16/DeepSeek-R1-Distill-Qwen-32B-F16-00001-of-00002.gguf", 2, "", "", "", "", ""}},
+      {"", "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "DeepSeek-R1-Distill-Qwen-32B-Q8_0.gguf", 1, "", "", ""},
+      {"F16", "DeepSeek-R1-Distill-Qwen-32B-F16/DeepSeek-R1-Distill-Qwen-32B-F16-00001-of-00002.gguf", 2, "", "", ""}},
      {"Q8_0", "Q4_K_M", "F16"}},
 
     {"unsloth/DeepSeek-V4-Flash-0731-GGUF",
@@ -2292,10 +2284,10 @@ static const real_repo real_repos[] = {
       {"dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"},
       {"dspark/dspark-DeepSeek-V4-Flash-0731-BF16.gguf"}},
      {
-      {"", "UD-IQ1_M/DeepSeek-V4-Flash-0731-UD-IQ1_M-00001-of-00003.gguf", 3, "", "", "", "", "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"},
-      {"Q8_0", "", 0, "", "", "", "", "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"},
-      {"UD-IQ1_M", "UD-IQ1_M/DeepSeek-V4-Flash-0731-UD-IQ1_M-00001-of-00003.gguf", 3, "", "", "", "", "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"},
-      {"UD-Q8_K_XL", "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf", 5, "", "", "", "", "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"}},
+      {"", "UD-IQ1_M/DeepSeek-V4-Flash-0731-UD-IQ1_M-00001-of-00003.gguf", 3, "", "", "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"},
+      {"Q8_0", "", 0, "", "", "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"},
+      {"UD-IQ1_M", "UD-IQ1_M/DeepSeek-V4-Flash-0731-UD-IQ1_M-00001-of-00003.gguf", 3, "", "", "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"},
+      {"UD-Q8_K_XL", "UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf", 5, "", "", "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"}},
      {"Q8_K_XL", "IQ4_NL", "IQ1_M"}},
 
     {"unsloth/DeepSeek-V4-Flash-GGUF",
@@ -2303,18 +2295,18 @@ static const real_repo real_repos[] = {
       {"UD-IQ4_NL/DeepSeek-V4-Flash-UD-IQ4_NL", 4},
       {"UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL", 5}},
      {
-      {"", "UD-IQ1_M/DeepSeek-V4-Flash-UD-IQ1_M-00001-of-00003.gguf", 3, "", "", "", "", ""},
-      {"UD-IQ1_M", "UD-IQ1_M/DeepSeek-V4-Flash-UD-IQ1_M-00001-of-00003.gguf", 3, "", "", "", "", ""},
-      {"UD-Q8_K_XL", "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf", 5, "", "", "", "", ""}},
+      {"", "UD-IQ1_M/DeepSeek-V4-Flash-UD-IQ1_M-00001-of-00003.gguf", 3, "", "", ""},
+      {"UD-IQ1_M", "UD-IQ1_M/DeepSeek-V4-Flash-UD-IQ1_M-00001-of-00003.gguf", 3, "", "", ""},
+      {"UD-Q8_K_XL", "UD-Q8_K_XL/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf", 5, "", "", ""}},
      {"Q8_K_XL", "IQ4_NL", "IQ1_M"}},
 
     {"unsloth/DeepSeek-V4-Pro-0813-GGUF",
      {{"UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL", 20},
       {"UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL", 20}},
      {
-      {"", "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf", 20, "", "", "", "", ""},
-      {"UD-Q4_K_XL", "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf", 20, "", "", "", "", ""},
-      {"UD-Q8_K_XL", "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00001-of-00020.gguf", 20, "", "", "", "", ""}},
+      {"", "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf", 20, "", "", ""},
+      {"UD-Q4_K_XL", "UD-Q4_K_XL/DeepSeek-V4-Pro-0813-UD-Q4_K_XL-00001-of-00020.gguf", 20, "", "", ""},
+      {"UD-Q8_K_XL", "UD-Q8_K_XL/DeepSeek-V4-Pro-0813-UD-Q8_K_XL-00001-of-00020.gguf", 20, "", "", ""}},
      {"Q8_K_XL", "Q4_K_XL"}},
 
     {"unsloth/embeddinggemma-2-GGUF",
@@ -2326,11 +2318,11 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-Q8_0.gguf"}},
      {
-      {"", "embeddinggemma-2-Q8_0.gguf", 1, "mmproj-Q8_0.gguf", "", "", "", ""},
-      {"Q8_0", "embeddinggemma-2-Q8_0.gguf", 1, "mmproj-Q8_0.gguf", "", "", "", ""},
-      {"BF16", "embeddinggemma-2-BF16.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q6_K_XL", "embeddinggemma-2-UD-Q6_K_XL.gguf", 1, "mmproj-Q8_0.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "embeddinggemma-2-Q8_0.gguf", 1, "mmproj-Q8_0.gguf", "", ""},
+      {"Q8_0", "embeddinggemma-2-Q8_0.gguf", 1, "mmproj-Q8_0.gguf", "", ""},
+      {"BF16", "embeddinggemma-2-BF16.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q6_K_XL", "embeddinggemma-2-UD-Q6_K_XL.gguf", 1, "mmproj-Q8_0.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q6_K_XL", "Q4_K_XL", "Q8_0", "BF16"}},
 
     {"unsloth/GLM-4.7-Flash-GGUF",
@@ -2340,11 +2332,11 @@ static const real_repo real_repos[] = {
       {"GLM-4.7-Flash-Q8_0.gguf"},
       {"GLM-4.7-Flash-UD-TQ1_0.gguf"}},
      {
-      {"", "GLM-4.7-Flash-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "GLM-4.7-Flash-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "GLM-4.7-Flash-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "BF16/GLM-4.7-Flash-BF16-00001-of-00002.gguf", 2, "", "", "", "", ""},
-      {"UD-TQ1_0", "GLM-4.7-Flash-UD-TQ1_0.gguf", 1, "", "", "", "", ""}},
+      {"", "GLM-4.7-Flash-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "GLM-4.7-Flash-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "GLM-4.7-Flash-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "BF16/GLM-4.7-Flash-BF16-00001-of-00002.gguf", 2, "", "", ""},
+      {"UD-TQ1_0", "GLM-4.7-Flash-UD-TQ1_0.gguf", 1, "", "", ""}},
      {"TQ1_0", "Q8_0", "Q6_K", "Q4_K_M", "BF16"}},
 
     {"unsloth/GLM-5.3-Flash-GGUF",
@@ -2355,11 +2347,11 @@ static const real_repo real_repos[] = {
       {"mmproj-BF16.gguf"},
       {"mmproj-F16.gguf"}},
      {
-      {"", "Q8_0/GLM-5.3-Flash-Q8_0-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Q8_0/GLM-5.3-Flash-Q8_0-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/GLM-5.3-Flash-BF16-00001-of-00014.gguf", 14, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q6_K_XL", "UD-Q6_K_XL/GLM-5.3-Flash-UD-Q6_K_XL-00001-of-00007.gguf", 7, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Q8_0/GLM-5.3-Flash-Q8_0-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Q8_0/GLM-5.3-Flash-Q8_0-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/GLM-5.3-Flash-BF16-00001-of-00014.gguf", 14, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q6_K_XL", "UD-Q6_K_XL/GLM-5.3-Flash-UD-Q6_K_XL-00001-of-00007.gguf", 7, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q6_K_XL", "IQ4_XS", "Q8_0", "BF16"}},
 
     {"unsloth/GLM-5.3-GGUF",
@@ -2368,10 +2360,10 @@ static const real_repo real_repos[] = {
       {"UD-IQ4_XS/GLM-5.3-UD-IQ4_XS", 9},
       {"UD-Q6_K_XL/GLM-5.3-UD-Q6_K_XL", 16}},
      {
-      {"", "Q8_0/GLM-5.3-Q8_0-00001-of-00017.gguf", 17, "", "", "", "", ""},
-      {"Q8_0", "Q8_0/GLM-5.3-Q8_0-00001-of-00017.gguf", 17, "", "", "", "", ""},
-      {"BF16", "BF16/GLM-5.3-BF16-00001-of-00033.gguf", 33, "", "", "", "", ""},
-      {"UD-Q6_K_XL", "UD-Q6_K_XL/GLM-5.3-UD-Q6_K_XL-00001-of-00016.gguf", 16, "", "", "", "", ""}},
+      {"", "Q8_0/GLM-5.3-Q8_0-00001-of-00017.gguf", 17, "", "", ""},
+      {"Q8_0", "Q8_0/GLM-5.3-Q8_0-00001-of-00017.gguf", 17, "", "", ""},
+      {"BF16", "BF16/GLM-5.3-BF16-00001-of-00033.gguf", 33, "", "", ""},
+      {"UD-Q6_K_XL", "UD-Q6_K_XL/GLM-5.3-UD-Q6_K_XL-00001-of-00016.gguf", 16, "", "", ""}},
      {"Q6_K_XL", "IQ4_XS", "Q8_0", "BF16"}},
 
     {"unsloth/inkling-GGUF",
@@ -2381,10 +2373,10 @@ static const real_repo real_repos[] = {
       {"UD-Q4_K_XL/inkling-UD-Q4_K_XL", 14},
       {"mmproj-BF16.gguf"}},
      {
-      {"", "Q8_0/inkling-GGUF-Q8_0-00001-of-00019.gguf", 19, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Q8_0/inkling-GGUF-Q8_0-00001-of-00019.gguf", 19, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/inkling-GGUF-BF16-00001-of-00041.gguf", 41, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q4_K_XL", "UD-Q4_K_XL/inkling-UD-Q4_K_XL-00001-of-00014.gguf", 14, "mmproj-BF16.gguf", "", "", "", ""}},
+      {"", "Q8_0/inkling-GGUF-Q8_0-00001-of-00019.gguf", 19, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Q8_0/inkling-GGUF-Q8_0-00001-of-00019.gguf", 19, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/inkling-GGUF-BF16-00001-of-00041.gguf", 41, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q4_K_XL", "UD-Q4_K_XL/inkling-UD-Q4_K_XL-00001-of-00014.gguf", 14, "mmproj-BF16.gguf", "", ""}},
      {"Q4_K_XL", "IQ1_S", "Q8_0", "BF16"}},
 
     {"unsloth/Kimi-K2.6-GGUF",
@@ -2395,10 +2387,10 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "BF16/Kimi-K2.6-BF16-00001-of-00046.gguf", 46, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/Kimi-K2.6-BF16-00001-of-00046.gguf", 46, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "UD-Q8_K_XL/Kimi-K2.6-UD-Q8_K_XL-00001-of-00014.gguf", 14, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "BF16/Kimi-K2.6-BF16-00001-of-00046.gguf", 46, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/Kimi-K2.6-BF16-00001-of-00046.gguf", 46, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q8_K_XL", "UD-Q8_K_XL/Kimi-K2.6-UD-Q8_K_XL-00001-of-00014.gguf", 14, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_XL", "Q4_K_XL", "BF16"}},
 
     {"unsloth/Kimi-K2.7-Code-GGUF",
@@ -2409,10 +2401,10 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "UD-IQ1_M/Kimi-K2.7-Code-UD-IQ1_M-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-IQ1_M", "UD-IQ1_M/Kimi-K2.7-Code-UD-IQ1_M-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "UD-Q8_K_XL/Kimi-K2.7-Code-UD-Q8_K_XL-00001-of-00014.gguf", 14, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "UD-IQ1_M/Kimi-K2.7-Code-UD-IQ1_M-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", ""},
+      {"UD-IQ1_M", "UD-IQ1_M/Kimi-K2.7-Code-UD-IQ1_M-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q8_K_XL", "UD-Q8_K_XL/Kimi-K2.7-Code-UD-Q8_K_XL-00001-of-00014.gguf", 14, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q8_K_XL", "Q2_K_XL", "IQ1_M"}},
 
     {"unsloth/Kimi-K3-GGUF",
@@ -2423,10 +2415,10 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "UD-IQ1_M/Kimi-K3-UD-IQ1_M-00001-of-00015.gguf", 15, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-IQ1_M", "UD-IQ1_M/Kimi-K3-UD-IQ1_M-00001-of-00015.gguf", 15, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-TQ2_0", "UD-TQ2_0/Kimi-K3-UD-TQ2_0-00001-of-00013.gguf", 13, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "UD-IQ1_M/Kimi-K3-UD-IQ1_M-00001-of-00015.gguf", 15, "mmproj-BF16.gguf", "", ""},
+      {"UD-IQ1_M", "UD-IQ1_M/Kimi-K3-UD-IQ1_M-00001-of-00015.gguf", 15, "mmproj-BF16.gguf", "", ""},
+      {"UD-TQ2_0", "UD-TQ2_0/Kimi-K3-UD-TQ2_0-00001-of-00013.gguf", 13, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"TQ2_0", "Q2_K_XL", "IQ1_M"}},
 
     {"unsloth/LFM2.5-VL-3B-GGUF",
@@ -2439,12 +2431,12 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "LFM2.5-VL-3B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "LFM2.5-VL-3B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "LFM2.5-VL-3B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "LFM2.5-VL-3B-BF16.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "LFM2.5-VL-3B-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "LFM2.5-VL-3B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "LFM2.5-VL-3B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "LFM2.5-VL-3B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "LFM2.5-VL-3B-BF16.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q8_K_XL", "LFM2.5-VL-3B-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_XL", "Q8_0", "Q5_K_S", "Q4_K_M", "BF16"}},
 
     {"unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
@@ -2453,10 +2445,10 @@ static const real_repo real_repos[] = {
       {"NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q3_K_XL.gguf"},
       {"NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q8_K_XL.gguf"}},
      {
-      {"", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "BF16/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16-00001-of-00002.gguf", 2, "", "", "", "", ""},
-      {"UD-Q8_K_XL", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q8_K_XL.gguf", 1, "", "", "", "", ""}},
+      {"", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "BF16/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16-00001-of-00002.gguf", 2, "", "", ""},
+      {"UD-Q8_K_XL", "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q8_K_XL.gguf", 1, "", "", ""}},
      {"Q8_K_XL", "Q3_K_XL", "Q8_0", "BF16"}},
 
     {"unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
@@ -2466,11 +2458,11 @@ static const real_repo real_repos[] = {
       {"Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"},
       {"Qwen3-30B-A3B-Instruct-2507-UD-TQ1_0.gguf"}},
      {
-      {"", "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "BF16/Qwen3-30B-A3B-Instruct-2507-BF16-00001-of-00002.gguf", 2, "", "", "", "", ""},
-      {"UD-TQ1_0", "Qwen3-30B-A3B-Instruct-2507-UD-TQ1_0.gguf", 1, "", "", "", "", ""}},
+      {"", "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "BF16/Qwen3-30B-A3B-Instruct-2507-BF16-00001-of-00002.gguf", 2, "", "", ""},
+      {"UD-TQ1_0", "Qwen3-30B-A3B-Instruct-2507-UD-TQ1_0.gguf", 1, "", "", ""}},
      {"TQ1_0", "Q8_0", "Q6_K", "Q4_K_M", "BF16"}},
 
     {"unsloth/Qwen3-VL-30B-A3B-Instruct-GGUF",
@@ -2483,12 +2475,12 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3-VL-30B-A3B-Instruct-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/Qwen3-VL-30B-A3B-Instruct-BF16-00001-of-00002.gguf", 2, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-TQ1_0", "Qwen3-VL-30B-A3B-Instruct-UD-TQ1_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Qwen3-VL-30B-A3B-Instruct-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/Qwen3-VL-30B-A3B-Instruct-BF16-00001-of-00002.gguf", 2, "mmproj-BF16.gguf", "", ""},
+      {"UD-TQ1_0", "Qwen3-VL-30B-A3B-Instruct-UD-TQ1_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"TQ1_0", "Q8_0", "Q6_K", "Q4_K_M", "BF16"}},
 
     {"unsloth/Qwen3.5-27B-GGUF",
@@ -2501,12 +2493,12 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Qwen3.5-27B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.5-27B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.5-27B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/Qwen3.5-27B-BF16-00001-of-00002.gguf", 2, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "Qwen3.5-27B-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.5-27B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.5-27B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Qwen3.5-27B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/Qwen3.5-27B-BF16-00001-of-00002.gguf", 2, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q8_K_XL", "Qwen3.5-27B-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_XL", "Q8_0", "Q6_K", "Q4_K_M", "BF16"}},
 
     {"unsloth/Qwen3.5-35B-A3B-GGUF",
@@ -2519,12 +2511,12 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Qwen3.5-35B-A3B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Qwen3.5-35B-A3B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.5-35B-A3B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002.gguf", 2, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "Qwen3.5-35B-A3B-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.5-35B-A3B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "Qwen3.5-35B-A3B-Q4_K_M.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Qwen3.5-35B-A3B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/Qwen3.5-35B-A3B-BF16-00001-of-00002.gguf", 2, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q8_K_XL", "Qwen3.5-35B-A3B-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_XL", "IQ3_S", "Q8_0", "Q4_K_M", "BF16"}},
 
     {"unsloth/Qwen3.5-397B-A17B-GGUF",
@@ -2537,12 +2529,12 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4_K_M", "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Q8_0/Qwen3.5-397B-A17B-Q8_0-00001-of-00010.gguf", 10, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/Qwen3.5-397B-A17B-BF16-00001-of-00017.gguf", 17, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00001-of-00010.gguf", 10, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Q8_0/Qwen3.5-397B-A17B-Q8_0-00001-of-00010.gguf", 10, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/Qwen3.5-397B-A17B-BF16-00001-of-00017.gguf", 17, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q8_K_XL", "UD-Q8_K_XL/Qwen3.5-397B-A17B-UD-Q8_K_XL-00001-of-00010.gguf", 10, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_XL", "IQ3_XXS", "Q8_0", "Q4_K_M", "BF16"}},
 
     {"unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
@@ -2554,11 +2546,11 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Qwen3.6-35B-A3B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Qwen3.6-35B-A3B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf", 2, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.6-35B-A3B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Qwen3.6-35B-A3B-Q8_0.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf", 2, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q8_K_XL", "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_XL", "Q3_K_M", "Q8_0", "BF16"}},
 
     {"unsloth/Qwen3.8-Flash-Next-GGUF",
@@ -2576,11 +2568,11 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mtp-Qwen3.8-Flash-Next-Q8_0.gguf"}},
      {
-      {"", "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""},
-      {"Q4_K_M", "", 0, "", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""},
-      {"Q8_0", "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""},
-      {"BF16", "BF16/Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""},
-      {"UD-Q6_K_XL", "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", "", "", ""}},
+      {"", "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", ""},
+      {"Q4_K_M", "", 0, "", "", ""},
+      {"Q8_0", "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q6_K_XL", "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", ""}},
      {"Q6_K_XL", "IQ4_XS", "Q8_0", "BF16"}},
 
     {"unsloth/Step-3.7-Flash-GGUF",
@@ -2592,29 +2584,29 @@ static const real_repo real_repos[] = {
       {"mmproj-F16.gguf"},
       {"mmproj-F32.gguf"}},
      {
-      {"", "Q8_0/Step-3.7-Flash-Q8_0-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q8_0", "Q8_0/Step-3.7-Flash-Q8_0-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "BF16/Step-3.7-Flash-BF16-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", "", "", ""},
-      {"UD-Q8_K_XL", "UD-Q8_K_XL/Step-3.7-Flash-UD-Q8_K_XL-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", "", "", ""},
-      {"F16", "", 0, "", "", "", "", ""}},
+      {"", "Q8_0/Step-3.7-Flash-Q8_0-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", ""},
+      {"Q8_0", "Q8_0/Step-3.7-Flash-Q8_0-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "BF16/Step-3.7-Flash-BF16-00001-of-00008.gguf", 8, "mmproj-BF16.gguf", "", ""},
+      {"UD-Q8_K_XL", "UD-Q8_K_XL/Step-3.7-Flash-UD-Q8_K_XL-00001-of-00006.gguf", 6, "mmproj-BF16.gguf", "", ""},
+      {"F16", "", 0, "", "", ""}},
      {"Q8_K_XL", "Q3_K_M", "Q8_0", "BF16"}},
 
     {"vmlinux/Qwen3.8-Flash-Next-Uncensored-Gufo-Q4Mix-GGUF",
      {{"Qwen3.8-Flash-Next-Uncensored-Gufo-Q4Mix.gguf"},
       {"mmproj-BF16.gguf"}},
      {
-      {"", "Qwen3.8-Flash-Next-Uncensored-Gufo-Q4Mix.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"Q4MIX", "Qwen3.8-Flash-Next-Uncensored-Gufo-Q4Mix.gguf", 1, "mmproj-BF16.gguf", "", "", "", ""},
-      {"BF16", "", 0, "", "", "", "", ""}},
+      {"", "Qwen3.8-Flash-Next-Uncensored-Gufo-Q4Mix.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"Q4MIX", "Qwen3.8-Flash-Next-Uncensored-Gufo-Q4Mix.gguf", 1, "mmproj-BF16.gguf", "", ""},
+      {"BF16", "", 0, "", "", ""}},
      {"Q4MIX"}},
 
     {"WalkingCat/Soprano-1.1-80M-GGUF",
      {{"Soprano-1.1-80M-GGUF/soprano-1.1-80m-bf16.gguf"},
       {"Soprano-1.1-80M-GGUF/soprano-1.1-80m-q8_0.gguf"}},
      {
-      {"", "Soprano-1.1-80M-GGUF/soprano-1.1-80m-q8_0.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "Soprano-1.1-80M-GGUF/soprano-1.1-80m-q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "Soprano-1.1-80M-GGUF/soprano-1.1-80m-bf16.gguf", 1, "", "", "", "", ""}},
+      {"", "Soprano-1.1-80M-GGUF/soprano-1.1-80m-q8_0.gguf", 1, "", "", ""},
+      {"Q8_0", "Soprano-1.1-80M-GGUF/soprano-1.1-80m-q8_0.gguf", 1, "", "", ""},
+      {"BF16", "Soprano-1.1-80M-GGUF/soprano-1.1-80m-bf16.gguf", 1, "", "", ""}},
      {"Q8_0", "BF16"}},
 
     {"yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF",
@@ -2624,10 +2616,10 @@ static const real_repo real_repos[] = {
       {"gemma4-v2-Q4_K_M.gguf"},
       {"gemma4-v2-Q8_0.gguf"}},
      {
-      {"", "gemma4-v2-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "gemma4-v2-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q8_0", "MTP/gemma-4-12B-it-MTP-Q8_0.gguf", 1, "", "", "", "", ""},
-      {"BF16", "MTP/gemma-4-12B-it-MTP-BF16.gguf", 1, "", "", "", "", ""}},
+      {"", "gemma4-v2-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "gemma4-v2-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q8_0", "MTP/gemma-4-12B-it-MTP-Q8_0.gguf", 1, "", "", ""},
+      {"BF16", "MTP/gemma-4-12B-it-MTP-BF16.gguf", 1, "", "", ""}},
      {"Q8_0", "Q4_K_M", "Q3_K_M", "BF16"}},
 
     {"zetasepic/Qwen2.5-72B-Instruct-abliterated-GGUF",
@@ -2635,10 +2627,10 @@ static const real_repo real_repos[] = {
       {"Qwen2.5-72B-Instruct-abliterated-Q4_K_M.gguf"},
       {"Qwen2.5-72B-Instruct-abliterated-Q6_K", 2}},
      {
-      {"", "Qwen2.5-72B-Instruct-abliterated-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q4_K_M", "Qwen2.5-72B-Instruct-abliterated-Q4_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q3_K_M", "Qwen2.5-72B-Instruct-abliterated-Q3_K_M.gguf", 1, "", "", "", "", ""},
-      {"Q6_K", "Qwen2.5-72B-Instruct-abliterated-Q6_K-00001-of-00002.gguf", 2, "", "", "", "", ""}},
+      {"", "Qwen2.5-72B-Instruct-abliterated-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q4_K_M", "Qwen2.5-72B-Instruct-abliterated-Q4_K_M.gguf", 1, "", "", ""},
+      {"Q3_K_M", "Qwen2.5-72B-Instruct-abliterated-Q3_K_M.gguf", 1, "", "", ""},
+      {"Q6_K", "Qwen2.5-72B-Instruct-abliterated-Q6_K-00001-of-00002.gguf", 2, "", "", ""}},
      {"Q6_K", "Q4_K_M", "Q3_K_M"}},
 };
 
@@ -2674,9 +2666,7 @@ static void check_real_plan(const real_repo & r, const real_plan & p) {
 
     common_download_opts opts;
     opts.download_mmproj = true;
-    opts.download_mtp    = true;
     opts.download_dflash = true;
-    opts.download_eagle3 = true;
     opts.download_dspark = true;
 
     auto plan = common_download_get_hf_plan(model_ref(g_context), opts);
@@ -2684,9 +2674,7 @@ static void check_real_plan(const real_repo & r, const real_plan & p) {
     expect_eq("primary", plan.primary.path, p.primary);
     expect_eq("parts",   std::to_string(plan.model_files.size()), std::to_string(p.parts));
     expect_eq("mmproj",  plan.mmproj.path, p.mmproj);
-    expect_eq("mtp",     plan.mtp.path,    p.mtp);
     expect_eq("dflash",  plan.dflash.path, p.dflash);
-    expect_eq("eagle3",  plan.eagle3.path, p.eagle3);
     expect_eq("dspark",  plan.dspark.path, p.dspark);
 }
 
@@ -2818,28 +2806,28 @@ static void test_task_assembly() {
     {
         // -hf with a spec type wires the sidecar of the main repo as fallback draft
         common_params params;
-        assemble({"server", "-hf", "test/main:Q8_0", "--spec-type", "draft-mtp"}, params);
-        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/main", "mtp-model-Q8_0.gguf"));
+        assemble({"server", "-hf", "test/main:Q8_0", "--spec-type", "draft-dflash"}, params);
+        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/main", "dflash-model-Q8_0.gguf"));
     }
     {
         // -hfd with a spec type wires the draft repo sidecar at its tag,
         // not its full model, and suppresses the main repo fallback
         common_params params;
-        assemble({"server", "-hf", "test/hole:Q8_0", "-hfd", "test/hole:Q4_0", "--spec-type", "draft-mtp"}, params);
-        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/hole", "mtp-model-Q4_0.gguf"));
+        assemble({"server", "-hf", "test/hole:Q8_0", "-hfd", "test/hole:BF16", "--spec-type", "draft-dflash"}, params);
+        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/hole", "dflash-model-BF16.gguf"));
     }
     {
         // an explicit -md file wins over the sidecar resolution
         common_params params;
-        assemble({"server", "-hf", "test/main:Q8_0", "-hfd", "test/main", "-md", "mtp-model-BF16.gguf", "--spec-type", "draft-mtp"}, params);
-        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/main", "mtp-model-BF16.gguf"));
+        assemble({"server", "-hf", "test/main:Q8_0", "-hfd", "test/main", "-md", "dflash-model-BF16.gguf", "--spec-type", "draft-dflash"}, params);
+        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/main", "dflash-model-BF16.gguf"));
     }
     {
-        // -hfd without a spec type auto-selects the type, mtp first when all ship
+        // -hfd without a spec type auto-selects the type, dspark first when all ship
         common_params params;
         assemble({"server", "-hf", "test/main:Q8_0", "-hfd", "test/quad:Q8_0"}, params);
-        REQUIRE(params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_DRAFT_MTP});
-        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/quad", "mtp-model-Q8_0.gguf"));
+        REQUIRE(params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK});
+        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/quad", "dspark-model-Q8_0.gguf"));
     }
     {
         // auto-selection with only a dflash sidecar
@@ -2849,11 +2837,11 @@ static void test_task_assembly() {
         REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/dflash", "dflash-model-Q8_0.gguf"));
     }
     {
-        // auto-selection with only an eagle3 sidecar
+        // an eagle3 sidecar is not a supported draft, the full model of the draft repo is used
         common_params params;
         assemble({"server", "-hf", "test/main:Q8_0", "-hfd", "test/eagle3:Q8_0"}, params);
-        REQUIRE(params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3});
-        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/eagle3", "eagle3-model-Q8_0.gguf"));
+        REQUIRE(params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE});
+        REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/eagle3", "model-Q8_0.gguf"));
     }
     {
         // auto-selection prefers dspark over dflash when both ship

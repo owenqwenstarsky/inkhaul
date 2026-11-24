@@ -302,7 +302,7 @@ struct server_slot {
 
     llama_tokens spec_draft;
 
-    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+    // draft candidates per token in spec_draft; only draft-simple fills it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
@@ -517,7 +517,6 @@ struct server_slot {
         if (task->type == SERVER_TASK_TYPE_DECISION && !llama_get_causal_attn(ctx_tgt)) {
             return false;
         }
-        // MTP supports splitting - uses task->need_embd() not need_embd()
         if (!task->need_embd()) {
             return true;
         }
@@ -1234,11 +1233,7 @@ private:
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
-        const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        const bool has_spec = params.speculative.has_dft();
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1315,7 +1310,7 @@ private:
             }
         }
 
-        // note: the draft / MTP context is fitted together with the target model, see common_fit_extra_model
+        // note: the draft context is fitted together with the target model, see common_fit_extra_model
 
         // attach a progress callback
         {
@@ -1352,7 +1347,6 @@ private:
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
         if (has_spec) {
-            // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
 
@@ -1363,17 +1357,17 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                spec_init = common_speculative_init_from_params(params_dft, ctx_tgt);
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
-                if (has_draft && model_dft == nullptr) {
+                if (model_dft == nullptr) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                     return false;
                 }
 
                 if (ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create MTP context\n");
+                    SRV_ERR("%s", "failed to create the draft context\n");
                     return false;
                 }
 
@@ -4445,9 +4439,7 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output;
-                        // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_nextn into ctx_dft.
+                        // embedding requires all tokens in the batch to be output
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
