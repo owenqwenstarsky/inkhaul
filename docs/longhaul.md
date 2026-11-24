@@ -35,6 +35,15 @@ The slots are shared by all layers. Files that give the experts of some layers a
 
 Without any hits a token reads about 384 x 5 MB, about 1.9 GB, from the SSD. Generation speed is therefore bound by the SSD speed and the hit rate. The resident part of the model is about 1 GB.
 
+To estimate for another file or cache size, with `E` = bytes per expert (gate_up + down), `L` = MoE layer passes per token, `k` = experts per token and `h` = hit rate:
+
+- disk read per generated token: about `L * k * (1 - h) * E`
+- generated tokens per second: at most `SSD read speed / (L * k * (1 - h) * E)`
+- cache slots: about `cache size / E`
+- the cache holds all experts of a layer, with no `n_ubatch` limit, from `n_expert` slots (128 for Mini)
+
+For Mini (`L` = 48, `k` = 8, `E` ~ 5 MB) at a hit rate of 50%, a token reads about 0.96 GB. The hit rate depends on the prompt and the routing, so measure it with the stats line below or replay a trace.
+
 ## Reading the stats
 
 At exit the cache logs one line per batch class:

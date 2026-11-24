@@ -2,7 +2,7 @@
 
 Goal: run Inkling 2 Mini on an M5 MacBook (24 GB unified memory) by keeping the routed expert weights on disk and holding only a fixed-size expert cache in RAM (default 512 MiB, set with one flag, always on). Then strip the fork down to Inkling 2 on Apple Silicon.
 
-Status: approved. Phases 1-4 are committed (see 12-15). Phase 5 is open.
+Status: approved. Phases 1-5 are committed (see 12-16).
 
 Target: [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF). The model is not downloaded or run during this work.
 
@@ -423,3 +423,11 @@ Phase 4 follow-ups (not blocking):
 - The diffusion params in common (`LLAMA_EXAMPLE_DIFFUSION`, `--diffusion-*`) and `llama_model_is_diffusion` are dead now that `examples/diffusion` is gone.
 - `ui-publish.yml` has no caller left (`release-publish.yml` is deleted). It is kept with the UI workflows.
 - `tools/fit-params/README.md` shows sample output from a CUDA machine.
+
+---
+
+## 16. Phase 5 status (done)
+
+- `docs/longhaul.md` replaces `docs/moe-cache.md`. It covers what is cached, the flag, the sizing formula with Mini's numbers and a table, the prefill vs cache-size trade-off, the stats line, the I/O thread count and the trace for offline sizing. The numbers are estimates from the model card, not measurements.
+- `scripts/moe-cache-tune.py` is deleted.
+- The README fork notice and quick start were added in Phase 4. The quick start pins `-hf AtomicChat/Inkling-2-Mini-GGUF:Q4_K`, because without a tag `-hf` falls back to the first model file when the repo has no Q4_K_M or Q8_0.
