@@ -76,7 +76,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
 | `--list-devices` | print list of available devices and exit |
 | `-ot, --override-tensor <tensor name pattern>=<buffer type>,...` | override tensor buffer type<br/>(env: LLAMA_ARG_OVERRIDE_TENSOR) |
-| `-lhc, --longhaul-cache SIZE` | LongHaul: RAM cache for the MoE experts, which stay on disk; a number in MiB or with a K, M or G suffix, e.g. 512M, 1G, 2G (default: 512M)<br/>a larger cache gives faster generation and prompt processing<br/>(env: LLAMA_ARG_LONGHAUL_CACHE) |
+| `-lhc, --longhaul-cache SIZE` | LongHaul: GPU memory cache for the MoE experts, which stay on disk; a number in MiB or with a K, M or G suffix, e.g. 512M, 1G, 2G (default: 512M)<br/>a larger cache gives faster generation and prompt processing<br/>(env: LLAMA_ARG_LONGHAUL_CACHE) |
 | `-ncffn, --n-cpu-ffn N` | keep the dense FFN weights of the first N layers in the CPU<br/>(dense models; MoE experts always stay on disk, see --longhaul-cache)<br/>(env: LLAMA_ARG_N_CPU_FFN) |
 | `-ngl, --gpu-layers, --n-gpu-layers N` | max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS) |
 | `-sm, --split-mode {none,layer,row}` | how to split the model across multiple GPUs, one of:<br/>- none: use one GPU only<br/>- layer (default): split layers and KV across GPUs (pipelined)<br/>- row: split weight across GPUs by rows (parallelized)<br/>(env: LLAMA_ARG_SPLIT_MODE) |

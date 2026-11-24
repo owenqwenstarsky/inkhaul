@@ -31,6 +31,9 @@ LLAMA_API std::string llama_arch_kv_name(llm_arch arch, llm_kv key);
 
 LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
 
+// true if the model keeps its experts on disk (LongHaul), then all its layers must be on one GPU
+LLAMA_API bool llama_model_has_longhaul(const struct llama_model * model);
+
 // FIXME temporary function for better error messages
 LLAMA_API bool llama_arch_supports_save(llm_arch arch);
 

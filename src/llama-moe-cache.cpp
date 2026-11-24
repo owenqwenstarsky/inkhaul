@@ -442,7 +442,10 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
     std::vector<read_job> jobs;
-    std::vector<std::vector<uint8_t>> staging; // [n_io_threads]
+    std::vector<uint8_t *> staging; // [n_io_threads]
+    size_t staging_thread_size = 0;
+    ggml_backend_buffer_ptr staging_buf; // pinned memory of the device if it has a host buffer type (CUDA)
+    std::vector<uint8_t> staging_mem;   // else plain memory (Metal)
     std::unique_ptr<moe_cache_io_pool> io_pool;
     std::mutex set_mtx; // the uploads to the banks, the backends do not promise concurrent set_tensor
 
@@ -465,7 +468,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (devices.empty()) {
-            throw std::runtime_error("LongHaul requires a GPU backend (Metal) for the expert cache");
+            throw std::runtime_error("LongHaul requires a GPU backend (CUDA or Metal) for the expert cache");
         }
         if (model.hparams.n_expert == 0 || n_expert_used == 0) {
             throw std::runtime_error("LongHaul requires a MoE model");
@@ -519,6 +522,10 @@ struct llama_moe_cache::impl {
         }
         if (groups.empty()) {
             throw std::runtime_error("LongHaul: the model has no experts on disk");
+        }
+        // one GPU: a loop pass on another device than the layer that owns its experts would need the banks of that device
+        if (std::any_of(groups.begin(), groups.end(), [&](const group & g) { return g.id != groups[0].id; })) {
+            throw std::runtime_error("LongHaul supports one GPU, select it with -dev (for example -dev CUDA0) or use -sm none");
         }
 
         // one extra slot at the end, some kernels read past the last expert
@@ -677,9 +684,25 @@ struct llama_moe_cache::impl {
                 n_io_threads = std::clamp(atoi(env), 1, 64);
             }
             io_pool = std::make_unique<moe_cache_io_pool>(n_io_threads);
-            staging.resize(n_io_threads);
-            for (auto & buf : staging) {
-                buf.resize(std::max(staging_size, max_expert_size));
+
+            // pinned memory makes the uploads to a discrete GPU faster
+            staging_thread_size = GGML_PAD(std::max(staging_size, max_expert_size), 64);
+            uint8_t * base = nullptr;
+            ggml_backend_buffer_type_t buft_staging = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(devices[groups[0].id].backend));
+            if (buft_staging != nullptr) {
+                staging_buf.reset(ggml_backend_buft_alloc_buffer(buft_staging, staging_thread_size*n_io_threads));
+                if (staging_buf) {
+                    base = (uint8_t *) ggml_backend_buffer_get_base(staging_buf.get());
+                } else {
+                    LLAMA_LOG_WARN("llama_moe_cache: failed to allocate %s staging buffers, using plain memory\n", ggml_backend_buft_name(buft_staging));
+                }
+            }
+            if (base == nullptr) {
+                staging_mem.resize(staging_thread_size*n_io_threads);
+                base = staging_mem.data();
+            }
+            for (int i = 0; i < n_io_threads; ++i) {
+                staging.push_back(base + i*staging_thread_size);
             }
         }
 
@@ -846,7 +869,7 @@ struct llama_moe_cache::impl {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
             const size_t expert_size = w->nb[2];
-            const size_t max_run     = std::max<size_t>(1, staging[0].size()/expert_size);
+            const size_t max_run     = std::max<size_t>(1, staging_thread_size/expert_size);
             for (size_t i = 0; i < fills.size();) {
                 size_t n = 1;
                 while (i + n < fills.size() && n < max_run && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
@@ -859,7 +882,7 @@ struct llama_moe_cache::impl {
         }
         io_pool->run(jobs.size(), [&](size_t j, int thread) {
             const read_job & job = jobs[j];
-            uint8_t * buf = staging[thread].data();
+            uint8_t * buf = staging[thread];
             model.longhaul_read(job.w, buf, job.offs_src, job.size);
             std::lock_guard<std::mutex> lock(set_mtx);
             ggml_backend_tensor_set(job.bank, buf, job.offs_dst, job.size);
@@ -919,14 +942,8 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
         if (w == nullptr) {
             continue;
         }
-        ggml_tensor * experts = pimpl->get_experts(w);
-        if (experts == nullptr) {
+        if (pimpl->get_experts(w) == nullptr) {
             GGML_ABORT("LongHaul: %s is not in the expert cache", w->name);
-        }
-        // the device of the cache must compute the matmul, else the scheduler copies the cache to another backend
-        ggml_tensor * b = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, experts->ne[0], w == layer.down_exps ? selected_experts->ne[0] : 1, selected_experts->ne[1]);
-        if (!ggml_backend_supports_op(pimpl->backend(il), ggml_mul_mat_id(ctx0, experts, b, selected_experts))) {
-            GGML_ABORT("LongHaul: the GPU does not support MUL_MAT_ID for %s (%s)", w->name, ggml_type_name(w->type));
         }
     }
 
@@ -950,6 +967,14 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
     return { il, ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]) };
 }
 
+void llama_moe_cache::check_op(const ggml_tensor * w, const ggml_tensor * op) const {
+    // the device of the cache must compute the matmul, else the scheduler copies the cache to another backend
+    GGML_ASSERT(pimpl->get_experts(w) != nullptr);
+    if (!ggml_backend_supports_op(pimpl->devices[pimpl->groups[0].id].backend, op)) {
+        GGML_ABORT("LongHaul: the GPU does not support %s for %s (%s)", ggml_op_desc(op), w->name, ggml_type_name(w->type));
+    }
+}
+
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
 }
@@ -962,11 +987,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
         }
     }
     if (pimpl->buf_host) {
-        size_t staging_size = 0;
-        for (const auto & buf : pimpl->staging) {
-            staging_size += buf.size();
-        }
-        res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size + staging_size;
+        res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size + pimpl->staging_mem.size();
+    }
+    if (pimpl->staging_buf) {
+        res[ggml_backend_buffer_get_type(pimpl->staging_buf.get())] += ggml_backend_buffer_get_size(pimpl->staging_buf.get());
     }
     return res;
 }
