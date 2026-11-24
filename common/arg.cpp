@@ -2732,47 +2732,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
-        {"-cmoe", "--cpu-moe"},
-        "keep all Mixture of Experts (MoE) weights in the CPU",
-        [](common_params & params) {
-            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
-        }
-    ).set_env("LLAMA_ARG_CPU_MOE"));
-    add_opt(common_arg(
-        {"-ncmoe", "--n-cpu-moe"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
-            llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
-        }
-    ).set_env("LLAMA_ARG_N_CPU_MOE"));
-    add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
-            params.moe_cache_size = (size_t) value*1024*1024;
-        }
-    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
-    add_opt(common_arg(
-        {"--moe-cache-cpu-share"}, "F",
-        string_format("share of the MoE cache misses that the CPU computes from the host experts instead of uploading them to the GPU once the cache is full, from 0 to 1 (default: %.2f)", (double) params.moe_cache_cpu_share),
+        {"-lhc", "--longhaul-cache"}, "SIZE",
+        string_format("LongHaul: RAM cache for the MoE experts, which stay on disk; a number in MiB or with a K, M or G suffix, e.g. 512M, 1G, 2G (default: %zuM)\n"
+        "a larger cache gives faster generation and prompt processing", params.longhaul_cache_size/(1024*1024)),
         [](common_params & params, const std::string & value) {
-            const float share = std::stof(value);
-            if (share < 0.0f || share > 1.0f) {
-                throw std::invalid_argument("invalid value");
-            }
-            params.moe_cache_cpu_share = share;
+            params.longhaul_cache_size = string_parse_mem_size(value);
         }
-    ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
+    ).set_env("LLAMA_ARG_LONGHAUL_CACHE"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
-        "(dense models; for MoE expert weights use --n-cpu-moe)",
+        "(dense models; MoE experts always stay on disk, see --longhaul-cache)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -4181,23 +4151,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.speculative.draft.tensor_buft_overrides);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg(
-        {"--spec-draft-cpu-moe", "-cmoed", "--cpu-moe-draft"},
-        "keep all Mixture of Experts (MoE) weights in the CPU for the draft model",
-        [](common_params & params) {
-            params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
-    add_opt(common_arg(
-        {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
-            llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
-        }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",

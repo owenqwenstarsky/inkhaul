@@ -196,6 +196,30 @@ static void test(void) {
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // LongHaul cache size
+    {
+        common_params lh_params;
+        assert(lh_params.longhaul_cache_size == 512ull*1024*1024);
+
+        const std::vector<std::pair<std::string, size_t>> valid = {
+            { "512M",  512ull << 20 },
+            { "1G",    1ull << 30 },
+            { "2GiB",  2ull << 30 },
+            { "1536",  1536ull << 20 },
+            { "768mb", 768ull << 20 },
+            { "64K",   64ull << 10 },
+        };
+        for (const auto & [value, bytes] : valid) {
+            argv = {"binary_name", "-m", "model_file.gguf", "--longhaul-cache", value};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), lh_params, LLAMA_EXAMPLE_COMMON));
+            assert(lh_params.longhaul_cache_size == bytes);
+        }
+        for (const std::string value : { "0", "0G", "abc", "1T", "-1G", "1.5G", "99999999999999999999G" }) {
+            argv = {"binary_name", "-m", "model_file.gguf", "-lhc", value};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), lh_params, LLAMA_EXAMPLE_COMMON));
+        }
+    }
+
     {
         common_params penalty_params;
         assert(penalty_params.sampling.penalty_last_n == 64);

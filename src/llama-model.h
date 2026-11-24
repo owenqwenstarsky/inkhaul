@@ -1044,6 +1044,12 @@ struct llama_model {
     llama_split_mode split_mode() const;
     bool no_alloc() const;
 
+    // LongHaul: expert tensors kept on disk (TENSOR_LONGHAUL), read by the expert cache
+    bool has_longhaul() const;
+    bool is_longhaul(const ggml_tensor * t) const;
+    // read size bytes of t at byte offs of its data, from the model file
+    void longhaul_read(const ggml_tensor * t, void * dst, size_t offs, size_t size) const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // total number of parameters in the model
@@ -1119,6 +1125,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_LONGHAUL;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

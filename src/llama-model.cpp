@@ -1456,6 +1456,14 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // LongHaul tensors and their data in the model files, see TENSOR_LONGHAUL
+    struct longhaul_src {
+        uint16_t file = UINT16_MAX; // UINT16_MAX if not known (no_alloc)
+        size_t   offs = 0;
+    };
+    std::unordered_map<const ggml_tensor *, longhaul_src> longhaul;
+    llama_files longhaul_files;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res, const ggml_tensor * w) const {
@@ -2133,6 +2141,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // LongHaul tensors stay on disk, record where their data is
+    {
+        size_t longhaul_bytes = 0;
+        for (const auto & [name, cur] : tensors_by_name) {
+            if (!ml.lazy.is_longhaul(cur)) {
+                continue;
+            }
+            impl::longhaul_src src;
+            if (const auto * w = ml.get_weight(name.c_str())) {
+                src.file = w->idx;
+                src.offs = w->offs;
+            }
+            pimpl->longhaul.emplace(cur, src);
+            longhaul_bytes += ggml_nbytes(cur);
+        }
+        if (!pimpl->longhaul.empty()) {
+            if (has_tensor_overrides()) {
+                LLAMA_LOG_WARN("%s: LongHaul tensors ignore the tensor buffer type overrides\n", __func__);
+            }
+            LLAMA_LOG_INFO("%s: LongHaul: %zu expert tensors, %.2f GiB kept on disk\n", __func__,
+                pimpl->longhaul.size(), longhaul_bytes/1024.0/1024.0/1024.0);
+        }
+    }
+
     // map each weight to its "<name>.scale" tensor: shape {1} for a 2D weight, {n_expert} for a 3D weight
     {
         auto ends_with = [](const std::string & str, const std::string & suffix) {
@@ -2319,6 +2351,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // the LongHaul expert cache reads the experts from the files, bypassing the OS file cache
+    if (!pimpl->longhaul.empty()) {
+        for (auto & file : ml.files) {
+            if (file->has_direct_io()) {
+                throw std::runtime_error("LongHaul does not support direct I/O, use the default load mode");
+            }
+            file->set_no_cache();
+        }
+        pimpl->longhaul_files = std::move(ml.files);
     }
 
     if (per_layer_tok_embd_s) {
@@ -2720,6 +2763,25 @@ llama_split_mode llama_model::split_mode() const {
 
 bool llama_model::no_alloc() const {
     return params.no_alloc;
+}
+
+bool llama_model::has_longhaul() const {
+    return !pimpl->longhaul.empty();
+}
+
+bool llama_model::is_longhaul(const ggml_tensor * t) const {
+    return pimpl->longhaul.count(t) > 0;
+}
+
+void llama_model::longhaul_read(const ggml_tensor * t, void * dst, size_t offs, size_t size) const {
+    const auto it = pimpl->longhaul.find(t);
+    if (it == pimpl->longhaul.end() || it->second.file >= pimpl->longhaul_files.size()) {
+        throw std::runtime_error(format("tensor %s has no LongHaul data", t->name));
+    }
+    if (offs > ggml_nbytes(t) || size > ggml_nbytes(t) - offs) {
+        throw std::runtime_error(format("LongHaul read of %zu bytes at %zu is out of the bounds of %s", size, offs, t->name));
+    }
+    pimpl->longhaul_files[it->second.file]->read_raw_at(dst, size, it->second.offs + offs);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -4253,7 +4315,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_LONGHAUL       (llama_model_loader::TENSOR_LONGHAUL) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);

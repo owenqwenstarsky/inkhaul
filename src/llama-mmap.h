@@ -31,6 +31,10 @@ struct llama_file {
 
     void read_raw(void * ptr, size_t len);
     void read_raw_unsafe(void * ptr, size_t len);
+    // read at an absolute offset, without the file position (not with direct I/O), safe to call from several threads
+    void read_raw_at(void * ptr, size_t len, size_t offset) const;
+    // ask the OS to not keep the data read from this file in its cache
+    void set_no_cache();
     void read_aligned_chunk(void * dest, size_t size);
     uint32_t read_u32();
 

@@ -355,12 +355,6 @@ Use exactly one of these options:
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
 --spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
                                         override tensor buffer type for draft model
---spec-draft-cpu-moe, -cmoed, --cpu-moe-draft
-                                        keep all Mixture of Experts (MoE) weights in the CPU for the draft model
-                                        (env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE)
---spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft  N
-                                        keep the MoE weights of the first N layers in the CPU for the draft model
-                                        (env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE)
 ```
 
 ### n-gram Mod Parameters

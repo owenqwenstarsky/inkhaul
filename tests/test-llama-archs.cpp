@@ -895,7 +895,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t longhaul_cache_size = 0) {
     llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
 
     llama_context_params ctx_params = llama_context_default_params();
@@ -905,11 +905,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
-    if (moe_cache_size > 0) {
-        // the MoE cache is only used for small ubatches
-        ctx_params.moe_cache_size = moe_cache_size;
-        ctx_params.n_ubatch = 2;
-    }
+    // 0: a file-backed model keeps its experts in the mapped file as the reference, see LLAMA_LONGHAUL_RESIDENT in main
+    ctx_params.longhaul_cache_size = longhaul_cache_size;
 
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
@@ -1334,10 +1331,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         std::string                     label;
         llama_split_mode                split_mode;
         bool                            host_experts; // keep the experts in host memory, see host_experts_test
-        size_t                          moe_cache_size;
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false)
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts) {}
     };
 
     const llama_model_tensor_buft_override host_experts_overrides[] = {
@@ -1376,20 +1372,6 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
         }
 
-        // the ops that use the host experts run on a GPU and read the experts from a cache
-        // the cache has only a few slots (4 for 288 KiB experts), so the experts are evicted and uploaded again
-        if (!devices_meta.empty()) {
-            const enum ggml_backend_dev_type type = ggml_backend_dev_type(devices_meta[0]);
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
-                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
-                // each GPU caches the layers assigned to it
-                if (devices_meta.size() > 1) {
-                    dev_configs.emplace_back(devices_meta, "MoE cache, layer split", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
-                    max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
-                }
-            }
-        }
     }
 
     size_t max_arch_name_length = 0;
@@ -1469,7 +1451,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llama_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -1546,7 +1528,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         GGML_ASSERT(file != nullptr);
 
                         {
-                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides);
                             const std::vector<float> logits_roundtrip = get_logits(
                                 model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                             status_roundtrip = "\033[1;32mOK\033[0m";
@@ -1588,6 +1570,160 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     }
 
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return all_ok ? 0 : 1;
+}
+
+// sets an environment variable, nullptr removes it
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+// the test hook of llama_context: with a cache size of 0, a file-backed model keeps its experts in the mapped file
+static void set_longhaul_resident(bool resident) {
+    set_env("LLAMA_LONGHAUL_RESIDENT", resident ? "1" : nullptr);
+}
+
+// LongHaul: a file-backed Inkling2 model keeps its experts on disk and reads them into a cache on the GPU
+// the logits must match the same model with its experts in memory, for caches from the smallest (evictions in every layer) to one that holds all experts
+static int test_longhaul(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count() && gpu == nullptr; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                (target_backend == nullptr || strcmp(target_backend, ggml_backend_dev_name(dev)) == 0)) {
+            gpu = dev;
+        }
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+
+    bool all_ok = true;
+    for (const llm_arch arch : { LLM_ARCH_INKLING2, LLM_ARCH_INKLING2_LOOP }) {
+        if (!arch_matches(arch_filter, arch)) {
+            continue;
+        }
+        if (gpu == nullptr) {
+            LOG("LongHaul %s: SKIP (no GPU)\n", llama_arch_name(arch));
+            continue;
+        }
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true);
+        // more experts than used per token, so that the small caches evict
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_COUNT).c_str(), 16);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_USED_COUNT).c_str(), 2);
+
+        const std::string path = get_tmp_gguf_path();
+        {
+            llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path.c_str());
+        }
+
+        // the bank size for n slots, as the cache allocates it: one extra slot per expert tensor, padded to the alignment
+        size_t expert_size[2] = { 0, 0 };
+        {
+            gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_context_ptr meta(gguf_init_from_file(path.c_str(), params));
+            GGML_ASSERT(meta);
+            const uint32_t n_expert = gguf_get_val_u32(meta.get(), gguf_find_key(meta.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_COUNT).c_str()));
+            const char * names[2] = { "blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_down_exps.weight" };
+            for (int i = 0; i < 2; i++) {
+                const int64_t tid = gguf_find_tensor(meta.get(), names[i]);
+                GGML_ASSERT(tid >= 0);
+                expert_size[i] = gguf_get_tensor_size(meta.get(), tid)/n_expert;
+            }
+        }
+        const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(gpu));
+        auto bank_size = [&](size_t n_slots) {
+            return GGML_PAD(expert_size[0]*(n_slots + 1), alignment) + GGML_PAD(expert_size[1]*(n_slots + 1), alignment);
+        };
+
+        const std::vector<float> logits_ref = [&]() {
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { gpu });
+            return get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+        }();
+
+        // 2 experts used per token: 2 and 5 slots cut the ubatch to 1 and 2 tokens, 16 slots hold one layer, 512 MiB all experts
+        // the default number of I/O threads, except for the cases that name one
+        struct cache_case {
+            const char * name;
+            size_t       size;
+            uint32_t     n_ubatch;   // expected after the cut, 0 = not cut
+            const char * io_threads; // LLAMA_LONGHAUL_IO_THREADS, nullptr = default
+        };
+        const cache_case cases[] = {
+            { "2 slots",                 bank_size(2),     1, nullptr },
+            { "2 slots, 1 I/O thread",   bank_size(2),     1, "1"     },
+            { "5 slots",                 bank_size(5),     2, nullptr },
+            { "16 slots",                bank_size(16),    0, nullptr },
+            { "16 slots, 16 I/O threads", bank_size(16),   0, "16"    },
+            { "512 MiB",                 512ull*1024*1024, 0, nullptr },
+        };
+        for (const cache_case & cc : cases) {
+            set_env("LLAMA_LONGHAUL_IO_THREADS", cc.io_threads);
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            bool ok = true;
+            std::string detail;
+            try {
+                auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu }, LLAMA_SPLIT_MODE_LAYER, false, nullptr, cc.size);
+                const uint32_t n_ubatch = llama_n_ubatch(model_and_ctx.second.get());
+                if (cc.n_ubatch != 0 ? n_ubatch != cc.n_ubatch : n_ubatch != 64) {
+                    ok = false;
+                    detail = "n_ubatch = " + std::to_string(n_ubatch);
+                }
+                const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                const double nmse_val = nmse(logits_ref, logits);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail += detail.empty() ? buf : std::string(", ") + buf;
+                ok = ok && nmse_val <= 1e-4;
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            fclose(file);
+            set_env("LLAMA_LONGHAUL_IO_THREADS", nullptr);
+            LOG("LongHaul %s, cache %s: %s (%s)\n", llama_arch_name(arch), cc.name, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+
+        // a cache that cannot hold the experts of one token, no cache without the test hook, and no GPU are errors
+        struct error_case {
+            const char *                    name;
+            size_t                          size;
+            std::vector<ggml_backend_dev_t> devs;
+        };
+        const error_case errors[] = {
+            { "cache too small", bank_size(1), { gpu } },
+            { "no cache",        0,            { gpu } },
+            { "no GPU",          bank_size(16), {} },
+        };
+        set_longhaul_resident(false);
+        for (const error_case & ec : errors) {
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            bool failed = false;
+            try {
+                get_model_and_ctx(nullptr, file, seed, stdev, ec.devs, LLAMA_SPLIT_MODE_LAYER, false, nullptr, ec.size);
+            } catch (const std::exception &) {
+                failed = true;
+            }
+            fclose(file);
+            LOG("LongHaul %s, %s: %s\n", llama_arch_name(arch), ec.name, failed ? "OK" : "FAIL (no error)");
+            all_ok = all_ok && failed;
+        }
+        set_longhaul_resident(true);
+
+        std::filesystem::remove(path);
+    }
     return all_ok ? 0 : 1;
 }
 
@@ -1910,6 +2046,9 @@ int main(int argc, char ** argv) {
     common_init();
     llama_backend_init();
 
+    // the reference runs keep the experts of file-backed models in the mapped file, see test_longhaul for the cache
+    set_longhaul_resident(true);
+
     std::random_device rd;
 
     std::string arch_filter;
@@ -2008,7 +2147,8 @@ int main(int argc, char ** argv) {
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
         }
-        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        const int ret = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        return test_longhaul(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

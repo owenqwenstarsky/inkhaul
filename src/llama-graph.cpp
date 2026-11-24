@@ -1925,15 +1925,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * slots,
-                 bool   cached) const {
+          ggml_tensor * slots) const {
     ggml_tensor * w_s = model.get_w_scale(w);
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
+        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
 
     if (w->type == GGML_TYPE_NVFP4) {
         ggml_prec_set_acc(res, GGML_PREC_BF16);
@@ -2541,12 +2540,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    // compute the expert input before the slot lookup, so that the scheduler prefetches it for the CPU part (the router can read a different tensor)
+    // compute the expert input before the slot lookup (the router can read a different tensor)
     ggml_build_forward_expand(gf, cur);
 
-    // the experts of host-resident layers may be read from the MoE cache (see llama_moe_cache::build_lookup)
+    // the experts on disk are read from the LongHaul cache (see llama_moe_cache::build_lookup)
     const llama_moe_cache_lookup cache = moe_cache == nullptr ? llama_moe_cache_lookup{} :
-        moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts);
+        moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps }, selected_experts);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2557,14 +2556,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
-    // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
+    // the experts selected by mm_ids, up to the down projection, from the MoE cache if mm_ids are slots
     // ids are the selected experts, for the biases and scales
-    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
+    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids) {
         ggml_tensor * up = nullptr;
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (gate_up_exps_b) {
@@ -2579,7 +2578,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up", il);
         } else {
             // separate gate and up path
-            up = build_lora_mm_id(up_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+            up = build_lora_mm_id(up_exps, cur, ids, mm_ids); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
             if (up_exps_b) {
@@ -2588,7 +2587,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (gate_exps) {
-                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
@@ -2698,7 +2697,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids); // [n_embd, n_expert_used, n_tokens]
         cb(experts, "ffn_moe_down", il);
 
         if (amax_src1.scale_s) {
@@ -2708,12 +2707,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
-    ggml_tensor * experts = cache.slots == nullptr ?
-        build_experts(cur, selected_experts, nullptr, true) :
-        moe_cache->build_experts(*this, cache, cur, selected_experts,
-                [](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, void * user_data) {
-                    return (*static_cast<decltype(build_experts) *>(user_data))(cur, ids, mm_ids, cached);
-                }, &build_experts);
+    ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots);
 
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);

@@ -344,6 +344,7 @@ struct cmd_params {
     std::vector<int>                 n_depth;
     std::vector<int>                 n_batch;
     std::vector<int>                 n_ubatch;
+    std::vector<int>                 lh_cache; // LongHaul cache in MiB
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
     std::vector<int>                 n_threads;
@@ -390,6 +391,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_depth              */ { 0 },
     /* n_batch              */ { 2048 },
     /* n_ubatch             */ { 512 },
+    /* lh_cache             */ { 512 },
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { common_cpu_get_num_math() },
@@ -464,6 +466,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+    printf("  -lhc, --longhaul-cache <size>                     LongHaul expert cache, e.g. 512M,1G (default: %sM)\n", join(cmd_params_defaults.lh_cache, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -635,6 +638,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_ubatch.insert(params.n_ubatch.end(), p.begin(), p.end());
+            } else if (arg == "-lhc" || arg == "--longhaul-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                for (const auto & v : string_split<std::string>(argv[i], split_delim)) {
+                    const size_t bytes = string_parse_mem_size(v);
+                    if (bytes < 1024*1024 || bytes/(1024*1024) > INT_MAX) {
+                        throw std::invalid_argument("LongHaul cache size must be from 1 MiB: " + v);
+                    }
+                    params.lh_cache.push_back((int) (bytes/(1024*1024)));
+                }
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1138,6 +1153,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_ubatch.empty()) {
         params.n_ubatch = cmd_params_defaults.n_ubatch;
     }
+    if (params.lh_cache.empty()) {
+        params.lh_cache = cmd_params_defaults.lh_cache;
+    }
     if (params.type_k.empty()) {
         params.type_k = cmd_params_defaults.type_k;
     }
@@ -1218,6 +1236,7 @@ struct cmd_params_instance {
     int                n_depth;
     int                n_batch;
     int                n_ubatch;
+    int                lh_cache;
     ggml_type          type_k;
     ggml_type          type_v;
     int                n_threads;
@@ -1311,6 +1330,7 @@ struct cmd_params_instance {
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
+        cparams.longhaul_cache_size = (size_t) lh_cache*1024*1024;
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
@@ -1346,6 +1366,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nopo : params.no_op_offload)
     for (const auto & nb : params.n_batch)
     for (const auto & nub : params.n_ubatch)
+    for (const auto & lhc : params.lh_cache)
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
@@ -1366,6 +1387,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
+                /* .lh_cache              = */ lhc,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1404,6 +1426,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
+                /* .lh_cache              = */ lhc,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1442,6 +1465,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
+                /* .lh_cache              = */ lhc,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1485,6 +1509,7 @@ struct test {
     uint64_t                 model_n_params;
     int                      n_batch;
     int                      n_ubatch;
+    int                      lh_cache;
     int                      n_threads;
     std::string              cpu_mask;
     bool                     cpu_strict;
@@ -1526,6 +1551,7 @@ struct test {
         model_n_params = llama_model_n_params(lmodel);
         n_batch        = inst.n_batch;
         n_ubatch       = inst.n_ubatch;
+        lh_cache       = inst.lh_cache;
         n_threads      = inst.n_threads;
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;
@@ -1602,7 +1628,7 @@ struct test {
         static const std::vector<std::string> fields = {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
-            "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
+            "n_ubatch",       "lh_cache",       "n_threads",     "cpu_mask",       "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
@@ -1617,7 +1643,7 @@ struct test {
     enum field_type { STRING, BOOL, INT, FLOAT };
 
     static field_type get_field_type(const std::string & field) {
-        if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
+        if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "lh_cache" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
@@ -1685,6 +1711,7 @@ struct test {
                                             std::to_string(model_n_params),
                                             std::to_string(n_batch),
                                             std::to_string(n_ubatch),
+                                            std::to_string(lh_cache),
                                             std::to_string(n_threads),
                                             cpu_mask,
                                             std::to_string(cpu_strict),
@@ -1875,6 +1902,9 @@ struct markdown_printer : public printer {
         if (field == "n_ubatch") {
             return 8;
         }
+        if (field == "lh_cache") {
+            return 8;
+        }
         if (field == "type_k" || field == "type_v") {
             return 6;
         }
@@ -1992,6 +2022,9 @@ struct markdown_printer : public printer {
         }
         if (params.n_ubatch.size() > 1 || params.n_ubatch != cmd_params_defaults.n_ubatch) {
             fields.emplace_back("n_ubatch");
+        }
+        if (params.lh_cache.size() > 1 || params.lh_cache != cmd_params_defaults.lh_cache) {
+            fields.emplace_back("lh_cache");
         }
         if (params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {
             fields.emplace_back("type_k");

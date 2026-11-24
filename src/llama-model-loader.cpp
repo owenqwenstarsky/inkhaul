@@ -1180,7 +1180,19 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool longhaul) {
+    if (longhaul) {
+        if (!llama_mmap::SUPPORTED) {
+            throw std::runtime_error(format("LongHaul requires mmap to keep tensor %s on disk", name.c_str()));
+        }
+        this->longhaul.insert(name);
+        if (w) {
+            ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
+            tensors.insert(name);
+        }
+        return true;
+    }
+
     if (mode == LLAMA_LAZY_MODE_OFF) {
         return false;
     }
@@ -1434,9 +1446,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    if (flags & (TENSOR_READ_LAZY | TENSOR_LONGHAUL)) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()), flags & TENSOR_LONGHAUL);
     }
 
     ggml_tensor t_meta = *cur;
@@ -1809,7 +1821,8 @@ bool llama_model_loader::load_all_data(
                 }
             }
 
-            if (check_tensors) {
+            // validating a LongHaul tensor would read all of it into RAM
+            if (check_tensors && !lazy.is_longhaul(cur)) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                 }));

@@ -54,6 +54,7 @@ test parameters:
   -d, --n-depth <n>                         (default: 0)
   -b, --batch-size <n>                      (default: 2048)
   -ub, --ubatch-size <n>                    (default: 512)
+  -lhc, --longhaul-cache <size>             LongHaul expert cache, e.g. 512M,1G (default: 512M)
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
   -t, --threads <n>                         (default: system dependent)

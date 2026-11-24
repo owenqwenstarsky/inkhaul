@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cstdint>
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
@@ -670,6 +671,38 @@ void string_process_escapes(std::string & input) {
     }
 
     input.resize(output_idx);
+}
+
+size_t string_parse_mem_size(const std::string & value) {
+    size_t n_digits = 0;
+    while (n_digits < value.size() && value[n_digits] >= '0' && value[n_digits] <= '9') {
+        n_digits++;
+    }
+    if (n_digits == 0 || n_digits > 19) {
+        throw std::invalid_argument("invalid size: " + value);
+    }
+    const uint64_t n = std::stoull(value.substr(0, n_digits));
+
+    std::string unit = value.substr(n_digits);
+    std::transform(unit.begin(), unit.end(), unit.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    int shift;
+    if (unit.empty() || unit == "m" || unit == "mb" || unit == "mib") {
+        shift = 20;
+    } else if (unit == "k" || unit == "kb" || unit == "kib") {
+        shift = 10;
+    } else if (unit == "g" || unit == "gb" || unit == "gib") {
+        shift = 30;
+    } else {
+        throw std::invalid_argument("invalid size unit: " + value);
+    }
+    if (n == 0) {
+        throw std::invalid_argument("size must be > 0: " + value);
+    }
+    if (n > (SIZE_MAX >> shift)) {
+        throw std::invalid_argument("size is too large: " + value);
+    }
+    return (size_t) n << shift;
 }
 
 bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_override> & overrides) {
@@ -1776,8 +1809,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    cparams.moe_cache_size      = params.moe_cache_size;
-    cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+    cparams.longhaul_cache_size = params.longhaul_cache_size;
 
     return cparams;
 }

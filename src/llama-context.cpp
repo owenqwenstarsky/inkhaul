@@ -375,8 +375,7 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
-    cparams.moe_cache_size      = params.moe_cache_size;
-    cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+    cparams.longhaul_cache_size = params.longhaul_cache_size;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -587,7 +586,7 @@ llama_context::llama_context(
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            cparams.moe_cache_size == 0; // not supported by the MoE cache
+            !model.has_longhaul(); // not supported by the LongHaul cache
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -615,8 +614,22 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+        if (model.has_longhaul()) {
+            if (cparams.longhaul_cache_size > 0) {
+                moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.longhaul_cache_size);
+
+                // the experts on disk have no other path, so every ubatch must fit in the cache
+                const int64_t max_ubatch = moe_cache->max_ubatch();
+                if ((int64_t) cparams.n_ubatch > max_ubatch) {
+                    LLAMA_LOG_WARN("%s: n_ubatch = %u is reduced to %" PRId64 " to fit the LongHaul cache, a larger cache gives faster prompt processing\n",
+                        __func__, cparams.n_ubatch, max_ubatch);
+                    cparams.n_ubatch = (uint32_t) max_ubatch;
+                }
+            } else if (getenv("LLAMA_LONGHAUL_RESIDENT") != nullptr) {
+                LLAMA_LOG_WARN("%s: LLAMA_LONGHAUL_RESIDENT is set, the experts are read from the mapped file without a RAM bound (for tests)\n", __func__);
+            } else {
+                throw std::runtime_error("the model keeps its experts on disk, LongHaul needs a cache size > 0");
+            }
         }
 
         sched_reserve();
@@ -2910,9 +2923,8 @@ uint32_t llama_context::graph_max_nodes() const {
         res += lora->get_n_nodes();
     }
 
-    // the MoE cache adds a lookup to each MoE layer, and a second expert path with a CPU share (up to ~16 tensors per layer),
-    // which the per-tensor estimates above do not cover for models with few tensors per layer
-    if (cparams.moe_cache_size > 0) {
+    // the LongHaul cache adds a lookup to each MoE layer, which the per-tensor estimates above do not cover for models with few tensors per layer
+    if (model.has_longhaul()) {
         res += 32u*model.hparams.n_layer_all;
     }
 
@@ -3202,20 +3214,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             last++;
         }
 
-        // the experts in the MoE cache are copied from device memory, the others are uploaded
-        int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
-            if (n == 0) {
-                e++;
-                continue;
-            }
-            if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
-            }
-            e   += n;
-            next = e;
-        }
+        const int64_t next = first;
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
         const size_t offset  = next*expert_size;
@@ -4432,8 +4431,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
-        /*.moe_cache_size              =*/ 0,
-        /*.moe_cache_cpu_share         =*/ 0.0f,
+        /*.longhaul_cache_size         =*/ 512ull*1024*1024,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

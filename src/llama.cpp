@@ -496,6 +496,17 @@ void llama_model_save_to_file(const struct llama_model * model, const char * pat
     ms.save(path_model);
 }
 
+void llama_model_save_with_meta(const struct llama_model * model, const struct gguf_context * meta, const char * path_model) {
+    gguf_context_ptr ctx(gguf_init_empty());
+    gguf_set_kv(ctx.get(), meta);
+    for (const auto & [name, t] : model->tensors_by_name) {
+        if (gguf_find_tensor(ctx.get(), name.c_str()) < 0) {
+            gguf_add_tensor(ctx.get(), t);
+        }
+    }
+    gguf_write_to_file(ctx.get(), path_model, false);
+}
+
 //
 // chat templates
 //

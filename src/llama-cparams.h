@@ -55,8 +55,7 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
     bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
 
-    size_t moe_cache_size;
-    float  moe_cache_cpu_share;
+    size_t longhaul_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host

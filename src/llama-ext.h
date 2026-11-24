@@ -35,6 +35,10 @@ LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
 // FIXME temporary function for better error messages
 LLAMA_API bool llama_arch_supports_save(llm_arch arch);
 
+// for tests: write the KVs of meta and each weight of model once to a GGUF file, the weights must be in host memory
+// unlike llama_model_save_to_file it keeps the metadata as given, so it also works for archs that expand their hparams at load (inkling2_loop)
+LLAMA_API void llama_model_save_with_meta(const struct llama_model * model, const struct gguf_context * meta, const char * path_model);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
