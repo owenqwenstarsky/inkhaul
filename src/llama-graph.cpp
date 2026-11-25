@@ -1189,6 +1189,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // after the NVFP4 default, so that the policy can request a higher precision
     prec_policy.apply(res, w);
 
+    if (slots != nullptr) {
+        moe_cache->check_op(w, res);
+    }
+
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];

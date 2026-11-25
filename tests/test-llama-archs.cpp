@@ -163,6 +163,10 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
             tmp16[i] = ggml_fp32_to_fp16(tmp[i]);
         }
         ggml_backend_tensor_set(tensor, tmp16.data(), 0, ggml_nbytes(tensor));
+    } else if (ggml_is_quantized(tensor->type)) {
+        std::vector<uint8_t> tmpq(ggml_nbytes(tensor));
+        ggml_quantize_chunk(tensor->type, tmp.data(), tmpq.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+        ggml_backend_tensor_set(tensor, tmpq.data(), 0, ggml_nbytes(tensor));
     } else {
         GGML_ABORT("fatal error");
     }
@@ -1240,6 +1244,15 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
             gpu = dev;
         }
     }
+    // a second GPU, for the error of a cache on two GPUs (GGML_CUDA_DEVICES=2 or GGML_METAL_DEVICES=2 emulate one)
+    ggml_backend_dev_t gpu2 = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count() && gpu2 == nullptr; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) && dev != gpu) {
+            gpu2 = dev;
+        }
+    }
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
     const uint32_t n_expert      = 16;
@@ -1250,24 +1263,30 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
     const longhaul_variant split_down = { ", gate/up split, F16 down", true,  true,  false };
     const longhaul_variant mtp        = { ", MTP block",              false, false, true  };
 
+    // type_exps: GGML_TYPE_COUNT is the default F32 experts
     struct arch_variants {
         llm_arch                      arch;
+        ggml_type                     type_exps;
         std::vector<longhaul_variant> variants;
     };
-    const arch_variants archs[] = {
-        { LLM_ARCH_INKLING2,      { base } },
-        { LLM_ARCH_INKLING2_LOOP, { base } },
-        { LLM_ARCH_QWEN35MOE,     { base, split, split_down, mtp } },
-    };
+    std::vector<arch_variants> archs;
+    for (const llm_arch arch : { LLM_ARCH_INKLING2, LLM_ARCH_INKLING2_LOOP }) {
+        for (const ggml_type type_exps : { GGML_TYPE_COUNT, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4 }) {
+            archs.push_back({ arch, type_exps, { base } });
+        }
+    }
+    archs.push_back({ LLM_ARCH_QWEN35MOE, GGML_TYPE_COUNT, { base, split, split_down, mtp } });
 
     bool all_ok = true;
     for (const arch_variants & av : archs) {
-        const llm_arch arch = av.arch;
+        const llm_arch  arch      = av.arch;
+        const ggml_type type_exps = av.type_exps;
         if (!arch_matches(arch_filter, arch)) {
             continue;
         }
+        const std::string name = std::string(llama_arch_name(arch)) + (type_exps == GGML_TYPE_COUNT ? "" : std::string(" ") + ggml_type_name(type_exps));
         if (gpu == nullptr) {
-            LOG("LongHaul %s: SKIP (no GPU)\n", llama_arch_name(arch));
+            LOG("LongHaul %s: SKIP (no GPU)\n", name.c_str());
             continue;
         }
         // more experts than used per token, so that the small caches evict
@@ -1275,6 +1294,20 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true, n_layer_min);
             gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_COUNT).c_str(), n_expert);
             gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_USED_COUNT).c_str(), n_expert_used);
+            if (type_exps != GGML_TYPE_COUNT) {
+                // quantized experts need rows that are a multiple of the block size
+                gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_FEED_FORWARD_LENGTH).c_str(), 64);
+                const uint32_t n_layer_ctx = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT).c_str()));
+                for (uint32_t il = 0; il < n_layer_ctx; il++) {
+                    ggml_tensor t;
+                    memset(&t, 0, sizeof(ggml_tensor));
+                    t.type = type_exps;
+                    ggml_format_name(&t, "blk.%" PRIu32 ".ffn_gate_up_exps.weight", il);
+                    gguf_add_tensor(gguf_ctx.get(), &t);
+                    ggml_format_name(&t, "blk.%" PRIu32 ".ffn_down_exps.weight", il);
+                    gguf_add_tensor(gguf_ctx.get(), &t);
+                }
+            }
             return gguf_ctx;
         };
         gguf_context_ptr gguf_ctx = get_gguf_ctx_longhaul(0);
@@ -1287,7 +1320,7 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
         }();
 
         for (const longhaul_variant & v : av.variants) {
-            const std::string label = std::string(llama_arch_name(arch)) + v.name;
+            const std::string label = name + v.name;
 
             // the MTP block is one more layer, of full attention like the one the MTP block of a Qwen 3.5 file has
             // the tensors of the trunk are drawn by name, so they are the same as the ones of the in-memory model
@@ -1403,17 +1436,20 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
             }
 
             // a cache that cannot hold the experts of one token, no cache without the test hook, and no GPU are errors
-            if (&v == &av.variants.front()) {
+            if (&v == &av.variants.front() && type_exps == GGML_TYPE_COUNT) {
                 struct error_case {
                     const char *                    name;
                     size_t                          size;
                     std::vector<ggml_backend_dev_t> devs;
                 };
-                const error_case errors[] = {
+                std::vector<error_case> errors = {
                     { "cache too small", get_cache_size(groups, n_expert, alignment, n_expert_used - 1), { gpu } },
                     { "no cache",        0,                                                                { gpu } },
                     { "no GPU",          get_cache_size(groups, n_expert, alignment, n_expert),           {} },
                 };
+                if (gpu2 != nullptr) {
+                    errors.push_back({ "two GPUs", get_cache_size(groups, n_expert, alignment, n_expert), { gpu, gpu2 } });
+                }
                 set_longhaul_resident(false);
                 for (const error_case & ec : errors) {
                     FILE * file = fopen(path.c_str(), "rb");

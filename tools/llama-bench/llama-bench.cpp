@@ -3,6 +3,7 @@
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
+#include <climits>
 #include <clocale>
 #include <cmath>
 #include <cstdio>

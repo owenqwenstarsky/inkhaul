@@ -21,10 +21,10 @@ Target: [AtomicChat/Inkling-2-Mini-GGUF](https://huggingface.co/AtomicChat/Inkli
 | D7 | In the public C API the field is renamed `moe_cache_size` -> `longhaul_cache_size`, default 512 MiB. Internal class and file names (`llama_moe_cache`) stay. | A clear public name, with minimal churn inside. |
 | D8 | The library rejects `longhaul_cache_size == 0` for MoE models. CLI, server and common never pass 0. The one exception is a test-only path that keeps a fully resident reference model for comparisons (see 6.1). | "Always on" is enforced in the library, not just in the CLI. Tests still need a ground truth. |
 | D9 | The cache budget is **per context**. Each `llama_context` on the model gets its own cache (server slots share one context, so one cache). | The cache lives in the context today. A shared cross-context cache would be a new subsystem. |
-| D10 | Requires the Metal backend. With no GPU device (for example `-ngl 0` or `--device none`), context creation fails with a clear error. | The cache relies on the scheduler copying a host slot map to the device. With everything on the CPU that copy, and so the callback, never happens. |
+| D10 | Requires the Metal backend (CUDA too since section 17). With no GPU device (for example `-ngl 0` or `--device none`), context creation fails with a clear error. | The cache relies on the scheduler copying a host slot map to the device. With everything on the CPU that copy, and so the callback, never happens. |
 | D11 | **Keep `inkling2_loop`**, and dedupe its aliased loop layers in the cache so one physical expert is cached once. | Mini is an `inkling2_loop` model (12 core layers run 3 times). Without the dedupe, the same expert would fill up to 3 slots. |
 | D12 | **Order: LongHaul first, then pruning.** | The current test suite (synthetic models, `test-llama-archs`) only works on the intact tree, and many tests build LLaMA models. Pruning first would break the safety net before the feature exists. |
-| D13 | **Pruning scope:** keep only `inkling2`, `inkling2_loop`, `dflash` limited to its DSpark variant (the Mini repo ships `dspark-Inkling-2-Mini-Q8_0.gguf` as a draft model), the `clip` stub (needed so `llama-quantize` can open mmproj files) and the `inkling2v` vision projector. Keep backends CPU + Metal + BLAS (Accelerate). Remove the other GPU backends, non-arm CPU arch code, non-macOS build targets, CI for other platforms, and tools/examples that only serve other models or platforms. Generic infrastructure stays (jinja engine, PEG/auto parser, server, bench, quantize, imatrix, perplexity, gguf tools). | This is what "focus the fork on Inkling 2 Mini + LongHaul" means in practice, without breaking shared machinery. Per-arch `#if` blocks inside shared ggml-cpu headers are left alone (editing them carries high risk for little gain). Superseded for the arch list by `QWEN35_PLAN.md`: `qwen35`, `qwen35moe` and the `qwen3vl_merger` projector are back. |
+| D13 | **Pruning scope:** keep only `inkling2`, `inkling2_loop`, `dflash` limited to its DSpark variant (the Mini repo ships `dspark-Inkling-2-Mini-Q8_0.gguf` as a draft model), the `clip` stub (needed so `llama-quantize` can open mmproj files) and the `inkling2v` vision projector. Keep backends CPU + Metal + BLAS (Accelerate) (CUDA and x86 CPU were restored later, see section 17). Remove the other GPU backends, non-arm CPU arch code, non-macOS build targets, CI for other platforms, and tools/examples that only serve other models or platforms. Generic infrastructure stays (jinja engine, PEG/auto parser, server, bench, quantize, imatrix, perplexity, gguf tools). | This is what "focus the fork on Inkling 2 Mini + LongHaul" means in practice, without breaking shared machinery. Per-arch `#if` blocks inside shared ggml-cpu headers are left alone (editing them carries high risk for little gain). Superseded for the arch list by `QWEN35_PLAN.md`: `qwen35`, `qwen35moe` and the `qwen3vl_merger` projector are back. |
 | D14 | Commits follow AGENTS.md: `Assisted-by: Claude` trailer, not `Co-authored-by`. Every commit needs your explicit approval. Nothing is pushed. | AGENTS.md rule. |
 
 ---
@@ -431,3 +431,44 @@ Phase 4 follow-ups (not blocking):
 - `docs/longhaul.md` replaces `docs/moe-cache.md`. It covers what is cached, the flag, the sizing formula with Mini's numbers and a table, the prefill vs cache-size trade-off, the stats line, the I/O thread count and the trace for offline sizing. The numbers are estimates from the model card, not measurements.
 - `scripts/moe-cache-tune.py` is deleted.
 - The README fork notice and quick start were added in Phase 4. The quick start pins `-hf AtomicChat/Inkling-2-Mini-GGUF:Q4_K`, because without a tag `-hf` falls back to the first model file when the repo has no Q4_K_M or Q8_0.
+
+---
+
+## 17. CUDA status
+
+CUDA is supported again on a new branch (`cuda`), for Linux and Windows on x86_64. Scope: one GPU, LongHaul always on (the expert cache is in VRAM).
+
+- ggml:
+  - `ggml/src/ggml-cuda`, `ggml-cuda.h`, `FindNCCL.cmake`, the `GGML_CUDA*` options, the backend registration and the CUDA parts of `ggml-common.h`, `ggml.h` and `ggml-impl.h` are restored from `e732a27^`. No ggml core change since then touched them, so they are unchanged from upstream. HIP and MUSA stay removed.
+  - The x86 CPU code is restored too: `ggml-cpu/arch/x86`, `amx/`, `FindSIMD.cmake`, the `GGML_AVX*`/`GGML_AMX*` options and the x86 `GGML_CPU_ALL_VARIANTS`. Without it an x86 host ran scalar code.
+- LongHaul on CUDA (`src/`):
+  - Linux: `set_no_cache()` sets `POSIX_FADV_RANDOM`, and `read_raw_at` drops what it read with `POSIX_FADV_DONTNEED`. Windows reads still go through the file cache.
+  - The staging buffers are pinned host memory when the GPU has a host buffer type (CUDA_Host), else plain memory as before (Metal).
+  - The `MUL_MAT_ID` support check moved from a probe in `build_lookup` to the real op in `build_lora_mm_id`, after the NVFP4 and precision-policy settings. CUDA rejects some precisions for `MUL_MAT_ID`; the old probe passed, and the scheduler would then have run the op on the CPU and copied the bank.
+  - LongHaul fails at context creation if its layers are on more than one GPU. This also covers the `inkling2_loop` case where a loop pass sits on another device than the layer that owns its experts.
+  - `--fit` stops with a clear message instead of offloading fewer layers or moving experts to the CPU (`llama_model_has_longhaul` in `llama-ext.h`).
+  - `-lhc` help: "GPU memory cache" instead of "RAM cache".
+- Fixed on the way: `llama-bench.cpp` used `INT_MAX` without `<climits>`, which only built on macOS.
+- Build, CI and packaging: `x64-linux-gcc*`, `x64-windows-llvm*`, `x64-windows-msvc*` and `+cuda` presets; `cmake/x64-windows-llvm.cmake`, `win-app.cmake` and the manifest; workflows `build-cuda-ubuntu.yml` (build only), `build-cuda-windows.yml` (manual, x64), `build-cpu.yml` (ubuntu x64); `GG_BUILD_CUDA` in `ci/run.sh`; `.devops/cuda.Dockerfile` and `cpu.Dockerfile` (amd64); the nix `cuda` package on `x86_64-linux`.
+- Docs: `docs/build.md` (Linux/Windows and CUDA), `docs/longhaul.md`, `docs/multi-gpu.md`, README, `docs/ops/CUDA.csv` and `docs/ops.md` (generated on the RTX PRO 4500).
+- Tests:
+  - `test-llama-archs` LongHaul runs Q8_0 and NVFP4 experts as well as F32 (NVFP4 covers the precision check), and a "two GPUs" error case when a second GPU exists (`GGML_CUDA_DEVICES=2` emulates one).
+  - `test-llama-mmap`: on Linux, the range read with `set_no_cache` is not resident afterwards (checked with `mincore`).
+  - `test-backend-ops`: the CUDA parts removed in `e732a27` are back (Blackwell FP4/FP8 tolerances, skipped ids, deterministic top-k).
+
+Verified on an RTX PRO 4500 Blackwell (sm_120, CUDA 13.2, gcc 13.3, x86_64 with AVX-512):
+
+- Builds with no warnings: CUDA, CPU only, and `GGML_BACKEND_DL` with all 14 x86 CPU variants.
+- `test-backend-ops -b CUDA0`: 21090/21090 passed. `test-backend-ops -b CPU` (x86, AVX-512 native build): 25162/25162 passed.
+- `test-llama-archs`: the 42 LongHaul cases match the resident reference (NMSE <= 4.5e-7), the ubatch cuts and error cases behave as on Metal; also with `GGML_CUDA_DISABLE_GRAPHS=1` and with `GGML_CUDA_DEVICES=2`.
+- `ctest -L main` (20/20) and `ctest -L behavior -LE 'model|python'` (39/39) pass on CUDA. In a CPU-only build, `test-llama-context`, `test-speculative-rejection-sampling` and `test-thread-safety` fail as expected (LongHaul needs a GPU), so `build-cpu.yml` excludes them.
+- `llama-completion` on a generated `inkling2` GGUF: after the run, 1 of 17 pages of each expert range is in the page cache (the page shared by two tensors), the rest of the file is cached as usual. The memory breakdown shows the 32 MiB of staging buffers.
+- `--fit` with a margin above the free VRAM stops with the LongHaul message and keeps all layers on the GPU.
+
+Not done or not verified:
+
+- Windows, Docker and nix are not built here; only the files they reference were checked.
+- No real model is run, so nothing is measured: pinned vs pageable staging, and the effect of the Linux page-cache hints, need `llama-bench` on Mini.
+- With CUDA the non-expert weights are copied from the mapping to VRAM, and their mapped pages stay counted in the process RSS (clean, file-backed, so the kernel can reclaim them). Dropping them after the upload (`madvise(MADV_DONTNEED)`; glibc's `posix_madvise` ignores `DONTNEED`) needs a real model to show the gain.
+- A read only drops the full pages of its range from the page cache, so a page shared by two reads stays. With Mini's 5 MB experts that is a few KiB per read.
+- `O_DIRECT` reads and asynchronous double-buffered uploads are left for Phase 2.

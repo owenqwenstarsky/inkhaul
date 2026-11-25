@@ -1,6 +1,7 @@
 {
   lib,
   glibc,
+  config,
   stdenv,
   stdenvNoCC,
   runCommand,
@@ -9,15 +10,19 @@
   pkg-config,
   git,
   blas,
+  cudaPackages,
+  autoAddDriverRunpath,
   darwin,
   openssl,
   nodejs,
   importNpmLock,
-  useBlas ? !useMetalKit && blas.meta.available,
+  useBlas ? !useCuda && !useMetalKit && blas.meta.available,
+  useCuda ? config.cudaSupport,
   useMetalKit ? stdenv.hostPlatform.isAarch64 && stdenv.hostPlatform.isDarwin,
   llamaVersion ? "0.0.0", # Arbitrary version, substituted by the flake
 
-  effectiveStdenv ? stdenv,
+  # CUDA needs its backend stdenv or libstdc++ mismatches downstream.
+  effectiveStdenv ? if useCuda then cudaPackages.backendStdenv else stdenv,
   enableStatic ? effectiveStdenv.hostPlatform.isStatic,
   precompileMetalShaders ? false,
   useWebUi ? true,
@@ -26,6 +31,7 @@
 let
   inherit (lib)
     cmakeBool
+    cmakeFeature
     optionals
     strings
     ;
@@ -34,6 +40,7 @@ let
 
   suffices =
     lib.optionals useBlas [ "BLAS" ]
+    ++ lib.optionals useCuda [ "CUDA" ]
     ++ lib.optionals useMetalKit [ "MetalKit" ];
 
   pnameSuffix =
@@ -58,6 +65,13 @@ let
       CoreGraphics
     ]
     ++ optionals useMetalKit [ MetalKit ];
+
+  cudaBuildInputs = with cudaPackages; [
+    cuda_cudart
+    cuda_nvml_dev
+    cccl # <nv/target>
+    libcublas
+  ];
 in
 
 effectiveStdenv.mkDerivation (finalAttrs: {
@@ -127,11 +141,17 @@ effectiveStdenv.mkDerivation (finalAttrs: {
       pkg-config
       git
     ]
+    ++ optionals useCuda [
+      cudaPackages.cuda_nvcc
+
+      autoAddDriverRunpath
+    ]
     ++ optionals (effectiveStdenv.hostPlatform.isGnu && enableStatic) [ glibc.static ]
     ++ optionals (effectiveStdenv.hostPlatform.isDarwin && useMetalKit && precompileMetalShaders) [ xcrunHost ];
 
   buildInputs =
     optionals effectiveStdenv.hostPlatform.isDarwin darwinBuildInputs
+    ++ optionals useCuda cudaBuildInputs
     ++ optionals useBlas [ blas ]
     ++ [ openssl ];
 
@@ -142,8 +162,17 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     (cmakeBool "CMAKE_SKIP_BUILD_RPATH" true)
     (cmakeBool "GGML_NATIVE" false)
     (cmakeBool "GGML_BLAS" useBlas)
+    (cmakeBool "GGML_CUDA" useCuda)
     (cmakeBool "GGML_METAL" useMetalKit)
     (cmakeBool "GGML_STATIC" enableStatic)
+  ]
+  ++ optionals useCuda [
+    (
+      with cudaPackages.flags;
+      cmakeFeature "CMAKE_CUDA_ARCHITECTURES" (
+        builtins.concatStringsSep ";" (map dropDot cudaCapabilities)
+      )
+    )
   ]
   ++ optionals useMetalKit [
     (lib.cmakeFeature "CMAKE_C_FLAGS" "-D__ARM_FEATURE_DOTPROD=1")
@@ -158,6 +187,10 @@ effectiveStdenv.mkDerivation (finalAttrs: {
   '';
 
   meta = {
+    # Configurations we don't want even the CI to evaluate. Results in the
+    # "unsupported platform" messages.
+    badPlatforms = optionals useCuda lib.platforms.darwin;
+
     # Configurations that are known to result in build failures. Can be
     # overridden by importing Nixpkgs with `allowBroken = true`.
     broken = (useMetalKit && !effectiveStdenv.hostPlatform.isDarwin);

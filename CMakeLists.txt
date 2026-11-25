@@ -149,6 +149,7 @@ option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/common.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/win-app.cmake)
 
 if (NOT DEFINED LLAMA_BUILD_NUMBER)
     set(LLAMA_BUILD_NUMBER        ${BUILD_NUMBER})
@@ -166,6 +167,10 @@ if (NOT DEFINED GGML_LLAMAFILE)
     set(GGML_LLAMAFILE_DEFAULT ON)
 endif()
 
+if (NOT DEFINED GGML_CUDA_GRAPHS)
+    set(GGML_CUDA_GRAPHS_DEFAULT ON)
+endif()
+
 # transition helpers
 function (llama_option_depr TYPE OLD)
     if (${OLD})
@@ -179,6 +184,8 @@ function (llama_option_depr TYPE OLD)
     endif()
 endfunction()
 
+llama_option_depr(FATAL_ERROR LLAMA_CUBLAS              GGML_CUDA)
+llama_option_depr(WARNING     LLAMA_CUDA                GGML_CUDA)
 llama_option_depr(WARNING     LLAMA_METAL               GGML_METAL)
 llama_option_depr(WARNING     LLAMA_METAL_EMBED_LIBRARY GGML_METAL_EMBED_LIBRARY)
 llama_option_depr(WARNING     LLAMA_NATIVE              GGML_NATIVE)
@@ -256,6 +263,8 @@ option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
 if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
 endif()
+
+llama_apply_app_manifests()
 
 #
 # install

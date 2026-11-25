@@ -28,7 +28,7 @@ struct llama_moe_cache_lookup {
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback reads the missing experts from the model file
 class llama_moe_cache {
 public:
-    // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
+    // backends are all the backends of the context, the cache is on the GPU of the MoE layers (all of them must be on one GPU)
     llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
     ~llama_moe_cache();
 
@@ -42,6 +42,9 @@ public:
     // the expert matmuls then read the cache with the slots in place of the expert ids
     // returns no slots if the layer is not cached
     llama_moe_cache_lookup build_lookup(const llm_graph_context & g, const llama_moe_cache_layer & layer, ggml_tensor * selected_experts) const;
+
+    // aborts if the device that caches w cannot compute op, an expert matmul that reads the cached experts of w
+    void check_op(const ggml_tensor * w, const ggml_tensor * op) const;
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);

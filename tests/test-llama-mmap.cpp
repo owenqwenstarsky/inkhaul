@@ -19,6 +19,14 @@
 #include <malloc.h>
 #endif
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <linux/magic.h>
+#include <sys/mman.h>
+#include <sys/vfs.h>
+#include <unistd.h>
+#endif
+
 static constexpr size_t test_file_size = LLAMA_DIRECT_IO_BUFFER_SIZE + 3*1024*1024 + 1;
 static constexpr size_t test_io_size   = 1024*1024;
 
@@ -248,6 +256,46 @@ static void check_read_at(testing & t, const std::filesystem::path & path) {
     t.assert_true("positional read past the end throws", threw);
 }
 
+// on Linux, set_no_cache drops what read_raw_at read from the page cache
+static void check_read_at_no_cache(testing & t, const std::filesystem::path & path) {
+#if defined(__linux__)
+    struct statfs sfs;
+    if (statfs(path.c_str(), &sfs) != 0 || sfs.f_type == TMPFS_MAGIC) {
+        return; // tmpfs keeps its pages
+    }
+    {
+        // dirty pages are not dropped
+        const int fd = open(path.c_str(), O_RDONLY);
+        t.assert_true("open", fd != -1);
+        fdatasync(fd);
+        close(fd);
+    }
+
+    llama_file file(path.string().c_str(), "rb");
+    file.set_no_cache();
+    std::vector<uint8_t> buffer(test_file_size);
+    file.read_raw_at(buffer.data(), buffer.size(), 0);
+
+    const int fd = open(path.c_str(), O_RDONLY);
+    t.assert_true("open", fd != -1);
+    void * addr = mmap(nullptr, test_file_size, PROT_READ, MAP_SHARED, fd, 0);
+    t.assert_true("mmap", addr != MAP_FAILED);
+    if (addr != MAP_FAILED) {
+        const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+        std::vector<unsigned char> resident((test_file_size + page - 1)/page);
+        t.assert_true("mincore", mincore(addr, test_file_size, resident.data()) == 0);
+        // the last page is partial, DONTNEED keeps it
+        const size_t n_resident = std::count_if(resident.begin(), resident.begin() + test_file_size/page, [](unsigned char v) { return (v & 1) != 0; });
+        t.assert_equal(size_t(0), n_resident);
+        munmap(addr, test_file_size);
+    }
+    close(fd);
+#else
+    (void) t;
+    (void) path;
+#endif
+}
+
 int main() {
     testing t;
     temporary_file test_file;
@@ -259,5 +307,6 @@ int main() {
     t.test("llama_file.direct_fallback", [&] (testing & t) { check_direct_io_fallback(t, test_file.path); });
     t.test("llama_mmap", [&] (testing & t) { check_mmap(t, test_file.path); });
     t.test("llama_file.read_at", [&] (testing & t) { check_read_at(t, test_file.path); });
+    t.test("llama_file.read_at_no_cache", [&] (testing & t) { check_read_at_no_cache(t, test_file.path); });
     return t.summary();
 }

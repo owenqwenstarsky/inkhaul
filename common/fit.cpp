@@ -63,7 +63,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool * hp_longhaul = nullptr) {
     common_fit_log_scope log_scope(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -151,6 +152,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_ngl         = llama_model_n_layer(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
+    if (hp_longhaul != nullptr) {
+        *hp_longhaul = llama_model_has_longhaul(model);
+    }
 
     common_memory_breakdown_print(ctx);
 
@@ -266,6 +270,7 @@ static void common_params_fit_impl(
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
+    bool     hp_lh  = false; // LongHaul: the experts stay on disk and every layer must be on the GPU
 
     // with non-unified kv, we need to take into account n_streams
     // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
@@ -331,7 +336,7 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &hp_lh);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -528,6 +533,10 @@ static void common_params_fit_impl(
     }
     if (nd == 0) {
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
+    }
+    if (hp_lh) {
+        // offloading fewer layers or moving experts to the CPU is not possible with LongHaul
+        throw common_params_fit_exception("LongHaul needs all layers on the GPU, use a smaller --longhaul-cache or context size, abort");
     }
 
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {

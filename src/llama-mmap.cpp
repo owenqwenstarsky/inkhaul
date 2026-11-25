@@ -637,6 +637,7 @@ struct llama_file::impl {
     FILE * fp{};
     size_t size{};
     bool owns_fp = true;
+    bool no_cache = false;
 };
 
 llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io) :
@@ -713,6 +714,12 @@ void llama_file::read_raw_at(void * ptr, size_t len, size_t offset) const {
         }
         done += (size_t) n;
     }
+#if defined(__linux__)
+    if (pimpl->no_cache) {
+        // best effort, drops only the full pages of the range from the page cache
+        posix_fadvise(fd, (off_t) offset, (off_t) len, POSIX_FADV_DONTNEED);
+    }
+#endif
 #endif
 }
 
@@ -721,6 +728,12 @@ void llama_file::set_no_cache() {
     if (fcntl(file_id(), F_NOCACHE, 1) == -1) {
         LLAMA_LOG_WARN("%s: fcntl(F_NOCACHE) failed: %s\n", __func__, strerror(errno));
     }
+#elif defined(__linux__)
+    // no readahead, and read_raw_at drops what it read
+    if (posix_fadvise(file_id(), 0, 0, POSIX_FADV_RANDOM) != 0) {
+        LLAMA_LOG_WARN("%s: posix_fadvise(POSIX_FADV_RANDOM) failed\n", __func__);
+    }
+    pimpl->no_cache = true;
 #endif
 }
 

@@ -32,6 +32,43 @@ typedef half2 ggml_half2;
 #define GGML_COMMON_AGGR_S
 
 #define GGML_COMMON_DECL
+#elif defined(GGML_COMMON_DECL_CUDA)
+#if defined(GGML_COMMON_DECL_MUSA)
+#include <musa_fp16.h>
+#else
+#include <cuda_fp16.h>
+#endif
+#include <cstdint>
+
+typedef half  ggml_half;
+typedef half2 ggml_half2;
+
+#define GGML_COMMON_AGGR_U
+#define GGML_COMMON_AGGR_S data
+
+#define GGML_COMMON_DECL
+#elif defined(GGML_COMMON_DECL_HIP)
+#include <hip/hip_fp16.h>
+#include <cstdint>
+
+typedef half  ggml_half;
+typedef half2 ggml_half2;
+
+#define GGML_COMMON_AGGR_U
+#define GGML_COMMON_AGGR_S data
+
+#define GGML_COMMON_DECL
+#elif defined(GGML_COMMON_DECL_SYCL)
+#include <sycl/half_type.hpp>
+#include <cstdint>
+
+typedef sycl::half  ggml_half;
+typedef sycl::half2 ggml_half2;
+
+#define GGML_COMMON_AGGR_U
+#define GGML_COMMON_AGGR_S data
+
+#define GGML_COMMON_DECL
 #endif
 
 #if defined(GGML_COMMON_DECL)
@@ -51,6 +88,88 @@ typedef half2 ggml_half2;
 
 #define QK_K 256
 #define K_SCALE_SIZE 12
+
+#if defined(GGML_COMMON_DECL_CUDA) || defined(GGML_COMMON_DECL_HIP) || defined(GGML_COMMON_DECL_SYCL)
+// QR = QK / number of values before dequantization
+// QI = number of 32 bit integers before dequantization
+
+#define QI1_0 (QK1_0 / 32)
+#define QR1_0 1
+
+#define QI2_0 (QK2_0 / 32)
+#define QR2_0 1
+
+
+#define QI4_0 (QK4_0 / (4 * QR4_0))
+#define QR4_0 2
+
+#define QI4_1 (QK4_1 / (4 * QR4_1))
+#define QR4_1 2
+
+#define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
+#define QR_MXFP4 2
+
+#define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
+#define QR_NVFP4 2
+
+#define QI5_0 (QK5_0 / (4 * QR5_0))
+#define QR5_0 2
+
+#define QI5_1 (QK5_1 / (4 * QR5_1))
+#define QR5_1 2
+
+#define QI8_0 (QK8_0 / (4 * QR8_0))
+#define QR8_0 1
+
+#define QI8_1 (QK8_1 / (4 * QR8_1))
+#define QR8_1 1
+
+#define QI2_K (QK_K / (4*QR2_K))
+#define QR2_K 4
+
+#define QI3_K (QK_K / (4*QR3_K))
+#define QR3_K 4
+
+#define QI4_K (QK_K / (4*QR4_K))
+#define QR4_K 2
+
+#define QI5_K (QK_K / (4*QR5_K))
+#define QR5_K 2
+
+#define QI6_K (QK_K / (4*QR6_K))
+#define QR6_K 2
+
+#define QI2_XXS (QK_K / (4*QR2_XXS))
+#define QR2_XXS 4
+
+#define QI2_XS (QK_K / (4*QR2_XS))
+#define QR2_XS 4
+
+#define QI2_S (QK_K / (4*QR2_S))
+#define QR2_S 4
+
+#define QI3_XXS (QK_K / (4*QR3_XXS))
+#define QR3_XXS 4
+
+#define QI3_XS (QK_K / (4*QR3_XS))
+#define QR3_XS 4
+
+#define QI1_S (QK_K / (4*QR1_S))
+#define QR1_S 8
+
+#define QI1_M (QK_K / (4*QR1_M))
+#define QR1_M 8
+
+#define QI4_NL (QK4_NL / (4*QR4_NL))
+#define QR4_NL 2
+
+#define QI4_XS (QK_K / (4*QR4_XS))
+#define QR4_XS 2
+
+#define QI3_S (QK_K / (4*QR3_S))
+#define QR3_S 4
+
+#endif // GGML_COMMON_DECL_CUDA || GGML_COMMON_DECL_HIP
 
 #ifdef _MSC_VER
 #define GGML_EXTENSION
@@ -365,6 +484,21 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #include <metal_stdlib>
 
 #define GGML_TABLE_BEGIN(type, name, size) static const constant type name[size] = {
+#define GGML_TABLE_END() };
+
+#define GGML_COMMON_IMPL
+#elif defined(GGML_COMMON_IMPL_CUDA) || defined(GGML_COMMON_IMPL_HIP) || defined(GGML_COMMON_IMPL_MUSA)
+#include <cstdint>
+
+#define GGML_TABLE_BEGIN(type, name, size) static const __device__ type name[size] = {
+#define GGML_TABLE_END() };
+
+#define GGML_COMMON_IMPL
+#elif defined(GGML_COMMON_IMPL_SYCL)
+
+#include <cstdint>
+
+#define GGML_TABLE_BEGIN(type, name, size) static const type name[size] = {
 #define GGML_TABLE_END() };
 
 #define GGML_COMMON_IMPL

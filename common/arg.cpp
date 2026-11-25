@@ -2592,7 +2592,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
         {"-lhc", "--longhaul-cache"}, "SIZE",
-        string_format("LongHaul: RAM cache for the MoE experts, which stay on disk; a number in MiB or with a K, M or G suffix, e.g. 512M, 1G, 2G (default: %zuM)\n"
+        string_format("LongHaul: GPU memory cache for the MoE experts, which stay on disk; a number in MiB or with a K, M or G suffix, e.g. 512M, 1G, 2G (default: %zuM)\n"
         "a larger cache gives faster generation and prompt processing", params.longhaul_cache_size/(1024*1024)),
         [](common_params & params, const std::string & value) {
             params.longhaul_cache_size = string_parse_mem_size(value);
