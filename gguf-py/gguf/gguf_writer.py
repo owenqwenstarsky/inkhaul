@@ -718,6 +718,9 @@ class GGUFWriter:
     def add_block_count(self, length: int) -> None:
         self.add_uint32(Keys.LLM.BLOCK_COUNT.format(arch=self.arch), length)
 
+    def add_leading_dense_block_count(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.LEADING_DENSE_BLOCK_COUNT.format(arch=self.arch), length)
+
     def add_full_attention_interval(self, interval: int) -> None:
         self.add_uint32(Keys.LLM.FULL_ATTENTION_INTERVAL.format(arch=self.arch), interval)
 
@@ -819,6 +822,9 @@ class GGUFWriter:
         else:
             self.add_array(Keys.LLM.EXPERT_USED_COUNT.format(arch=self.arch), count)
 
+    def add_expert_shared_count(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.EXPERT_SHARED_COUNT.format(arch=self.arch), count)
+
     def add_expert_group_count(self, count: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_GROUP_COUNT.format(arch=self.arch), count)
 
@@ -827,6 +833,9 @@ class GGUFWriter:
 
     def add_expert_weights_scale(self, value: float) -> None:
         self.add_float32(Keys.LLM.EXPERT_WEIGHTS_SCALE.format(arch=self.arch), value)
+
+    def add_expert_weights_norm(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.EXPERT_WEIGHTS_NORM.format(arch=self.arch), value)
 
     def add_expert_gating_func(self, value: ExpertGatingFuncType) -> None:
         self.add_uint32(Keys.LLM.EXPERT_GATING_FUNC.format(arch=self.arch), value.value)
@@ -878,6 +887,12 @@ class GGUFWriter:
 
     def add_causal_attention(self, value: bool) -> None:
         self.add_bool(Keys.Attention.CAUSAL.format(arch=self.arch), value)
+
+    def add_q_lora_rank(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.Q_LORA_RANK.format(arch=self.arch), length)
+
+    def add_kv_lora_rank(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.KV_LORA_RANK.format(arch=self.arch), length)
 
     def add_rope_freq_base_swa(self, value: float) -> None:
         self.add_float32(Keys.Rope.FREQ_BASE_SWA.format(arch=self.arch), value)
@@ -1040,6 +1055,12 @@ class GGUFWriter:
 
     def add_kda_head_dim(self, value: int) -> None:
         self.add_uint32(Keys.KDA.HEAD_DIM.format(arch=self.arch), value)
+
+    def add_kda_safe_gate(self, value: bool) -> None:
+        self.add_bool(Keys.KDA.SAFE_GATE.format(arch=self.arch), value)
+
+    def add_kda_gate_lower_bound(self, value: float) -> None:
+        self.add_float32(Keys.KDA.GATE_LOWER_BOUND.format(arch=self.arch), value)
 
     def add_tokenizer_model(self, model: str) -> None:
         self.add_string(Keys.Tokenizer.MODEL, model)

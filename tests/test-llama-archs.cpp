@@ -257,6 +257,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_head  = 4;
         n_ff    = 24;
         n_layer = 3;
+    } else if (arch == LLM_ARCH_BAILINGMOE3) {
+        n_embd  = 128;
+        n_ff    = 192;
+        n_layer = 3; // the dense lead layer, then MoE layers
     }
 
     uint32_t n_head_kv = n_head;
@@ -361,6 +365,33 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         gguf_set_arr_data(ret.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN).c_str(), GGUF_TYPE_BOOL, values.data(), values.size());
     }
 
+    if (arch == LLM_ARCH_BAILINGMOE3) {
+        // the trunk alternates KDA (no KV head) and MLA (one latent KV head) layers, then one NextN (MTP) layer
+        const uint32_t n_block = n_layer + 1;
+        std::vector<uint32_t> n_head_kv_per_layer;
+        std::vector<float>    clamp_exp;
+        std::vector<float>    clamp_shexp;
+        for (uint32_t il = 0; il < n_block; il++) {
+            n_head_kv_per_layer.push_back(il % 2 == 1 || il == n_layer ? 1 : 0);
+            // small limits, so that the clamps bite on the activations of the random weights
+            clamp_exp  .push_back(il % 2 == 1 ? 0.05f : 0.0f);
+            clamp_shexp.push_back(il % 2 == 1 ? 0.07f : 0.0f);
+        }
+        ms.add_kv(LLM_KV_BLOCK_COUNT,                n_block);
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,       uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,    n_head_kv_per_layer);
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(128));
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
+        ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,      uint32_t(0)); // Ling 3 has no q LoRA
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
+        // VL files carry mrope sections, the text model ropes with NORM anyway
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,    std::vector<uint32_t>({8, 12, 12, 0}));
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,           clamp_exp);
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP,         clamp_shexp);
+    }
+
     // dummy tokenizer: token ids are derived from fixed-size chunks and detokenized as hex ids
     {
         std::vector<std::string> tokenizer_list(n_vocab);
@@ -396,6 +427,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         gating_func); // sigmoid : softmax : sqrtsoftplus
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
+
+        if (arch == LLM_ARCH_BAILINGMOE3) {
+            // group-limited routing, as Ling 3 (8 groups, 4 used)
+            ms.add_kv(LLM_KV_EXPERT_COUNT,            uint32_t(8));
+            ms.add_kv(LLM_KV_EXPERT_GROUP_COUNT,      uint32_t(4));
+            ms.add_kv(LLM_KV_EXPERT_GROUP_USED_COUNT, uint32_t(2));
+            ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,    2.5f);
+            ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
+        }
     }
 
 
@@ -452,12 +492,14 @@ static std::string get_tmp_gguf_path() {
     return (std::filesystem::temp_directory_path() / ("test-llama-archs-" + std::to_string(++id) + ".gguf")).string();
 }
 
+// the model comes from one of: the fixture (gguf_ctx), a file, or the files of a split model (splits)
 static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
-    GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr,
+        const std::vector<std::string> & splits = {}) {
+    GGML_ASSERT((gguf_ctx != nullptr) + (file != nullptr) + !splits.empty() == 1);
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
@@ -467,9 +509,14 @@ static llama_model_ptr get_model(
     model_params.tensor_buft_overrides = tensor_buft_overrides;
 
     tensor_data_params tensor_params = { seed, stdev };
-    llama_model_ptr model(gguf_ctx != nullptr ?
-        llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params) :
-        llama_model_load_from_file_ptr(file, model_params));
+    std::vector<const char *> split_paths;
+    for (const std::string & path : splits) {
+        split_paths.push_back(path.c_str());
+    }
+    llama_model_ptr model(
+        gguf_ctx != nullptr ? llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params) :
+        file     != nullptr ? llama_model_load_from_file_ptr(file, model_params) :
+                              llama_model_load_from_splits(split_paths.data(), split_paths.size(), model_params));
     if (!model) {
         throw std::runtime_error("failed to create llama model");
     }
@@ -480,8 +527,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t longhaul_cache_size = 0) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t longhaul_cache_size = 0,
+        const std::vector<std::string> & splits = {}) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, splits);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -669,6 +717,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_INKLING2:
         case LLM_ARCH_INKLING2_LOOP:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_BAILINGMOE3:
             return true;
         default:
             return false;
@@ -849,6 +898,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             }
             const std::string config_name = moe ? "MoE" : "Dense";
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            if (arch == LLM_ARCH_BAILINGMOE3) {
+                // the KDA safe gate defaults to true
+                GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
+            }
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
@@ -1098,26 +1151,47 @@ static std::vector<expert_group> get_expert_groups(const std::string & path, con
     return groups;
 }
 
-// the slots of each group for a cache size, as the cache splits it on one device: by the size of the experts of the groups
-static std::vector<int32_t> get_group_slots(const std::vector<expert_group> & groups, const uint32_t n_expert, const size_t alignment, const size_t size) {
+// the expert bytes the cache allocates for n_slots slots of a group: one extra slot per expert tensor, padded to the alignment
+static size_t get_alloc_size(const expert_group & g, const size_t alignment, const int32_t n_slots) {
+    size_t res = 0;
+    for (size_t s : g.sizes) {
+        res += GGML_PAD(s*(n_slots + 1), alignment);
+    }
+    return res;
+}
+
+// the bytes that give every group the slots of a ubatch of n_ubatch tokens (at most the experts of one layer)
+static size_t get_reserve(const std::vector<expert_group> & groups, const uint32_t n_expert, const uint32_t n_expert_used, const size_t alignment, const uint32_t n_ubatch) {
+    size_t res = 0;
+    for (const expert_group & g : groups) {
+        res += get_alloc_size(g, alignment, (int32_t) std::min(n_ubatch*n_expert_used, n_expert));
+    }
+    return res;
+}
+
+// the slots of each group for a cache size, as the cache splits it on one device: every group first gets the slots of the
+// largest ubatch that fits in half of the cache, the rest is split by the size of the experts of the groups
+// empty below the reserve of one token, the cache does not load
+static std::vector<int32_t> get_group_slots(const std::vector<expert_group> & groups, const uint32_t n_expert, const uint32_t n_expert_used, const size_t alignment, const size_t size) {
+    if (get_reserve(groups, n_expert, n_expert_used, alignment, 1) > size) {
+        return {};
+    }
+    const uint32_t n_max = (n_expert + n_expert_used - 1)/n_expert_used;
+    uint32_t n_ubatch = 1;
+    while (n_ubatch < n_max && get_reserve(groups, n_expert, n_expert_used, alignment, n_ubatch + 1) <= size/2) {
+        n_ubatch++;
+    }
+    const size_t rest = size - std::min(size, get_reserve(groups, n_expert, n_expert_used, alignment, n_ubatch));
     size_t host_bytes = 0;
     for (const expert_group & g : groups) {
         host_bytes += g.host_bytes;
     }
     std::vector<int32_t> res;
     for (const expert_group & g : groups) {
-        auto alloc_size = [&](int32_t n_slots) {
-            size_t sum = 0;
-            for (size_t s : g.sizes) {
-                sum += GGML_PAD(s*(n_slots + 1), alignment);
-            }
-            return sum;
-        };
-        const double  share     = 1.0*g.host_bytes/host_bytes;
-        const size_t  budget    = (size_t) ((double) size*share);
+        int32_t n_slots = (int32_t) std::min(n_ubatch*n_expert_used, n_expert);
+        const size_t  budget    = get_alloc_size(g, alignment, n_slots) + (size_t) ((double) rest*g.host_bytes/host_bytes);
         const int32_t max_slots = g.n_layers*(int32_t) n_expert;
-        int32_t n_slots = 0;
-        while (n_slots < max_slots && alloc_size(n_slots + 1) <= budget) {
+        while (n_slots < max_slots && get_alloc_size(g, alignment, n_slots + 1) <= budget) {
             n_slots++;
         }
         res.push_back(n_slots);
@@ -1125,26 +1199,59 @@ static std::vector<int32_t> get_group_slots(const std::vector<expert_group> & gr
     return res;
 }
 
-// the smallest cache size that gives every group at least n_slots slots
-static size_t get_cache_size(const std::vector<expert_group> & groups, const uint32_t n_expert, const size_t alignment, const int32_t n_slots) {
-    size_t host_bytes = 0;
-    for (const expert_group & g : groups) {
-        host_bytes += g.host_bytes;
+// the ubatch of a context with a cache of this size: cut to the tokens whose experts fit in the group with the fewest slots,
+// unless every group holds a whole layer (64 is the n_ubatch of the test contexts)
+static uint32_t get_expected_ubatch(const std::vector<expert_group> & groups, const uint32_t n_expert, const uint32_t n_expert_used, const size_t alignment, const size_t size) {
+    uint32_t res = 64;
+    for (int32_t n_slots : get_group_slots(groups, n_expert, n_expert_used, alignment, size)) {
+        if (n_slots < (int32_t) n_expert) {
+            res = std::min<uint32_t>(res, n_slots/n_expert_used);
+        }
     }
+    return res;
+}
+
+// the smallest cache size that gives every group at least n_slots slots
+static size_t get_cache_size(const std::vector<expert_group> & groups, const uint32_t n_expert, const uint32_t n_expert_used, const size_t alignment, const int32_t n_slots) {
+    // the groups cannot get more than the cache, so the search starts at the sum of their banks
     size_t size = 0;
     for (const expert_group & g : groups) {
-        size_t alloc = 0;
-        for (size_t s : g.sizes) {
-            alloc += GGML_PAD(s*(n_slots + 1), alignment);
-        }
-        size = std::max(size, (size_t) std::ceil(alloc/(1.0*g.host_bytes/host_bytes)));
+        size += get_alloc_size(g, alignment, n_slots);
     }
-    for (;; size++) {
-        const std::vector<int32_t> slots = get_group_slots(groups, n_expert, alignment, size);
-        if (std::all_of(slots.begin(), slots.end(), [&](int32_t n) { return n >= n_slots; })) {
-            return size;
+    auto fits = [&](size_t sz) {
+        const std::vector<int32_t> slots = get_group_slots(groups, n_expert, n_expert_used, alignment, sz);
+        return !slots.empty() && std::all_of(slots.begin(), slots.end(), [&](int32_t n) { return n >= n_slots; });
+    };
+    // with one group the bound fits, with more the share of a group can need more: double the step until it fits, then bisect
+    size_t lo = size;
+    size_t step = 1;
+    while (!fits(lo + step - 1)) {
+        lo += step;
+        step *= 2;
+    }
+    size_t hi = lo + step - 1;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo)/2;
+        if (fits(mid)) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
         }
     }
+    return hi;
+}
+
+// the first GPU (or integrated GPU) other than skip, of the named backend device if name is not nullptr
+static ggml_backend_dev_t get_gpu(const char * name, ggml_backend_dev_t skip) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) && dev != skip &&
+                (name == nullptr || strcmp(name, ggml_backend_dev_name(dev)) == 0)) {
+            return dev;
+        }
+    }
+    return nullptr;
 }
 
 // a file for the LongHaul test, rewritten from the file saved from the in-memory model
@@ -1235,24 +1342,9 @@ static void write_longhaul_variant(const std::string & src, const std::string & 
 // LongHaul: a file-backed MoE model keeps its experts on disk and reads them into a cache on the GPU
 // the logits must match the same file with its experts in the mapped file, for caches from the smallest (evictions in every layer) to one that holds all experts
 static int test_longhaul(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
-    ggml_backend_dev_t gpu = nullptr;
-    for (size_t i = 0; i < ggml_backend_dev_count() && gpu == nullptr; i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
-                (target_backend == nullptr || strcmp(target_backend, ggml_backend_dev_name(dev)) == 0)) {
-            gpu = dev;
-        }
-    }
+    ggml_backend_dev_t gpu  = get_gpu(target_backend, nullptr);
     // a second GPU, for the error of a cache on two GPUs (GGML_CUDA_DEVICES=2 or GGML_METAL_DEVICES=2 emulate one)
-    ggml_backend_dev_t gpu2 = nullptr;
-    for (size_t i = 0; i < ggml_backend_dev_count() && gpu2 == nullptr; i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) && dev != gpu) {
-            gpu2 = dev;
-        }
-    }
+    ggml_backend_dev_t gpu2 = get_gpu(nullptr, gpu);
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
     const uint32_t n_expert      = 16;
@@ -1347,6 +1439,7 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
             GGML_ASSERT(n_expert_file == n_expert);
             GGML_ASSERT(groups.size() == (v.mixed_down ? 2u : 1u));
             const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(gpu));
+            auto cache_size = [&](int32_t n_slots) { return get_cache_size(groups, n_expert, n_expert_used, alignment, n_slots); };
 
             // the reference: the experts in the mapped file (cache size 0 with the test hook)
             std::vector<float> logits_ref;
@@ -1387,25 +1480,19 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
                 size_t       size;
                 const char * io_threads; // LLAMA_LONGHAUL_IO_THREADS, nullptr = default
             };
-            const size_t size_min = get_cache_size(groups, n_expert, alignment, n_expert_used);
+            const size_t size_min = cache_size(n_expert_used);
             std::vector<cache_case> cases = {
-                { std::to_string(n_expert_used) + " slots", size_min,                                          nullptr },
-                { "5 slots",                                get_cache_size(groups, n_expert, alignment, 5),        nullptr },
-                { std::to_string(n_expert) + " slots",      get_cache_size(groups, n_expert, alignment, n_expert), nullptr },
-                { "512 MiB",                                512ull*1024*1024,                                      nullptr },
+                { std::to_string(n_expert_used) + " slots", size_min,             nullptr },
+                { "5 slots",                                cache_size(5),        nullptr },
+                { std::to_string(n_expert) + " slots",      cache_size(n_expert), nullptr },
+                { "512 MiB",                                512ull*1024*1024,     nullptr },
             };
             if (&v == &av.variants.front()) {
                 cases.push_back({ std::to_string(n_expert_used) + " slots, 1 I/O thread", size_min, "1" });
-                cases.push_back({ std::to_string(n_expert) + " slots, 16 I/O threads", get_cache_size(groups, n_expert, alignment, n_expert), "16" });
+                cases.push_back({ std::to_string(n_expert) + " slots, 16 I/O threads", cache_size(n_expert), "16" });
             }
             for (const cache_case & cc : cases) {
-                // the ubatch is cut to the tokens whose experts fit in the group with the fewest slots, unless every group holds a whole layer
-                uint32_t n_ubatch_exp = 64;
-                for (int32_t n_slots : get_group_slots(groups, n_expert, alignment, cc.size)) {
-                    if (n_slots < (int32_t) n_expert) {
-                        n_ubatch_exp = std::min<uint32_t>(n_ubatch_exp, n_slots/n_expert_used);
-                    }
-                }
+                const uint32_t n_ubatch_exp = get_expected_ubatch(groups, n_expert, n_expert_used, alignment, cc.size);
 
                 set_env("LLAMA_LONGHAUL_IO_THREADS", cc.io_threads);
                 FILE * file = fopen(path.c_str(), "rb");
@@ -1443,12 +1530,12 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
                     std::vector<ggml_backend_dev_t> devs;
                 };
                 std::vector<error_case> errors = {
-                    { "cache too small", get_cache_size(groups, n_expert, alignment, n_expert_used - 1), { gpu } },
-                    { "no cache",        0,                                                                { gpu } },
-                    { "no GPU",          get_cache_size(groups, n_expert, alignment, n_expert),           {} },
+                    { "cache too small", size_min - 1,         { gpu } },
+                    { "no cache",        0,                    { gpu } },
+                    { "no GPU",          cache_size(n_expert), {} },
                 };
                 if (gpu2 != nullptr) {
-                    errors.push_back({ "two GPUs", get_cache_size(groups, n_expert, alignment, n_expert), { gpu, gpu2 } });
+                    errors.push_back({ "two GPUs", cache_size(n_expert), { gpu, gpu2 } });
                 }
                 set_longhaul_resident(false);
                 for (const error_case & ec : errors) {
@@ -1471,6 +1558,375 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
         }
     }
     return all_ok ? 0 : 1;
+}
+
+// a GGUF file with its tensor data in memory
+struct gguf_file {
+    gguf_context_ptr gguf;
+    ggml_context_ptr ctx;
+
+    explicit gguf_file(const std::string & path) {
+        ggml_context * ctx_data = nullptr;
+        gguf_init_params params = { /*.no_alloc =*/ false, /*.ctx =*/ &ctx_data };
+        gguf.reset(gguf_init_from_file(path.c_str(), params));
+        ctx.reset(ctx_data);
+        GGML_ASSERT(gguf && ctx);
+    }
+
+    // the model tensors, ctx also holds the data blob
+    std::vector<ggml_tensor *> tensors() const {
+        std::vector<ggml_tensor *> ret;
+        for (int64_t i = 0; i < gguf_get_n_tensors(gguf.get()); i++) {
+            ret.push_back(ggml_get_tensor(ctx.get(), gguf_get_tensor_name(gguf.get(), i)));
+        }
+        return ret;
+    }
+};
+
+// adds a NextN (MTP) layer to a saved bailingmoe3 model, as the converter writes it: the weights of block il_src copied
+// to block il_dst, and the NextN tensors (the fixture skips the layer, the saved model only has its optional KV scales)
+static void add_nextn_layer(const std::string & path, uint32_t il_src, uint32_t il_dst, int64_t n_embd) {
+    gguf_file in(path);
+    gguf_context_ptr out(gguf_init_empty());
+    gguf_set_kv(out.get(), in.gguf.get());
+
+    const std::string prefix_src = "blk." + std::to_string(il_src) + ".";
+    const std::string prefix_dst = "blk." + std::to_string(il_dst) + ".";
+
+    size_t size = 4*ggml_tensor_overhead() + 8*n_embd*n_embd*sizeof(float);
+    for (ggml_tensor * t : in.tensors()) {
+        size += ggml_tensor_overhead() + ggml_nbytes(t);
+    }
+    ggml_init_params params = { /*.mem_size =*/ size, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };
+    ggml_context_ptr ctx(ggml_init(params));
+
+    for (ggml_tensor * t : in.tensors()) {
+        gguf_add_tensor(out.get(), t);
+        const std::string name = ggml_get_name(t);
+        const bool weight = name.size() > 7 && (name.compare(name.size() - 7, 7, ".weight") == 0 || name.compare(name.size() - 5, 5, ".bias") == 0);
+        if (name.rfind(prefix_src, 0) == 0 && weight) {
+            ggml_tensor * copy = ggml_dup_tensor(ctx.get(), t);
+            memcpy(copy->data, t->data, ggml_nbytes(t));
+            ggml_set_name(copy, (prefix_dst + name.substr(prefix_src.size())).c_str());
+            gguf_add_tensor(out.get(), copy);
+        }
+    }
+    for (const char * name : { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "layer_output_norm.weight" }) {
+        const bool proj = strcmp(name, "nextn.eh_proj.weight") == 0;
+        ggml_tensor * t = proj ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 2*n_embd, n_embd) : ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_embd);
+        memset(t->data, 0, ggml_nbytes(t));
+        ggml_set_name(t, (prefix_dst + name).c_str());
+        gguf_add_tensor(out.get(), t);
+    }
+    GGML_ASSERT(gguf_write_to_file(out.get(), path.c_str(), false));
+}
+
+// writes a model as 2 split files, the tensors alternate between the files, so the experts of a layer are in both
+static std::vector<std::string> write_splits(const std::string & path) {
+    gguf_file in(path);
+    const uint16_t n_split = 2;
+    std::vector<gguf_context_ptr> outs;
+    std::vector<std::string> paths;
+    for (uint16_t i = 0; i < n_split; i++) {
+        char split_path[512];
+        llama_split_path(split_path, sizeof(split_path), path.c_str(), i, n_split);
+        paths.emplace_back(split_path);
+        outs.emplace_back(gguf_init_empty());
+        if (i == 0) {
+            gguf_set_kv(outs[i].get(), in.gguf.get());
+        }
+        gguf_set_val_u16(outs[i].get(), "split.no",            i);
+        gguf_set_val_u16(outs[i].get(), "split.count",         n_split);
+        gguf_set_val_i32(outs[i].get(), "split.tensors.count", gguf_get_n_tensors(in.gguf.get()));
+    }
+    size_t it = 0;
+    for (ggml_tensor * t : in.tensors()) {
+        gguf_add_tensor(outs[it++ % n_split].get(), t);
+    }
+    for (uint16_t i = 0; i < n_split; i++) {
+        GGML_ASSERT(gguf_write_to_file(outs[i].get(), paths[i].c_str(), false));
+    }
+    return paths;
+}
+
+// decodes a prompt of n_prompt tokens, then the rest in batches of 1 to 3 tokens
+static std::vector<float> get_logits_steps(llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, uint32_t n_prompt) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens = tokens.size();
+    llama_memory_clear(llama_get_memory(lctx), true);
+    common_batch batch(lctx);
+
+    std::vector<float> ret;
+    ret.reserve(n_tokens*n_vocab);
+    uint32_t n_step = 1;
+    for (uint32_t i0 = 0; i0 < n_tokens; ) {
+        const uint32_t i1 = std::min(n_tokens, i0 == 0 ? n_prompt : i0 + n_step);
+        n_step = n_step % 3 + 1;
+        batch.clear();
+        for (uint32_t pos = i0; pos < i1; pos++) {
+            batch.add(tokens[pos], pos, 0, true);
+        }
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            throw std::runtime_error("failed to decode batch");
+        }
+        for (uint32_t i = 0; i < i1 - i0; i++) {
+            const float * logits_ith = llama_get_logits_ith(lctx, i);
+            ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+        }
+        i0 = i1;
+    }
+    return ret;
+}
+
+// LongHaul with bailingmoe3: a dense lead layer, separate gate, up and down experts, a NextN layer that stays on disk,
+// files with two expert layouts and split files; the logits must match the in-memory model, also when decoding in small batches
+static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    const llm_arch arch = LLM_ARCH_BAILINGMOE3;
+    if (!arch_matches(arch_filter, arch)) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu  = get_gpu(target_backend, nullptr);
+    ggml_backend_dev_t gpu2 = get_gpu(nullptr, gpu);
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    // more experts than used per token, so that the small caches evict
+    const uint32_t n_expert      = 16;
+    const uint32_t n_expert_used = 2;
+
+    struct variant {
+        ggml_type type_exps;   // GGML_TYPE_COUNT: the default F32 experts
+        uint32_t  n_layer_min;
+        bool      mixed;       // the last layer keeps F32 experts, a group of its own in the cache
+    };
+    // a dense lead layer and 3 MoE layers (MLA, KDA, MLA)
+    std::vector<variant> variants;
+    for (const ggml_type type_exps : { GGML_TYPE_COUNT, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4 }) {
+        variants.push_back({ type_exps, 4, type_exps != GGML_TYPE_COUNT });
+    }
+    // 40 cached MoE layers, for the graph size with the cache lookups
+    variants.push_back({ GGML_TYPE_COUNT, 41, false });
+
+    bool all_ok = true;
+    for (const variant & v : variants) {
+        const ggml_type type_exps = v.type_exps;
+        std::string name = std::string(llama_arch_name(arch)) + (type_exps == GGML_TYPE_COUNT ? "" : std::string(" ") + ggml_type_name(type_exps));
+        if (v.mixed) {
+            name += " + F32";
+        }
+        if (v.n_layer_min > 4) {
+            name += " " + std::to_string(v.n_layer_min) + " layers";
+        }
+        if (gpu == nullptr) {
+            LOG("LongHaul %s: SKIP (no GPU)\n", name.c_str());
+            continue;
+        }
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true, v.n_layer_min);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_COUNT).c_str(),      n_expert);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_USED_COUNT).c_str(), n_expert_used);
+
+        const uint32_t n_block = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT).c_str()));
+        const uint32_t n_layer = n_block - 1; // without the NextN layer
+
+        if (type_exps != GGML_TYPE_COUNT) {
+            // quantized experts need rows that are a multiple of the block size
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_FEED_FORWARD_LENGTH).c_str(), 64);
+            for (uint32_t il = 0; il < n_layer; il++) {
+                if (v.mixed && il == n_layer - 1) {
+                    continue;
+                }
+                for (const char * e : { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps" }) {
+                    ggml_tensor t;
+                    memset(&t, 0, sizeof(ggml_tensor));
+                    t.type = type_exps;
+                    ggml_format_name(&t, "blk.%" PRIu32 ".%s.weight", il, e);
+                    gguf_add_tensor(gguf_ctx.get(), &t);
+                }
+            }
+        }
+
+        const std::string path = get_tmp_gguf_path();
+        {
+            llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path.c_str());
+        }
+        // blk.1 is an MLA MoE layer, as the NextN layer of Ling 3
+        const uint32_t n_embd = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EMBEDDING_LENGTH).c_str()));
+        add_nextn_layer(path, 1, n_layer, n_embd);
+
+        uint32_t n_expert_file = 0;
+        const std::vector<expert_group> groups = get_expert_groups(path, arch, n_expert_file);
+        GGML_ASSERT(n_expert_file == n_expert);
+        GGML_ASSERT(groups.size() == (v.mixed ? 2u : 1u));
+        const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(gpu));
+        auto cache_size = [&](int32_t n_slots) { return get_cache_size(groups, n_expert, n_expert_used, alignment, n_slots); };
+        auto reserve    = [&](uint32_t n_ubatch) { return get_reserve(groups, n_expert, n_expert_used, alignment, n_ubatch); };
+
+        const std::vector<float> logits_ref = [&]() {
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { gpu });
+            return get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+        }();
+
+        // 2 experts used per token: 2 and 5 slots cut the ubatch to 1 and 2 tokens, 16 slots hold one layer, 512 MiB all experts
+        // the default number of I/O threads, except for the cases that name one
+        struct cache_case {
+            const char * name;
+            size_t       size;
+            const char * io_threads; // LLAMA_LONGHAUL_IO_THREADS, nullptr = default
+        };
+        std::vector<cache_case> cases;
+        if (v.mixed) {
+            // a group of one layer gets the slots of the ubatch as the others, the smallest cache holds one token in each
+            cases = {
+                { "reserve(1)",     reserve(1),       nullptr },
+                { "2 x reserve(4)", 2*reserve(4),     nullptr },
+                { "512 MiB",        512ull*1024*1024, nullptr },
+            };
+            GGML_ASSERT(get_expected_ubatch(groups, n_expert, n_expert_used, alignment, reserve(1)) == 1);
+            GGML_ASSERT(get_expected_ubatch(groups, n_expert, n_expert_used, alignment, 2*reserve(4)) >= 4);
+        } else if (v.n_layer_min > 4) {
+            cases = {
+                { "5 slots", cache_size(5),    nullptr },
+                { "512 MiB", 512ull*1024*1024, nullptr },
+            };
+        } else {
+            cases = {
+                { "2 slots",                  cache_size(2),    nullptr },
+                { "2 slots, 1 I/O thread",    cache_size(2),    "1"     },
+                { "5 slots",                  cache_size(5),    nullptr },
+                { "16 slots",                 cache_size(16),   nullptr },
+                { "16 slots, 16 I/O threads", cache_size(16),   "16"    },
+                { "512 MiB",                  512ull*1024*1024, nullptr },
+            };
+        }
+        for (const cache_case & cc : cases) {
+            const uint32_t n_ubatch_exp = get_expected_ubatch(groups, n_expert, n_expert_used, alignment, cc.size);
+            set_env("LLAMA_LONGHAUL_IO_THREADS", cc.io_threads);
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            bool ok = true;
+            std::string detail;
+            try {
+                auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu }, LLAMA_SPLIT_MODE_LAYER, nullptr, cc.size);
+                const uint32_t n_ubatch = llama_n_ubatch(model_and_ctx.second.get());
+                if (n_ubatch != n_ubatch_exp) {
+                    ok = false;
+                    detail = "n_ubatch = " + std::to_string(n_ubatch) + ", expected " + std::to_string(n_ubatch_exp);
+                }
+                const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                // also decode and small batches after a prompt
+                const double nmse_val = std::max(nmse(logits_ref, logits),
+                    nmse(logits_ref, get_logits_steps(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, 100)));
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail += detail.empty() ? buf : std::string(", ") + buf;
+                ok = ok && nmse_val <= 1e-4;
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            fclose(file);
+            set_env("LLAMA_LONGHAUL_IO_THREADS", nullptr);
+            LOG("LongHaul %s, cache %s: %s (%s)\n", name.c_str(), cc.name, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+
+        if (v.mixed) {
+            // below the reserve of one token, the error names the smallest cache
+            std::string log;
+            ggml_log_callback log_cb;
+            void * log_ud;
+            llama_log_get(&log_cb, &log_ud);
+            llama_log_set([](ggml_log_level, const char * text, void * ud) { ((std::string *) ud)->append(text); }, &log);
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            bool failed = false;
+            try {
+                get_model_and_ctx(nullptr, file, seed, stdev, { gpu }, LLAMA_SPLIT_MODE_LAYER, nullptr, reserve(1) - 1);
+            } catch (const std::exception &) {
+                failed = true;
+            }
+            fclose(file);
+            llama_log_set(log_cb, log_ud);
+            char min_str[64];
+            snprintf(min_str, sizeof(min_str), "use at least %.0f MiB", std::ceil(reserve(1)/1024.0/1024.0));
+            const bool ok = failed && log.find(min_str) != std::string::npos;
+            LOG("LongHaul %s, cache below reserve(1): %s\n", name.c_str(), ok ? "OK" : "FAIL (no error or no minimum)");
+            all_ok = all_ok && ok;
+        }
+
+        if (type_exps != GGML_TYPE_COUNT || v.n_layer_min > 4) {
+            std::filesystem::remove(path);
+            continue;
+        }
+
+        // a split model, the experts are read from both files
+        {
+            const std::vector<std::string> splits = write_splits(path);
+            bool ok = true;
+            std::string detail;
+            try {
+                auto model_and_ctx = get_model_and_ctx(nullptr, nullptr, seed, stdev, { gpu }, LLAMA_SPLIT_MODE_LAYER, nullptr, cache_size(5), splits);
+                const double nmse_val = nmse(logits_ref, get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens));
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail = buf;
+                ok = nmse_val <= 1e-4;
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            for (const std::string & p : splits) {
+                std::filesystem::remove(p);
+            }
+            LOG("LongHaul %s, 2 split files: %s (%s)\n", name.c_str(), ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+
+        // a cache that cannot hold the experts of one token, no cache without the test hook, no GPU and two GPUs are errors
+        struct error_case {
+            const char *                    name;
+            size_t                          size;
+            std::vector<ggml_backend_dev_t> devs;
+        };
+        std::vector<error_case> errors = {
+            { "cache too small", cache_size(n_expert_used) - 1, { gpu } },
+            { "no cache",        0,                             { gpu } },
+            { "no GPU",          cache_size(n_expert),          {} },
+        };
+        if (gpu2 != nullptr) {
+            errors.push_back({ "two GPUs", cache_size(n_expert), { gpu, gpu2 } });
+        }
+        set_longhaul_resident(false);
+        for (const error_case & ec : errors) {
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            bool failed = false;
+            try {
+                get_model_and_ctx(nullptr, file, seed, stdev, ec.devs, LLAMA_SPLIT_MODE_LAYER, nullptr, ec.size);
+            } catch (const std::exception &) {
+                failed = true;
+            }
+            fclose(file);
+            LOG("LongHaul %s, %s: %s\n", name.c_str(), ec.name, failed ? "OK" : "FAIL (no error)");
+            all_ok = all_ok && failed;
+        }
+        set_longhaul_resident(true);
+
+        std::filesystem::remove(path);
+    }
+    return all_ok ? 0 : 1;
+}
+
+// Ling 3 rotates adjacent pairs: a bailingmoe3 model ropes with NORM (one position per token) even with the mrope sections of the VL files
+static int test_rope_type(const std::string & arch_filter, const size_t seed, const float stdev) {
+    if (!arch_matches(arch_filter, LLM_ARCH_BAILINGMOE3)) {
+        return 0;
+    }
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_BAILINGMOE3, true);
+    llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+    const bool ok = llama_model_rope_type(model.get()) == LLAMA_ROPE_TYPE_NORM;
+    LOG("Rope type bailingmoe3: %s\n", ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 struct kv_shift_move {
@@ -1672,6 +2128,9 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
             // different bases, so that a shift using the wrong one is caught
             gguf_set_val_f32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ROPE_FREQ_BASE).c_str(),     20000.0f);
             gguf_set_val_f32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ROPE_FREQ_BASE_SWA).c_str(), 10000.0f);
+            if (arch == LLM_ARCH_BAILINGMOE3) {
+                GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
+            }
 
             llama_model_ptr model;
             try {
@@ -1884,8 +2343,10 @@ int main(int argc, char ** argv) {
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
         }
-        const int ret = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
-        return test_longhaul(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        int ret = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+        ret = test_rope_type(arch_filter, seed, stdev) != 0 ? 1 : ret;
+        ret = test_longhaul(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        return test_longhaul_bailingmoe3(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

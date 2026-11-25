@@ -22,6 +22,8 @@ struct llama_model;
 // available models
 enum llm_type {
     LLM_TYPE_UNKNOWN,
+    LLM_TYPE_7_9B_A1_3B,
+    LLM_TYPE_124B_A5_1B,
 };
 
 std::string llama_rope_scaling_type_name(llama_rope_scaling_type rope_scaling_type);
@@ -61,6 +63,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_down     = nullptr; // w2
     struct ggml_tensor * ffn_up       = nullptr; // w3
 
+    // MLA
+    struct ggml_tensor * wq_a           = nullptr;
+    struct ggml_tensor * wkv_a_mqa      = nullptr;
+    struct ggml_tensor * attn_q_a_norm  = nullptr;
+    struct ggml_tensor * attn_kv_a_norm = nullptr;
+
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
     struct ggml_tensor * ffn_gate_exps     = nullptr;
@@ -76,6 +84,15 @@ struct llama_layer {
 
     // ff bias
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+
+    // KDA (ssm_a and ssm_beta are with the gated delta net tensors below)
+    struct ggml_tensor * ssm_q_conv = nullptr;
+    struct ggml_tensor * ssm_k_conv = nullptr;
+    struct ggml_tensor * ssm_v_conv = nullptr;
+    struct ggml_tensor * ssm_f_a    = nullptr;
+    struct ggml_tensor * ssm_dt_b   = nullptr;
+    struct ggml_tensor * ssm_g_a    = nullptr;
+    struct ggml_tensor * ssm_o_norm = nullptr;
 
     // rope frequency factors
     struct ggml_tensor * rope_freqs = nullptr;

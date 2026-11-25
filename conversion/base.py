@@ -77,6 +77,13 @@ class ModelBase:
     block_count: int
     tensor_map: gguf.TensorNameMap
 
+    # MTP (multi-token prediction) export modes; set by main() before instantiation.
+    # Architectures that implement the filtering/export behavior opt in by
+    # setting supports_mtp_export = True on their model class or a mixin.
+    supports_mtp_export: bool = False
+    mtp_only: bool = False
+    no_mtp: bool = False
+
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
                  metadata_override: Path | None = None, model_name: str | None = None,
@@ -628,10 +635,10 @@ class ModelBase:
             gguf.MODEL_TENSOR.ATTN_Q, gguf.MODEL_TENSOR.ATTN_K, gguf.MODEL_TENSOR.ATTN_V,
             gguf.MODEL_TENSOR.ATTN_OUT, gguf.MODEL_TENSOR.ATTN_QKV, gguf.MODEL_TENSOR.ATTN_GATE,
             gguf.MODEL_TENSOR.FFN_GATE, gguf.MODEL_TENSOR.FFN_UP, gguf.MODEL_TENSOR.FFN_DOWN,
-            gguf.MODEL_TENSOR.FFN_GATE_EXP, gguf.MODEL_TENSOR.FFN_UP_EXP, gguf.MODEL_TENSOR.FFN_DOWN_EXP,
             gguf.MODEL_TENSOR.FFN_GATE_SHEXP, gguf.MODEL_TENSOR.FFN_UP_SHEXP, gguf.MODEL_TENSOR.FFN_DOWN_SHEXP,
+            gguf.MODEL_TENSOR.FFN_GATE_EXP, gguf.MODEL_TENSOR.FFN_UP_EXP, gguf.MODEL_TENSOR.FFN_DOWN_EXP,
             gguf.MODEL_TENSOR.SSM_OUT, gguf.MODEL_TENSOR.SSM_ALPHA, gguf.MODEL_TENSOR.SSM_BETA,
-            gguf.MODEL_TENSOR.OUTPUT,
+            gguf.MODEL_TENSOR.NEXTN_EH_PROJ, gguf.MODEL_TENSOR.OUTPUT,
         }
 
         for scale_name in list(self.model_tensors.keys()):
@@ -873,6 +880,10 @@ class ModelBase:
                     gguf.MODEL_TENSOR.FFN_GATE_INP_SHEXP,
                     gguf.MODEL_TENSOR.SSM_CONV1D,
                     gguf.MODEL_TENSOR.V_ENC_EMBD_POS,
+                    # Kimi KDA conv weights should be F32
+                    gguf.MODEL_TENSOR.SSM_CONV1D_Q,
+                    gguf.MODEL_TENSOR.SSM_CONV1D_K,
+                    gguf.MODEL_TENSOR.SSM_CONV1D_V,
                 )
             )
             or new_name[-7:] not in (".weight", ".lora_a", ".lora_b")
@@ -1777,6 +1788,9 @@ class TextModel(ModelBase):
         if chkhsh == "5635e1c8d621dff7b4825f41f2f97b6ceb39bcf2d5c541db28577080d6efd5e5":
             # ref: https://huggingface.co/thinkingmachines/Inkling-2-Small
             res = "inkling2"
+        if chkhsh == "9b1be57e70d20d9501b2b3186e792d81181ae36ada3903c26f9fea418cf87206":
+            # ref: https://huggingface.co/inclusionAI/Ling-mini-base-2.0
+            res = "bailingmoe2"
         if chkhsh == "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4":
             # ref: https://huggingface.co/Qwen/Qwen3.5-9B-Instruct
             res = "qwen35"

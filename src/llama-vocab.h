@@ -9,10 +9,11 @@
 
 // pre-tokenization types
 enum llama_vocab_pre_type {
-    LLAMA_VOCAB_PRE_TYPE_DEFAULT = 0,
-    LLAMA_VOCAB_PRE_TYPE_GPT4O   = 1,
-    LLAMA_VOCAB_PRE_TYPE_QWEN2   = 2,
-    LLAMA_VOCAB_PRE_TYPE_QWEN35  = 3,
+    LLAMA_VOCAB_PRE_TYPE_DEFAULT    = 0,
+    LLAMA_VOCAB_PRE_TYPE_GPT4O      = 1,
+    LLAMA_VOCAB_PRE_TYPE_QWEN2      = 2,
+    LLAMA_VOCAB_PRE_TYPE_QWEN35     = 3,
+    LLAMA_VOCAB_PRE_TYPE_BAILINGMOE = 4,
 };
 
 struct LLM_KV;

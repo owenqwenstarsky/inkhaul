@@ -7,6 +7,8 @@ llama.cpp supports multimodal input via `libmtmd`. These tools support this feat
 
 This fork keeps two encoders: `inkling2v`, the vision encoder of Inkling 2, and `qwen3vl_merger`, the vision encoder of Qwen 3.5 / 3.6. Both take **image** input. They do not take audio input, and Qwen video input is not supported.
 
+Ling-3.2-air runs as a text model only: its vision encoder (`ling3vl`) is not in this fork, and `--mmproj` files for it do not load.
+
 To enable it, you can use one of the 2 methods below:
 
 - Use `-hf` option with a repo that ships an `mmproj` file

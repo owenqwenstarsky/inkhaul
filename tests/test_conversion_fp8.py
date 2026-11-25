@@ -11,15 +11,80 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
 from safetensors.torch import save_file
 
-from conversion.base import gguf
+from conversion import get_model_class
+from conversion.base import LazyTorchTensor, ModelType, get_model_architecture, gguf
+from conversion.bailingmoe3 import BailingMoeV3Model, BailingMoeV3VLModel
 from conversion.inkling2 import Inkling2Model, _E4M3, _E2M1
+
+
+class ConversionTestCase(unittest.TestCase):
+    def convert(self, model_class, tensors, eager=False, check_lazy=False, scan_nvfp4=False, ftype=gguf.LlamaFileType.GUESSED, hparams_override=None, with_kv=False, **kwargs):
+        with tempfile.TemporaryDirectory() as directory:
+            return self._convert(Path(directory), model_class, tensors, eager, check_lazy, scan_nvfp4, ftype, hparams_override, with_kv, **kwargs)
+
+    def _convert(self, path, model_class, tensors, eager, check_lazy, scan_nvfp4, ftype, hparams_override, with_kv, **kwargs):
+        hparams = {
+            "model_type": "qwen2_moe",
+            "architectures": ["Qwen2MoeForCausalLM"],
+            "num_hidden_layers": 1,
+            "hidden_size": 4,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "num_experts": 2,
+            "qk_nope_head_dim": 2,
+            "v_head_dim": 2,
+            "quantization_config": {"quant_method": "modelopt"},
+        }
+        hparams.update(hparams_override or {})
+        (path / "config.json").write_text(json.dumps(hparams))
+        save_file(tensors, str(path / "model.safetensors"))
+        model = model_class(path, ftype, path / "out.gguf", hparams=hparams, eager=eager, **kwargs)
+        reads: list[str] = []
+        if check_lazy:
+            self.assertFalse(eager)
+
+            def track(name, gen):
+                tensor = gen()
+
+                def load(source):
+                    reads.append(name)
+                    return LazyTorchTensor.to_eager(source())
+
+                return LazyTorchTensor(meta=torch.empty(tuple(tensor.shape), dtype=tensor.dtype, device="meta"), args=(gen,), func=load)
+
+            model.model_tensors = {
+                name: lambda name=name, gen=gen: track(name, gen)
+                for name, gen in model.model_tensors.items()
+            }
+        if scan_nvfp4:
+            model._generate_nvfp4_tensors()
+            self.assertEqual(reads, [])
+        model.prepare_tensors()
+        if check_lazy:
+            deferred = {name for name, tensor in tensors.items() if tensor.numel() != 1 or name.endswith((".weight", ".bias"))}
+            self.assertFalse(deferred.intersection(reads), f"Materialized during preparation: {reads}")
+            for name, info in model.gguf_writer.tensors[0].items():
+                if name.endswith((".weight", ".bias")):
+                    self.assertIsInstance(info.tensor, gguf.LazyNumpyTensor)
+        result = {
+            name: (info.dtype, gguf.LazyNumpyTensor.to_eager(info.tensor).copy())
+            for name, info in model.gguf_writer.tensors[0].items()
+        }
+        if check_lazy:
+            self.assertTrue(deferred.intersection(reads))
+        if with_kv:
+            model.set_gguf_parameters()
+            return result, {key: value.value for key, value in model.gguf_writer.kv_data[0].items()}
+        return result
 
 
 class TestInkling2PackedConversion(unittest.TestCase):
@@ -328,6 +393,334 @@ class TestInkling2TextNames(unittest.TestCase):
         self.assertEqual(renamed.keys(), actual.keys())
         for name in actual:
             np.testing.assert_array_equal(renamed[name], actual[name], name)
+
+
+class TestBailingMoeV3Conversion(ConversionTestCase):
+    """Synthetic Ling-3.2-air (bailingmoe3) checkpoint: layer 0 is KDA with a dense MLP, layer 1 is MLA with MoE, layer 2 is the MTP layer."""
+
+    N_EMBD, N_VOCAB, HEAD_DIM, N_FF, N_FF_EXP, N_FF_SHEXP, N_EXPERT = 128, 32, 128, 256, 160, 256, 4
+    QK_NOPE, QK_ROPE, V_HEAD, KV_RANK, KERNEL = 48, 16, 32, 64, 4
+    FP8_CONFIG = {"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic", "weight_block_size": [128, 128]}
+    KEYS = {
+        "block_count", "context_length", "embedding_length", "feed_forward_length", "attention.head_count",
+        "attention.head_count_kv", "rope.freq_base", "attention.layer_norm_rms_epsilon", "expert_count", "expert_used_count",
+        "expert_group_count", "expert_group_used_count", "expert_gating_func", "attention.key_length", "attention.value_length",
+        "vocab_size", "ssm.conv_kernel", "kda.head_dim", "kda.safe_gate", "kda.gate_lower_bound", "attention.kv_lora_rank",
+        "rope.dimension_count", "attention.key_length_mla", "attention.value_length_mla", "expert_feed_forward_length",
+        "expert_shared_feed_forward_length", "expert_shared_count", "leading_dense_block_count", "expert_weights_scale",
+        "expert_weights_norm", "swiglu_clamp_exp", "swiglu_clamp_shexp", "nextn_predict_layers", "rope.dimension_sections",
+    }
+
+    def text_config(self):
+        return {
+            "model_type": "bailing_hybrid",
+            "vocab_size": self.N_VOCAB,
+            "hidden_size": self.N_EMBD,
+            "intermediate_size": self.N_FF,
+            "moe_intermediate_size": self.N_FF_EXP,
+            "moe_shared_expert_intermediate_size": self.N_FF_SHEXP,
+            "num_hidden_layers": 2,
+            "num_nextn_predict_layers": 1,
+            "layer_group_size": 2,
+            "first_k_dense_replace": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": self.HEAD_DIM,
+            "max_position_embeddings": 4096,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6,
+            "num_experts": self.N_EXPERT,
+            "num_experts_per_tok": 2,
+            "num_shared_experts": 1,
+            "n_group": 2,
+            "topk_group": 1,
+            "score_function": "sigmoid",
+            "routed_scaling_factor": 2.5,
+            "norm_topk_prob": True,
+            "q_lora_rank": None,
+            "kv_lora_rank": self.KV_RANK,
+            "qk_nope_head_dim": self.QK_NOPE,
+            "qk_rope_head_dim": self.QK_ROPE,
+            "v_head_dim": self.V_HEAD,
+            "no_kda_lora": True,
+            "kda_safe_gate": True,
+            "kda_lower_bound": -5.0,
+            "short_conv_kernel_size": self.KERNEL,
+            "gated_attention_proj_granularity_type": "head_wise",
+            "expert_swiglu_limit_list": [None, 7.0],
+            "share_expert_swiglu_limit_list": [None, 5.0],
+        }
+
+    def vl_config(self):
+        text_config = {**self.text_config(), "mrope_section": [4, 2, 2]}
+        return {"model_type": "bailing_hybrid_vl", "architectures": ["BailingMoeV3VLForConditionalGeneration"], "text_config": text_config, "vision_config": {"depth": 1}, "quantization_config": self.FP8_CONFIG}
+
+    def causal_config(self):
+        return {**self.text_config(), "architectures": ["BailingMoeV3ForCausalLM"], "quantization_config": self.FP8_CONFIG}
+
+    @staticmethod
+    def fp8(shape, scale):
+        """FP8 weight with one scale per 128x128 block. Returns the weight, the scale and the reference dequant."""
+        weight = (torch.linspace(-2, 2, shape[0] * shape[1]).reshape(shape) * torch.cos(torch.arange(shape[1]).float())).to(torch.float8_e4m3fn)
+        scale = torch.tensor(scale, dtype=torch.float32)
+        reference = weight.float() * scale.repeat_interleave(128, 0).repeat_interleave(128, 1)[:shape[0], :shape[1]]
+        return weight, scale, reference.numpy()
+
+    def checkpoint(self, vision):
+        """Returns the checkpoint tensors and the FP8 reference values by source weight name."""
+        generator = torch.Generator().manual_seed(0)
+        tensors: dict[str, torch.Tensor] = {}
+        fp8_reference: dict[str, np.ndarray] = {}
+
+        def add(name, *shape, dtype=torch.bfloat16):
+            tensors[name] = torch.randn(shape, generator=generator).to(dtype)
+
+        def add_fp8(name, shape, scale):
+            weight, scale_inv, reference = self.fp8(shape, scale)
+            tensors[name + ".weight"] = weight
+            tensors[name + ".weight_scale_inv"] = scale_inv
+            fp8_reference[name + ".weight"] = reference
+
+        H = self.N_EMBD
+        add("model.word_embeddings.weight", self.N_VOCAB, H)
+        add("model.norm.weight", H)
+        add("lm_head.weight", self.N_VOCAB, H)
+
+        # layer 0: KDA attention, dense MLP
+        p = "model.layers.0."
+        add(p + "input_layernorm.weight", H)
+        add(p + "post_attention_layernorm.weight", H)
+        for proj in ("q_proj", "k_proj", "v_proj", "f_proj", "g_proj"):
+            add(p + f"attention.{proj}.weight", self.HEAD_DIM, H)
+        for conv in ("q_conv1d", "k_conv1d", "v_conv1d"):
+            add(p + f"attention.{conv}.weight", self.HEAD_DIM, 1, self.KERNEL)
+        add(p + "attention.b_proj.weight", 1, H)
+        tensors[p + "attention.A_log"] = torch.tensor([0.3])
+        add(p + "attention.dt_bias", self.HEAD_DIM, dtype=torch.float32)
+        add(p + "attention.o_norm.weight", self.HEAD_DIM)
+        add(p + "attention.o_proj.weight", H, self.HEAD_DIM)
+        add_fp8(p + "mlp.gate_proj", (self.N_FF, H), [[0.5], [2.0]])
+        add_fp8(p + "mlp.up_proj", (self.N_FF, H), [[0.25], [4.0]])
+        add_fp8(p + "mlp.down_proj", (H, self.N_FF), [[1.5, 0.125]])
+
+        # layer 1: MLA attention, MoE; layer 2: MTP
+        for bid in (1, 2):
+            p = f"model.layers.{bid}."
+            add(p + "input_layernorm.weight", H)
+            add(p + "post_attention_layernorm.weight", H)
+            add(p + "attention.q_proj.weight", self.QK_NOPE + self.QK_ROPE, H)
+            add_fp8(p + "attention.kv_a_proj_with_mqa", (self.KV_RANK + self.QK_ROPE, H), [[0.75]])
+            add(p + "attention.kv_a_layernorm.weight", self.KV_RANK)
+            add(p + "attention.kv_b_proj.weight", self.QK_NOPE + self.V_HEAD, self.KV_RANK)
+            add(p + "attention.dense.weight", H, self.V_HEAD)
+            add(p + "attention.g_proj.weight", 1, H)
+            add(p + "mlp.gate.weight", self.N_EXPERT, H, dtype=torch.float32)
+            add(p + "mlp.gate.expert_bias", self.N_EXPERT, dtype=torch.float32)
+            for xid in range(self.N_EXPERT):
+                add_fp8(p + f"mlp.experts.{xid}.gate_proj", (self.N_FF_EXP, H), [[0.5 + xid], [2.0]])
+                add_fp8(p + f"mlp.experts.{xid}.up_proj", (self.N_FF_EXP, H), [[1.0], [0.25 * (xid + 1)]])
+                add_fp8(p + f"mlp.experts.{xid}.down_proj", (H, self.N_FF_EXP), [[2.0 + xid, 0.5]])
+            add(p + "mlp.shared_experts.gate_proj.weight", self.N_FF_SHEXP, H)
+            add_fp8(p + "mlp.shared_experts.up_proj", (self.N_FF_SHEXP, H), [[3.0], [0.5]])
+            add(p + "mlp.shared_experts.down_proj.weight", H, self.N_FF_SHEXP)
+
+        p = "model.layers.2."
+        add_fp8(p + "eh_proj", (H, 2 * H), [[0.5, 2.0]])
+        add(p + "enorm.weight", H)
+        add(p + "hnorm.weight", H)
+        add(p + "final_layernorm.weight", H)
+
+        if vision:
+            add("model.visual.patch_embed.proj.weight", 16, 3, 2, 2)
+            add("model.visual.blocks.0.attn.qkv.weight", 48, 16)
+            add("linear_proj.0.weight", 32, 64)
+            add("linear_proj.2.weight", H, 32)
+        return tensors, fp8_reference
+
+    def expected_shapes(self, layers):
+        H = self.N_EMBD
+        shapes = {
+            "token_embd.weight": (self.N_VOCAB, H),
+            "output_norm.weight": (H,),
+            "output.weight": (self.N_VOCAB, H),
+        }
+        for bid in layers:
+            shapes.update({
+                f"blk.{bid}.attn_norm.weight": (H,),
+                f"blk.{bid}.ffn_norm.weight": (H,),
+            })
+            if bid == 0:
+                shapes.update({
+                    "blk.0.attn_q.weight": (self.HEAD_DIM, H),
+                    "blk.0.attn_k.weight": (self.HEAD_DIM, H),
+                    "blk.0.attn_v.weight": (self.HEAD_DIM, H),
+                    "blk.0.ssm_f_a.weight": (self.HEAD_DIM, H),
+                    "blk.0.ssm_g_a.weight": (self.HEAD_DIM, H),
+                    "blk.0.ssm_conv1d_q.weight": (1, self.HEAD_DIM, 1, self.KERNEL),
+                    "blk.0.ssm_conv1d_k.weight": (1, self.HEAD_DIM, 1, self.KERNEL),
+                    "blk.0.ssm_conv1d_v.weight": (1, self.HEAD_DIM, 1, self.KERNEL),
+                    "blk.0.ssm_beta.weight": (1, H),
+                    "blk.0.ssm_a": (1, 1),
+                    "blk.0.ssm_dt.bias": (self.HEAD_DIM,),
+                    "blk.0.ssm_norm.weight": (self.HEAD_DIM,),
+                    "blk.0.attn_output.weight": (H, self.HEAD_DIM),
+                    "blk.0.ffn_gate.weight": (self.N_FF, H),
+                    "blk.0.ffn_up.weight": (self.N_FF, H),
+                    "blk.0.ffn_down.weight": (H, self.N_FF),
+                })
+                continue
+            shapes.update({
+                f"blk.{bid}.attn_q.weight": (self.QK_NOPE + self.QK_ROPE, H),
+                f"blk.{bid}.attn_kv_a_mqa.weight": (self.KV_RANK + self.QK_ROPE, H),
+                f"blk.{bid}.attn_kv_a_norm.weight": (self.KV_RANK,),
+                f"blk.{bid}.attn_k_b.weight": (1, self.KV_RANK, self.QK_NOPE),
+                f"blk.{bid}.attn_v_b.weight": (1, self.V_HEAD, self.KV_RANK),
+                f"blk.{bid}.attn_output.weight": (H, self.V_HEAD),
+                f"blk.{bid}.attn_gate.weight": (1, H),
+                f"blk.{bid}.ffn_gate_inp.weight": (self.N_EXPERT, H),
+                f"blk.{bid}.exp_probs_b.bias": (self.N_EXPERT,),
+                f"blk.{bid}.ffn_gate_exps.weight": (self.N_EXPERT, self.N_FF_EXP, H),
+                f"blk.{bid}.ffn_up_exps.weight": (self.N_EXPERT, self.N_FF_EXP, H),
+                f"blk.{bid}.ffn_down_exps.weight": (self.N_EXPERT, H, self.N_FF_EXP),
+                f"blk.{bid}.ffn_gate_shexp.weight": (self.N_FF_SHEXP, H),
+                f"blk.{bid}.ffn_up_shexp.weight": (self.N_FF_SHEXP, H),
+                f"blk.{bid}.ffn_down_shexp.weight": (H, self.N_FF_SHEXP),
+            })
+            if bid == 2:
+                shapes.update({
+                    "blk.2.nextn.eh_proj.weight": (H, 2 * H),
+                    "blk.2.nextn.enorm.weight": (H,),
+                    "blk.2.nextn.hnorm.weight": (H,),
+                    "blk.2.layer_output_norm.weight": (H,),
+                })
+        return shapes
+
+    def run_converter(self, model_class, config, tensors, ftype=gguf.LlamaFileType.ALL_F32, **kwargs):
+        result, kv = self.convert(model_class, tensors, ftype=ftype, hparams_override=config, with_kv=True, **kwargs)
+        prefix = "bailingmoe3."
+        return result, {key[len(prefix):]: value for key, value in kv.items() if key.startswith(prefix)}
+
+    def test_registered_classes(self):
+        for config, expected in ((self.vl_config(), BailingMoeV3VLModel), (self.causal_config(), BailingMoeV3Model)):
+            arch = get_model_architecture(config, ModelType.TEXT)
+            self.assertIs(get_model_class(arch), expected)
+        with self.assertRaises(NotImplementedError):
+            get_model_class("BailingMoeV3VLForConditionalGeneration", mmproj=True)
+
+    def test_vl_text_model(self):
+        tensors, fp8_reference = self.checkpoint(vision=True)
+        result, kv = self.run_converter(BailingMoeV3VLModel, self.vl_config(), tensors, check_lazy=True)
+
+        self.assertEqual({name: data.shape for name, (_, data) in result.items()}, self.expected_shapes(range(3)))
+        for name, (dtype, _) in result.items():
+            self.assertEqual(dtype, gguf.GGMLQuantizationType.F32, name)
+
+        self.assertEqual(kv.keys(), self.KEYS)
+        self.assertEqual(kv["block_count"], 3)
+        self.assertEqual(list(kv["attention.head_count_kv"]), [0, 1, 1])
+        self.assertEqual(kv["attention.key_length"], self.KV_RANK + self.QK_ROPE)
+        self.assertEqual(kv["attention.value_length"], self.HEAD_DIM)
+        self.assertEqual(kv["attention.key_length_mla"], self.QK_NOPE + self.QK_ROPE)
+        self.assertEqual(kv["attention.value_length_mla"], self.V_HEAD)
+        self.assertEqual(kv["rope.dimension_count"], self.QK_ROPE)
+        self.assertEqual(list(kv["rope.dimension_sections"]), [4, 2, 2, 0])
+        self.assertEqual(list(kv["swiglu_clamp_exp"]), [0.0, 7.0, 0.0])
+        self.assertEqual(list(kv["swiglu_clamp_shexp"]), [0.0, 5.0, 0.0])
+        self.assertEqual((kv["expert_count"], kv["expert_used_count"]), (self.N_EXPERT, 2))
+        self.assertEqual((kv["expert_group_count"], kv["expert_group_used_count"]), (2, 1))
+        self.assertEqual(kv["expert_gating_func"], gguf.ExpertGatingFuncType.SIGMOID)
+        self.assertEqual((kv["leading_dense_block_count"], kv["nextn_predict_layers"]), (1, 1))
+        self.assertEqual((kv["expert_shared_count"], kv["expert_shared_feed_forward_length"]), (1, self.N_FF_SHEXP))
+        self.assertEqual((kv["kda.head_dim"], kv["kda.safe_gate"], kv["kda.gate_lower_bound"]), (self.HEAD_DIM, True, -5.0))
+        self.assertEqual((kv["expert_weights_scale"], kv["expert_weights_norm"]), (2.5, True))
+        self.assertEqual((kv["ssm.conv_kernel"], kv["vocab_size"]), (self.KERNEL, self.N_VOCAB))
+
+        def source(name):
+            return tensors[name].float().numpy()
+
+        # no rope row permutation
+        np.testing.assert_array_equal(result["blk.1.attn_q.weight"][1], source("model.layers.1.attention.q_proj.weight"))
+        np.testing.assert_array_equal(result["blk.0.ssm_f_a.weight"][1], source("model.layers.0.attention.f_proj.weight"))
+        np.testing.assert_array_equal(result["blk.0.ssm_g_a.weight"][1], source("model.layers.0.attention.g_proj.weight"))
+        np.testing.assert_array_equal(result["blk.1.attn_gate.weight"][1], source("model.layers.1.attention.g_proj.weight"))
+        np.testing.assert_array_equal(result["blk.0.ssm_conv1d_k.weight"][1], source("model.layers.0.attention.k_conv1d.weight").reshape(1, self.HEAD_DIM, 1, self.KERNEL))
+        np.testing.assert_array_equal(result["blk.0.ssm_dt.bias"][1], source("model.layers.0.attention.dt_bias"))
+        np.testing.assert_allclose(result["blk.0.ssm_a"][1], np.exp([[0.3]]), rtol=1e-6)
+
+        kv_b = source("model.layers.1.attention.kv_b_proj.weight").reshape(1, self.QK_NOPE + self.V_HEAD, self.KV_RANK)
+        np.testing.assert_array_equal(result["blk.1.attn_k_b.weight"][1], kv_b[:, :self.QK_NOPE].transpose(0, 2, 1))
+        np.testing.assert_array_equal(result["blk.1.attn_v_b.weight"][1], kv_b[:, self.QK_NOPE:])
+
+        for bid, proj, target in ((1, "gate_proj", "ffn_gate_exps"), (2, "down_proj", "ffn_down_exps")):
+            experts = np.stack([fp8_reference[f"model.layers.{bid}.mlp.experts.{xid}.{proj}.weight"] for xid in range(self.N_EXPERT)])
+            np.testing.assert_array_equal(result[f"blk.{bid}.{target}.weight"][1], experts)
+        np.testing.assert_array_equal(result["blk.1.exp_probs_b.bias"][1], source("model.layers.1.mlp.gate.expert_bias"))
+
+        for source_name, target in (
+            ("model.layers.0.mlp.gate_proj.weight", "blk.0.ffn_gate.weight"),
+            ("model.layers.0.mlp.up_proj.weight", "blk.0.ffn_up.weight"),
+            ("model.layers.0.mlp.down_proj.weight", "blk.0.ffn_down.weight"),
+            ("model.layers.1.attention.kv_a_proj_with_mqa.weight", "blk.1.attn_kv_a_mqa.weight"),
+            ("model.layers.1.mlp.shared_experts.up_proj.weight", "blk.1.ffn_up_shexp.weight"),
+            ("model.layers.2.mlp.shared_experts.up_proj.weight", "blk.2.ffn_up_shexp.weight"),
+            ("model.layers.2.eh_proj.weight", "blk.2.nextn.eh_proj.weight"),
+        ):
+            np.testing.assert_array_equal(result[target][1], fp8_reference[source_name], target)
+
+    def test_vl_auto_outtype(self):
+        """With the auto outtype, 128x128 block FP8 weights are dequantized and KDA conv weights stay F32."""
+        tensors, fp8_reference = self.checkpoint(vision=True)
+        result, _ = self.run_converter(BailingMoeV3VLModel, self.vl_config(), tensors, ftype=gguf.LlamaFileType.GUESSED)
+        values = {name: gguf.dequantize(data, dtype) for name, (dtype, data) in result.items()}
+        self.assertEqual({name: data.shape for name, data in values.items()}, self.expected_shapes(range(3)))
+        self.assertEqual(result["blk.0.ssm_conv1d_q.weight"][0], gguf.GGMLQuantizationType.F32)
+        for source_name, target in (
+            ("model.layers.0.mlp.gate_proj.weight", "blk.0.ffn_gate.weight"),
+            ("model.layers.1.attention.kv_a_proj_with_mqa.weight", "blk.1.attn_kv_a_mqa.weight"),
+            ("model.layers.1.mlp.shared_experts.up_proj.weight", "blk.1.ffn_up_shexp.weight"),
+            ("model.layers.2.eh_proj.weight", "blk.2.nextn.eh_proj.weight"),
+        ):
+            self.assertEqual(result[target][0], gguf.GGMLQuantizationType.BF16, target)
+            np.testing.assert_array_equal(values[target], torch.from_numpy(fp8_reference[source_name]).bfloat16().float().numpy(), target)
+        experts = np.stack([fp8_reference[f"model.layers.1.mlp.experts.{xid}.up_proj.weight"] for xid in range(self.N_EXPERT)])
+        self.assertEqual(result["blk.1.ffn_up_exps.weight"][0], gguf.GGMLQuantizationType.BF16)
+        np.testing.assert_array_equal(values["blk.1.ffn_up_exps.weight"], torch.from_numpy(experts).bfloat16().float().numpy())
+        self.assertFalse([name for name in result if name.endswith(".scale")])
+
+    def test_vl_no_mtp(self):
+        tensors, _ = self.checkpoint(vision=True)
+        with mock.patch.object(BailingMoeV3VLModel, "no_mtp", True):
+            result, kv = self.run_converter(BailingMoeV3VLModel, self.vl_config(), tensors)
+        self.assertEqual({name: data.shape for name, (_, data) in result.items()}, self.expected_shapes(range(2)))
+        self.assertEqual(kv.keys(), self.KEYS - {"nextn_predict_layers"})
+        self.assertEqual(kv["block_count"], 2)
+        self.assertEqual(list(kv["attention.head_count_kv"]), [0, 1])
+        self.assertEqual(list(kv["swiglu_clamp_exp"]), [0.0, 7.0])
+
+    def test_vl_mtp_only(self):
+        tensors, _ = self.checkpoint(vision=True)
+        with mock.patch.object(BailingMoeV3VLModel, "mtp_only", True):
+            result, kv = self.run_converter(BailingMoeV3VLModel, self.vl_config(), tensors)
+        expected = {name: shape for name, shape in self.expected_shapes(range(3)).items() if not name.startswith(("blk.0.", "blk.1."))}
+        self.assertEqual({name: data.shape for name, (_, data) in result.items()}, expected)
+        self.assertEqual((kv["block_count"], kv["nextn_predict_layers"]), (3, 1))
+
+    def test_causal_lm(self):
+        tensors, fp8_reference = self.checkpoint(vision=False)
+        result, kv = self.run_converter(BailingMoeV3Model, self.causal_config(), tensors)
+        self.assertEqual({name: data.shape for name, (_, data) in result.items()}, self.expected_shapes(range(3)))
+        self.assertEqual(kv.keys(), self.KEYS - {"rope.dimension_sections"})
+        np.testing.assert_array_equal(result["blk.2.nextn.eh_proj.weight"][1], fp8_reference["model.layers.2.eh_proj.weight"])
+
+    def test_mtp_flags(self):
+        import convert_hf_to_gguf
+        for flag in ("--no-mtp", "--no-nextn"):
+            with mock.patch.object(sys, "argv", ["convert_hf_to_gguf.py", flag, "model"]):
+                args = convert_hf_to_gguf.parse_args()
+            self.assertTrue(args.no_mtp)
+            self.assertFalse(args.mtp)
+        with mock.patch.object(sys, "argv", ["convert_hf_to_gguf.py", "--mtp", "model"]):
+            self.assertTrue(convert_hf_to_gguf.parse_args().mtp)
 
 
 if __name__ == "__main__":

@@ -4,5 +4,6 @@ set(LLAMA_CHAT_PARSERS_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/parsers.cpp
     ${CMAKE_CURRENT_LIST_DIR}/parsers.h
     ${CMAKE_CURRENT_LIST_DIR}/inkling.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/ling3.cpp
     ${CMAKE_CURRENT_LIST_DIR}/qwen3-coder.cpp
 )

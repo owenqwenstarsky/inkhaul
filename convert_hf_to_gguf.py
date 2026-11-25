@@ -116,6 +116,14 @@ def parse_args() -> argparse.Namespace:
         help="Export multimodal projector (mmproj) for vision models. This will only work on some vision models. An 'mmproj-' prefix will be added to the output file name.",
     )
     parser.add_argument(
+        "--mtp", action="store_true",
+        help="Export only the multi-token prediction (MTP) head as a separate GGUF, suitable for use as a speculative draft. An 'mtp-' prefix will be added to the output file name.",
+    )
+    parser.add_argument(
+        "--no-nextn", "--no-mtp", dest="no_mtp", action="store_true",
+        help="Exclude NextN speculative draft tensors from the converted GGUF. Pair with --mtp on a second run to publish target and draft as two files.",
+    )
+    parser.add_argument(
         "--fuse-gate-up-exps", action="store_true",
         help="Fuse gate_exps and up_exps tensors into a single gate_up_exps tensor for MoE models.",
     )
@@ -204,6 +212,19 @@ def main() -> None:
         except NotImplementedError:
             logger.error(f"Model {model_architecture} is not supported")
             sys.exit(1)
+
+        if args.mtp and args.no_mtp:
+            logger.error("--mtp and --no-nextn are mutually exclusive")
+            sys.exit(1)
+
+        if args.mtp or args.no_mtp:
+            if not model_class.supports_mtp_export:
+                logger.error("--mtp / --no-nextn are not supported for %s", model_architecture)
+                sys.exit(1)
+            if args.no_mtp:
+                model_class.no_mtp = True
+            if args.mtp:
+                model_class.mtp_only = True
 
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,

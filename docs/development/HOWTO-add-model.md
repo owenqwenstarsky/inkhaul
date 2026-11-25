@@ -2,7 +2,7 @@
 
 > [!NOTE]
 >
-> This fork keeps only the Inkling 2 architectures (`inkling2`, `inkling2_loop`), the Qwen 3.5 / 3.6 architectures (`qwen35`, `qwen35moe`), the DSpark draft model (`dflash`), the `clip` stub for mmproj files and the `inkling2v` and `qwen3vl_merger` vision encoders.
+> This fork keeps only the Inkling 2 architectures (`inkling2`, `inkling2_loop`), the Qwen 3.5 / 3.6 architectures (`qwen35`, `qwen35moe`), the Ling 3 architecture (`bailingmoe3`, text only, used by Ling-3.2-air), the DSpark draft model (`dflash`), the `clip` stub for mmproj files and the `inkling2v` and `qwen3vl_merger` vision encoders.
 > The steps below describe where an architecture lives in the code. Use the Inkling 2 files as the reference: `conversion/inkling2.py`, `src/models/inkling2.cpp`, `src/models/inkling2-loop.cpp` and `tools/mtmd/models/inkling2v.cpp`.
 
 Adding a model requires few steps:

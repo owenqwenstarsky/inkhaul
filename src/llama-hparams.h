@@ -57,6 +57,10 @@ struct llama_hparams {
     uint32_t n_embd_head_k_swa;
     uint32_t n_embd_head_v_swa;
 
+    // MLA: key/value head size before the absorption of wk_b/wv_b
+    uint32_t n_embd_head_k_mla_impl = 0;
+    uint32_t n_embd_head_v_mla_impl = 0;
+
     // different RoPE dimensions for full_attention and SWA layers
     uint32_t n_rot_full;
     uint32_t n_rot_swa;
@@ -77,7 +81,14 @@ struct llama_hparams {
     uint32_t n_group_used       = 0;
     uint32_t n_ff_shexp         = 0;
 
+    uint32_t n_layer_dense_lead = 0;
+    uint32_t n_lora_q           = 0;
+    uint32_t n_lora_kv          = 0;
+    uint32_t n_expert_shared    = 0;
+
     float    expert_weights_scale = 0.0f;
+    bool     expert_weights_norm  = false;
+    uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
     float    expert_weights_norm_eps = 0.0f; // > 0: weights / (sum + eps), else the sum is clamped
     bool     expert_router_f32    = false;   // compute the router logits in F32
 
@@ -128,7 +139,13 @@ struct llama_hparams {
     uint32_t ssm_n_group = 0;
 
     // for Kimi Linear KDA
-    uint32_t n_embd_head_kda = 0;
+    uint32_t n_embd_head_kda      = 0;
+    bool     kda_safe_gate        = false;
+    float    kda_gate_lower_bound = -INFINITY;
+
+    // SwiGLU clamp limits per layer, 0 = no clamp
+    std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_exp;   // routed experts
+    std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_shexp; // shared expert
 
     // kimi-k3
     uint32_t attn_res_block_size  = 0;      // 0 = no cross-layer attention residuals
@@ -249,6 +266,11 @@ struct llama_hparams {
     // dimension of value embeddings across all k-v heads
     uint32_t n_embd_v_gqa(uint32_t il = 0) const;
 
+    bool is_mla() const;
+
+    uint32_t n_embd_head_k_mla() const;
+    uint32_t n_embd_head_v_mla() const;
+
     // true if any layer has a different n_embd_v_gqa
     bool is_n_embd_v_gqa_variable() const;
 
@@ -271,7 +293,7 @@ struct llama_hparams {
 
     bool has_rope(uint32_t il) const;
 
-    // number of layers
+    // number of layers, without the NextN (MTP) layers
     uint32_t n_layer() const;
 
     // note that this function uses different SWA parameters from those in the hparams
