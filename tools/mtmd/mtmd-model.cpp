@@ -241,6 +241,37 @@ struct mtmd_model_loader {
                         hparams.set_limit_image_tokens(1, 4096);
                         hparams.set_warmup_n_tokens(32*32); // avoid OOM on warmup
                     } break;
+                case PROJECTOR_TYPE_QWEN3VL:
+                    {
+                        hparams.n_merge = 2;
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                        hparams.image_resize_pad  = PAD_NONE; // the HF processor resizes to the smart_resize size, no padding
+                        hparams.image_round_half_even = true; // smart_resize uses Python round()
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        if (hparams.n_merge != 2) {
+                            // the temporal merge input and the merger use a 2x2 patch grid
+                            throw std::runtime_error(mtmd_format("%s: spatial_merge_size (%d) must be 2\n", __func__, hparams.n_merge));
+                        }
+                        // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
+                        hparams.set_limit_image_tokens(8, 4096);
+                        // optional limits of the model, the custom values take precedence
+                        if (hparams.custom_image_min_tokens <= 0) {
+                            get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels, false);
+                        }
+                        if (hparams.custom_image_max_tokens <= 0) {
+                            get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, false);
+                        }
+                        if (hparams.image_min_pixels <= 0 || hparams.image_max_pixels <= 0) {
+                            throw std::runtime_error(mtmd_format("%s: image_min_pixels (%d) and image_max_pixels (%d) must be positive\n", __func__, hparams.image_min_pixels, hparams.image_max_pixels));
+                        }
+                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                        const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
+                        if (hparams.image_min_pixels < warn_min_pixels) {
+                            LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
+                            LOG_WRN("%s: if you encounter problems with accuracy, try adding --image-min-tokens 1024\n", __func__);
+                            LOG_WRN("%s: more info: https://github.com/ggml-org/llama.cpp/issues/16842\n\n", __func__);
+                        }
+                    } break;
                 default:
                     throw std::runtime_error(mtmd_format("%s: unknown vision projector type %s\n", __func__, proj_type.c_str()));
             }
@@ -376,6 +407,7 @@ struct mtmd_model_loader {
 
         model.patch_bias = get_tensor(TN_PATCH_BIAS, false);
         model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   has_patch_embd);
+        model.patch_embeddings_1 = get_tensor(TN_PATCH_EMBD_1, false);
 
         model.position_embeddings = get_tensor(mtmd_format(TN_POS_EMBD, prefix), false);
 
@@ -412,6 +444,17 @@ struct mtmd_model_loader {
             layer.ff_gate_b = get_tensor(mtmd_format(TN_FFN_GATE, prefix, il, "bias"),   false);
             layer.ff_down_w = get_tensor(mtmd_format(TN_FFN_DOWN, prefix, il, "weight"));
             layer.ff_down_b = get_tensor(mtmd_format(TN_FFN_DOWN, prefix, il, "bias"),   false);
+
+            // qwen3vl deepstack layer
+            layer.deepstack_norm_w = get_tensor(mtmd_format(TN_DEEPSTACK_NORM, il, "weight"), false);
+            layer.deepstack_norm_b = get_tensor(mtmd_format(TN_DEEPSTACK_NORM, il, "bias"), false);
+            layer.deepstack_fc1_w  = get_tensor(mtmd_format(TN_DEEPSTACK_FC1,  il, "weight"), false);
+            layer.deepstack_fc1_b  = get_tensor(mtmd_format(TN_DEEPSTACK_FC1,  il, "bias"), false);
+            layer.deepstack_fc2_w  = get_tensor(mtmd_format(TN_DEEPSTACK_FC2,  il, "weight"), false);
+            layer.deepstack_fc2_b  = get_tensor(mtmd_format(TN_DEEPSTACK_FC2,  il, "bias"), false);
+            if (layer.has_deepstack()) {
+                model.n_deepstack_layers++;
+            }
         }
 
         switch (model.proj_type) {
@@ -426,6 +469,27 @@ struct mtmd_model_loader {
                     model.mm_1_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 1, "bias"), false);
                     model.mm_2_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_2_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"), false);
+                } break;
+            case PROJECTOR_TYPE_QWEN3VL:
+                {
+                    // these come from the generic path above, where they are optional
+                    if (!model.patch_embeddings_1 || !model.patch_bias || !model.position_embeddings || model.class_embedding) {
+                        throw std::runtime_error(mtmd_format("%s: missing patch_embd.weight.1, patch_embd.bias or position_embd, or unexpected class_embd\n", __func__));
+                    }
+                    // the fused qkv is split at n_embd, the M-RoPE sections are d_head/4 each
+                    if (hparams.n_head <= 0 || hparams.n_embd % (hparams.n_head * 4) != 0 ||
+                            (hparams.n_embd_head != 0 && hparams.n_embd_head * hparams.n_head != hparams.n_embd)) {
+                        throw std::runtime_error(mtmd_format("%s: n_embd (%d) must be n_head (%d) x head_dim, with head_dim a multiple of 4\n", __func__, hparams.n_embd, hparams.n_head));
+                    }
+                    for (const auto & layer : model.layers) {
+                        if (!layer.qkv_w || !layer.qkv_b) {
+                            throw std::runtime_error(mtmd_format("%s: missing fused attn_qkv weight or bias\n", __func__));
+                        }
+                    }
+                    model.mm_0_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_1_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_1_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"));
                 } break;
             default:
                 GGML_ASSERT(false && "unknown projector type");
@@ -627,6 +691,8 @@ int mtmd_model::n_output_tokens_x(const mtmd_image_f32 * img) const {
     const int n_total = n_output_tokens(img);
     const auto & proj = proj_type;
     switch (proj) {
+        case PROJECTOR_TYPE_QWEN3VL:
+            return (img->nx() / params.patch_size) / 2;
         case PROJECTOR_TYPE_INKLING2V:
             return img->nx() / (params.patch_size * params.n_merge);
         default:
@@ -639,6 +705,8 @@ int mtmd_model::n_output_tokens_y(const mtmd_image_f32 * img) const {
     const auto & params = hparams;
     const auto & proj = proj_type;
     switch (proj) {
+        case PROJECTOR_TYPE_QWEN3VL:
+            return (img->ny() / params.patch_size) / 2;
         case PROJECTOR_TYPE_INKLING2V:
             return img->ny() / (params.patch_size * params.n_merge);
         default:
@@ -663,6 +731,13 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
                 int y_patch = img->ny() / (params.patch_size * params.n_merge);
                 n_patches = x_patch * y_patch;
             } break;
+        case PROJECTOR_TYPE_QWEN3VL:
+            {
+                // dynamic size (2 conv, so double patch size)
+                int x_patch = img->nx() / (params.patch_size * 2);
+                int y_patch = img->ny() / (params.patch_size * 2);
+                n_patches = x_patch * y_patch;
+            } break;
         default:
             GGML_ABORT("unsupported projector type");
     }
@@ -676,6 +751,9 @@ int mtmd_model::n_mmproj_embd() const {
     switch (proj_type) {
         case PROJECTOR_TYPE_INKLING2V:
             return mm_2_w->ne[1];
+        case PROJECTOR_TYPE_QWEN3VL:
+            // main path + deepstack paths
+            return mm_1_b->ne[0] * (1 + n_deepstack_layers);
         default:
             GGML_ABORT("Unknown projector type");
     }
@@ -686,6 +764,8 @@ int mtmd_model::n_mmproj_embd() const {
 // this logic should be refactored in near future to distinctly handle "merge frames" and "batching"
 int mtmd_model::n_temporal_merge() const {
     switch (proj_type) {
+        case PROJECTOR_TYPE_QWEN3VL:
+            return 2;
         default:
             return 1;
     }

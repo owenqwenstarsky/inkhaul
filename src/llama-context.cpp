@@ -81,8 +81,8 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
-    // only the delta-net models replayed the inputs of the last ubatch on rollback
-    cparams.rs_replay = false;
+    // delta-net rollback keeps one state and the inputs of the last ubatch; the gdn op replays the kept tokens before the new ones
+    cparams.rs_replay = cparams.n_rs_seq > 0 && (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE);
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;

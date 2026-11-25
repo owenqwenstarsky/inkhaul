@@ -114,6 +114,7 @@ class Keys:
         BLOCK_COUNT                       = "{arch}.block_count"
         FEED_FORWARD_LENGTH               = "{arch}.feed_forward_length"
         EXPERT_FEED_FORWARD_LENGTH        = "{arch}.expert_feed_forward_length"
+        EXPERT_SHARED_FEED_FORWARD_LENGTH = "{arch}.expert_shared_feed_forward_length"
         TENSOR_DATA_LAYOUT                = "{arch}.tensor_data_layout"
         EXPERT_COUNT                      = "{arch}.expert_count"
         EXPERT_USED_COUNT                 = "{arch}.expert_used_count"
@@ -327,6 +328,7 @@ class Keys:
         SPATIAL_MERGE_SIZE    = "clip.vision.spatial_merge_size"
         USE_GELU              = "clip.use_gelu"
         USE_SILU              = "clip.use_silu"
+        IS_DEEPSTACK_LAYERS   = "clip.vision.is_deepstack_layers"
         FEATURE_LAYERS        = "clip.vision.feature_layer" # Granite4 Vision
         IMAGE_GRID_PINPOINTS  = "clip.vision.image_grid_pinpoints" # Granite4 Vision
 
@@ -378,6 +380,8 @@ class MODEL_ARCH(IntEnum):
     DFLASH           = auto()
     INKLING2         = auto()
     INKLING2_LOOP    = auto()
+    QWEN35           = auto()
+    QWEN35MOE        = auto()
 
 
 class MODEL_TENSOR(IntEnum):
@@ -390,6 +394,7 @@ class MODEL_TENSOR(IntEnum):
     ATTN_Q               = auto()
     ATTN_K               = auto()
     ATTN_V               = auto()
+    ATTN_QKV             = auto()
     ATTN_OUT             = auto()
     ATTN_NORM            = auto()
     ATTN_POST_NORM       = auto()
@@ -410,6 +415,7 @@ class MODEL_TENSOR(IntEnum):
     ATTN_POST_CONV       = auto()
     ATTN_RES_QUERY       = auto()
     FFN_GATE_INP         = auto()
+    FFN_GATE_INP_SHEXP   = auto()
     FFN_NORM             = auto()
     FFN_POST_NORM        = auto()
     FFN_GATE             = auto()
@@ -419,6 +425,9 @@ class MODEL_TENSOR(IntEnum):
     FFN_DOWN_EXP         = auto()
     FFN_UP_EXP           = auto()
     FFN_GATE_UP_EXP      = auto()
+    FFN_GATE_SHEXP       = auto()
+    FFN_DOWN_SHEXP       = auto()
+    FFN_UP_SHEXP         = auto()
     FFN_EXP_PROBS_B      = auto()
     FFN_POST_CONV        = auto()
     FFN_RES_QUERY        = auto()
@@ -439,6 +448,15 @@ class MODEL_TENSOR(IntEnum):
     ATTN_K_NORM          = auto()
     LAYER_OUT_SCALE      = auto()
     ENC_OUTPUT_NORM      = auto()
+    SSM_CONV1D           = auto()
+    SSM_DT               = auto()
+    SSM_A                = auto()
+    SSM_NORM             = auto()
+    SSM_OUT              = auto()
+    SSM_ALPHA            = auto() # qwen3.5
+    SSM_BETA             = auto() # qwen3.5
+    ATTN_QKV_GATE        = auto() # qwen35, [attn_qkv | attn_gate]
+    SSM_BETA_ALPHA_CAT   = auto() # qwen35, [ssm_beta | ssm_alpha]
     # vision
     V_MMPROJ             = auto()
     V_ENC_EMBD_CLS       = auto()
@@ -451,6 +469,7 @@ class MODEL_TENSOR(IntEnum):
     V_ENC_ATTN_K         = auto()
     V_ENC_ATTN_K_NORM    = auto()
     V_ENC_ATTN_V         = auto()
+    V_ENC_ATTN_QKV       = auto()
     V_ENC_ATTN_O         = auto()
     V_ENC_POST_ATTN_NORM = auto()
     V_ENC_FFN_UP         = auto()
@@ -495,6 +514,8 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DFLASH:           "dflash",
     MODEL_ARCH.INKLING2:         "inkling2",
     MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
+    MODEL_ARCH.QWEN35:           "qwen35",
+    MODEL_ARCH.QWEN35MOE:        "qwen35moe",
 }
 
 
@@ -509,6 +530,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_Q:                    "blk.{bid}.attn_q",
     MODEL_TENSOR.ATTN_K:                    "blk.{bid}.attn_k",
     MODEL_TENSOR.ATTN_V:                    "blk.{bid}.attn_v",
+    MODEL_TENSOR.ATTN_QKV:                  "blk.{bid}.attn_qkv",
     MODEL_TENSOR.ATTN_OUT:                  "blk.{bid}.attn_output",
     MODEL_TENSOR.ATTN_SINKS:                "blk.{bid}.attn_sinks",
     MODEL_TENSOR.ATTN_GATE:                 "blk.{bid}.attn_gate",
@@ -530,6 +552,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_K_NORM:               "blk.{bid}.attn_k_norm",
     MODEL_TENSOR.ATTN_POST_NORM:            "blk.{bid}.post_attention_norm",
     MODEL_TENSOR.FFN_GATE_INP:              "blk.{bid}.ffn_gate_inp",
+    MODEL_TENSOR.FFN_GATE_INP_SHEXP:        "blk.{bid}.ffn_gate_inp_shexp",
     MODEL_TENSOR.FFN_NORM:                  "blk.{bid}.ffn_norm",
     MODEL_TENSOR.FFN_POST_NORM:             "blk.{bid}.post_ffw_norm",
     MODEL_TENSOR.FFN_GATE:                  "blk.{bid}.ffn_gate",
@@ -539,6 +562,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_DOWN_EXP:              "blk.{bid}.ffn_down_exps",
     MODEL_TENSOR.FFN_UP_EXP:                "blk.{bid}.ffn_up_exps",
     MODEL_TENSOR.FFN_GATE_UP_EXP:           "blk.{bid}.ffn_gate_up_exps",
+    MODEL_TENSOR.FFN_GATE_SHEXP:            "blk.{bid}.ffn_gate_shexp",
+    MODEL_TENSOR.FFN_DOWN_SHEXP:            "blk.{bid}.ffn_down_shexp",
+    MODEL_TENSOR.FFN_UP_SHEXP:              "blk.{bid}.ffn_up_shexp",
     MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
     MODEL_TENSOR.FFN_POST_CONV:             "blk.{bid}.ffn_post_conv",
     MODEL_TENSOR.FFN_RES_QUERY:             "blk.{bid}.ffn_res_query",
@@ -557,6 +583,15 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.LOOP_FFN_CTRL_FORGET:      "blk.{bid}.loop_ffn_ctrl_forget",
     MODEL_TENSOR.LAYER_OUT_SCALE:           "blk.{bid}.layer_output_scale",
     MODEL_TENSOR.ENC_OUTPUT_NORM:           "enc.output_norm",
+    MODEL_TENSOR.SSM_CONV1D:                "blk.{bid}.ssm_conv1d",
+    MODEL_TENSOR.SSM_DT:                    "blk.{bid}.ssm_dt",
+    MODEL_TENSOR.SSM_A:                     "blk.{bid}.ssm_a",
+    MODEL_TENSOR.SSM_NORM:                  "blk.{bid}.ssm_norm",
+    MODEL_TENSOR.SSM_OUT:                   "blk.{bid}.ssm_out",
+    MODEL_TENSOR.SSM_ALPHA:                 "blk.{bid}.ssm_alpha",
+    MODEL_TENSOR.SSM_BETA:                  "blk.{bid}.ssm_beta",
+    MODEL_TENSOR.ATTN_QKV_GATE:             "blk.{bid}.attn_qkv_gate",
+    MODEL_TENSOR.SSM_BETA_ALPHA_CAT:        "blk.{bid}.ssm_beta_alpha",
     # vision
     MODEL_TENSOR.V_MMPROJ:                  "mm.{bid}",
     MODEL_TENSOR.V_ENC_EMBD_CLS:            "v.class_embd",
@@ -568,6 +603,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_ENC_ATTN_K:              "v.blk.{bid}.attn_k",
     MODEL_TENSOR.V_ENC_ATTN_K_NORM:         "v.blk.{bid}.attn_k_norm",
     MODEL_TENSOR.V_ENC_ATTN_V:              "v.blk.{bid}.attn_v",
+    MODEL_TENSOR.V_ENC_ATTN_QKV:            "v.blk.{bid}.attn_qkv",
     MODEL_TENSOR.V_ENC_INPUT_NORM:          "v.blk.{bid}.ln1",
     MODEL_TENSOR.V_ENC_ATTN_O:              "v.blk.{bid}.attn_out",
     MODEL_TENSOR.V_ENC_POST_ATTN_NORM:      "v.blk.{bid}.ln2",
@@ -621,6 +657,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_ENC_ATTN_K,
         MODEL_TENSOR.V_ENC_ATTN_K_NORM,
         MODEL_TENSOR.V_ENC_ATTN_V,
+        MODEL_TENSOR.V_ENC_ATTN_QKV,
         MODEL_TENSOR.V_ENC_ATTN_O,
         MODEL_TENSOR.V_ENC_POST_ATTN_NORM,
         MODEL_TENSOR.V_ENC_FFN_UP,
@@ -765,6 +802,64 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.LOOP_FFN_CTRL_DOWN,
         MODEL_TENSOR.LOOP_FFN_CTRL_GAIN,
         MODEL_TENSOR.LOOP_FFN_CTRL_FORGET,
+    ],
+    MODEL_ARCH.QWEN35: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.ATTN_QKV_GATE,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_ALPHA,
+        MODEL_TENSOR.SSM_BETA_ALPHA_CAT,
+        MODEL_TENSOR.SSM_OUT,
+    ],
+    MODEL_ARCH.QWEN35MOE: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_ALPHA,
+        MODEL_TENSOR.SSM_OUT,
     ],
 }
 
@@ -941,6 +1036,7 @@ class GGUFValueType(IntEnum):
 
 class VisionProjectorType:
     INKLING2V      = "inkling2v"
+    QWEN3VL        = "qwen3vl_merger"
 
 
 # Items here are (block size, type size)

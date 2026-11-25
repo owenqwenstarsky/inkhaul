@@ -511,6 +511,30 @@ private:
 };
 
 //
+// mtmd_image_preprocessor_dyn_size
+//
+
+mtmd_image_size mtmd_image_preprocessor_dyn_size::get_target_size(const mtmd_hparams & hparams, const mtmd_image_size & original_size) {
+    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
+    img_tool::calc_size_opt opts;
+    opts.align_size      = hparams.patch_size * hparams.n_merge;
+    opts.min_pixels      = hparams.image_min_pixels;
+    opts.max_pixels      = hparams.image_max_pixels;
+    opts.round_half_even = hparams.image_round_half_even;
+    return img_tool::calc_size_preserved_ratio(original_size, opts);
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const mtmd_image_u8 & img) const {
+    mtmd_image_u8 resized_image;
+    img_tool::resize(img, resized_image, get_target_size(hparams, img.get_size()),
+                        hparams.image_resize_algo,
+                        hparams.image_resize_pad);
+    mtmd_image_preproc_out output;
+    output.append(hparams, resized_image, true);
+    return output;
+}
+
+//
 // mtmd_image_preprocessor_inkling2v
 //
 

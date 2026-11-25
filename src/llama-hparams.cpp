@@ -230,5 +230,5 @@ bool llama_hparams::has_rope(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_layer() const {
-    return n_layer_all;
+    return n_layer_all - n_layer_nextn;
 }

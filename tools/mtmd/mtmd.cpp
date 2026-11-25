@@ -895,6 +895,13 @@ struct mtmd_context {
                     img_beg = "<|content_image|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_inkling2v>(models.v.get());
                 } break;
+            case PROJECTOR_TYPE_QWEN3VL:
+                {
+                    // <|vision_start|> ... (image embeddings) ... <|vision_end|>
+                    img_beg = "<|vision_start|>";
+                    img_end = "<|vision_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(models.v.get());
+                } break;
             default:
                 throw std::runtime_error(mtmd_format("%s: unexpected vision projector type %d\n", __func__, proj));
         }

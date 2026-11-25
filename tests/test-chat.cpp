@@ -2212,6 +2212,605 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         "const": "42"
     })";
 
+    // Special tokens of the templates that use the Qwen3-Coder format.
+    // Check that the vocab of a model defines them before reuse. A model can share the syntax without the tokens.
+    const std::vector<std::string> qwen3_coder_specials = {
+        "<|im_start|>", "<|im_end|>", "<think>", "</think>",
+        "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
+    };
+
+    {
+        // Qwen3.5 (basically same as Nemotron, but keeping separate tests just in case)
+        auto tst = peg_tester("models/templates/Qwen3.5-4B.jinja", detailed_debug);
+        tst.specials(qwen3_coder_specials);
+
+        tst.test("I'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test("I'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .expect_content("<think>\nI'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .expect_rules({ "tool-0", "tool-0-arg-0" })
+            .run();
+
+        tst.test(
+               "I'm\nthinking\n</think>\n\n"
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n"
+               "<tool_call>\n"
+               "<function=special_function_with_opt>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "<parameter=arg2>\n2\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "def hello():\n"
+               "    print(\"Hello, world!\")\n"
+               "\n"
+               "hello()\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({
+                python_tool
+        })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}", {} },
+            })
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=edit>\n"
+               "<parameter=filename>\n"
+               "foo.c\n"
+               "</parameter>\n"
+               "<parameter=oldString>\n"
+               "#iclunde\n"
+               "</parameter>\n"
+               "<parameter=newString>\n"
+               "#include\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({
+                edit_tool
+        })
+            .expect_tool_calls({
+                { "edit", "{\"filename\": \"foo.c\", \"oldString\": \"#iclunde\", \"newString\": \"#include\"}", {} },
+            })
+            .run();
+
+        // a parameter value that itself ends in a newline (e.g. a source file with a
+        // trailing newline). The structural delimiter is "\n</parameter>\n", so the value
+        // "#include\n" renders as "...#include\n\n</parameter>\n". The trailing newline must
+        // be preserved faithfully (no stripping), and the generated grammar must admit a
+        // value ending on a delimiter prefix. Regression test for gbnf_excluding_pattern.
+        tst.test(
+               "<tool_call>\n"
+               "<function=edit>\n"
+               "<parameter=filename>\n"
+               "foo.c\n"
+               "</parameter>\n"
+               "<parameter=oldString>\n"
+               "#iclunde\n"
+               "</parameter>\n"
+               "<parameter=newString>\n"
+               "#include\n"
+               "\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({
+                edit_tool
+        })
+            .expect_tool_calls({
+                { "edit", "{\"filename\": \"foo.c\", \"oldString\": \"#iclunde\", \"newString\": \"#include\\n\"}", {} },
+            })
+            .run();
+
+
+        // test code that starts with indent
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "    print(\"Hello, world!\")\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({
+                python_tool
+        })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"    print(\\\"Hello, world!\\\")\"}", {} },
+            })
+            .run();
+
+        tst.test(
+               "I need to output the invoice details in JSON\n"
+               "</think>\n\n"
+               R"({"amount": 123.45, "date": "2025-12-03"})")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .json_schema(invoice_schema)
+            .expect_reasoning("I need to output the invoice details in JSON")
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+
+        tst.test(
+               "I need to output the invoice details in JSON\n"
+               "</think>\n\n"
+               R"({"amount": 123.45, "date": "2025-12-03"})")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ get_time_tool })
+            .json_schema(invoice_schema)
+            .expect_reasoning("I need to output the invoice details in JSON")
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+
+        // a tool call ends the prefilled thinking block, with or without a closing </think>
+        tst.test(
+               "<tool_call>\n"
+               "<function=run_in_terminal>\n"
+               "<parameter=command>\n"
+               "pwd\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ run_in_terminal_tool })
+            .expect_tool_calls({
+                { "run_in_terminal", R"({"command": "pwd"})", {} },
+            })
+            .run();
+
+        // ...including after the model has thought about it
+        tst.test(
+               "Need to inspect the current directory.\n"
+               "<tool_call>\n"
+               "<function=run_in_terminal>\n"
+               "<parameter=command>\n"
+               "pwd\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ run_in_terminal_tool })
+            .expect_reasoning("Need to inspect the current directory.")
+            .expect_tool_calls({
+                { "run_in_terminal", R"({"command": "pwd"})", {} },
+            })
+            .run();
+
+        // No args tool
+        tst.test(
+               "<tool_call>\n"
+               "<function=empty_args>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ empty_args_tool })
+            .expect(message_with_tool_calls("empty_args", "{}"))
+            .run();
+
+        // No args tool with no properties defined
+        tst.test(
+               "<tool_call>\n"
+               "<function=empty_args_no_props>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ empty_args_tool_no_properties })
+            .expect(message_with_tool_calls("empty_args_no_props", "{}"))
+            .run();
+
+        // Edge cases when reasoning traces are not sent
+        tst.test(
+               "<think>\n\n</think>\n\n"
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({
+                special_function_tool
+        })
+            .expect_reasoning("<think>\n\n")
+            .expect_tool_calls({ { "special_function", "{\"arg1\": 1}", "" } })
+            .run();
+
+        tst.test(
+               "</think>\n\n"
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({
+                special_function_tool
+        })
+            .expect_reasoning("")
+            .expect_tool_calls({ { "special_function", "{\"arg1\": 1}", "" } })
+            .run();
+
+        tst.test(
+               "</think>\n\n"
+               "<tool_call>\n"
+               "<function=run_in_terminal>\n"
+               "<parameter=command>\n"
+               "pwd\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({
+                run_in_terminal_tool
+        })
+            .expect_tool_calls({
+                { "run_in_terminal", R"({"command": "pwd"})", {} },
+            })
+            .run();
+
+        tst.test(
+               "</think>\n\n"
+               "Let me inspect the current directory.\n"
+               "<tool_call>\n"
+               "<function=run_in_terminal>\n"
+               "<parameter=command>\n"
+               "pwd\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({
+                run_in_terminal_tool
+        })
+            .expect_content("Let me inspect the current directory.")
+            .expect_tool_calls({
+                { "run_in_terminal", R"({"command": "pwd"})", {} },
+            })
+            .run();
+
+        tst.test(
+               "</think>\n\n"
+               "Let me inspect the current directory.\n"
+               "<tool_call>\n"
+               "<function=run_in_terminal>\n"
+               "<parameter=command>\n"
+               "pwd\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({
+                run_in_terminal_tool
+        })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect_content("Let me inspect the current directory.")
+            .expect_tool_calls({
+                { "run_in_terminal", R"({"command": "pwd"})", {} },
+            })
+            .run();
+
+        tst.test(
+               "I should inspect the directory.\n"
+               "</think>\n\n"
+               "Let me inspect it now.\n"
+               "<tool_call>\n"
+               "<function=run_in_terminal>\n"
+               "<parameter=command>\n"
+               "pwd\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({
+                run_in_terminal_tool
+        })
+            .expect_reasoning("I should inspect the directory.")
+            .expect_content("Let me inspect it now.\n")
+            .expect_tool_calls({
+                { "run_in_terminal", R"({"command": "pwd"})", {} },
+            })
+            .run();
+
+        // Continuation tests
+        tst.test("world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(" thinking\n</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        {
+            common_chat_msg user_start;
+            user_start.role    = "user";
+            user_start.content = "Create a todo list, then inspect the repository.";
+
+            common_chat_msg assistant_todos =
+                simple_assist_msg("", "", "manage_todo_list",
+                                  R"({"todos":[{"item":"Inspect repository","selected":false}]})", "call_todos");
+
+            common_chat_msg tool_result;
+            tool_result.role         = "tool";
+            tool_result.content      = "Successfully wrote todo list";
+            tool_result.tool_call_id = "call_todos";
+
+            common_chat_msg user_continue;
+            user_continue.role    = "user";
+            user_continue.content = "Proceed.";
+
+            tst.test(
+                   "I need to run a terminal command.\n"
+                   "</think>\n\n"
+                   "<tool_call>\n"
+                   "<function=run_in_terminal>\n"
+                   "<parameter=command>\n"
+                   "pwd\n"
+                   "</parameter>\n"
+                   "</function>\n"
+                   "</tool_call>")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .enable_thinking(true)
+                .tools({
+                    manage_todo_list_tool, run_in_terminal_tool
+            })
+                .messages({ user_start, assistant_todos, tool_result, user_continue })
+                .expect_reasoning("I need to run a terminal command.")
+                .expect_tool_calls({
+                    { "run_in_terminal", R"({"command": "pwd"})", {} },
+                })
+                .run();
+
+            tst.test(
+                   "I need to run a terminal command.\n"
+                   "</think>\n\n"
+                   "Let me inspect the current directory.\n"
+                   "<tool_call>\n"
+                   "<function=run_in_terminal>\n"
+                   "<parameter=command>\n"
+                   "pwd\n"
+                   "</parameter>\n"
+                   "</function>\n"
+                   "</tool_call>")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .enable_thinking(true)
+                .tools({
+                    manage_todo_list_tool, run_in_terminal_tool
+            })
+                .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+                .messages({ user_start, assistant_todos, tool_result, user_continue })
+                .expect_reasoning("I need to run a terminal command.")
+                .expect_content("Let me inspect the current directory.")
+                .expect_tool_calls({
+                    { "run_in_terminal", R"({"command": "pwd"})", {} },
+                })
+                .run();
+
+            tst.test(
+                   "</think>\n\n"
+                   "<tool_call>\n"
+                   "<function=run_in_terminal>\n"
+                   "<parameter=command>\n"
+                   "pwd\n"
+                   "</parameter>\n"
+                   "</function>\n"
+                   "</tool_call>")
+                .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+                .enable_thinking(true)
+                .tools({
+                    manage_todo_list_tool, run_in_terminal_tool
+            })
+                .messages({ user_start, assistant_todos, tool_result, user_continue })
+                .expect_tool_calls({
+                    { "run_in_terminal", R"({"command": "pwd"})", {} },
+                })
+                .run();
+        }
+    }
+
+    {
+        // NVIDIA Nemotron-3 Nano
+        auto tst = peg_tester("models/templates/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.jinja", detailed_debug);
+        tst.specials(qwen3_coder_specials);
+
+        tst.test("Hello, world!\nWhat's up?").
+            enable_thinking(false).
+            reasoning_format(COMMON_REASONING_FORMAT_AUTO).
+            expect(message_assist).run();
+
+        tst.test("I'm\nthinking\n</think>\nHello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .expect_content("<think>\nI'm\nthinking\n</think>\nHello, world!\nWhat's up?")
+            .run();
+
+        tst.test("I'm\nthinking\n</think>\nHello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        tst.test(
+               "I'm\nthinking\n</think>\n"
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n"
+               "<tool_call>\n"
+               "<function=special_function_with_opt>\n"
+               "<parameter=arg1>\n1\n</parameter>\n"
+               "<parameter=arg2>\n2\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "def hello():\n"
+               "    print(\"Hello, world!\")\n"
+               "\n"
+               "hello()\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({
+                python_tool
+        })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}", {} },
+            })
+            .run();
+
+        tst.test(
+               "I need to output the invoice details in JSON\n"
+               "</think>\n"
+               R"({"amount": 123.45, "date": "2025-12-03"})")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .json_schema(invoice_schema)
+            .expect_reasoning("I need to output the invoice details in JSON")
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+
+        // Continuation tests
+        tst.test("world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(" thinking\n</think>\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+    }
+
     {
         // CohereForAI Command-R 7B (2024-tool_use)
         auto tst = peg_tester("models/templates/CohereForAI-c4ai-command-r7b-12-2024-tool_use.jinja", detailed_debug);
@@ -2532,6 +3131,391 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .add_generation_prompt(false)
             .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
             .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+    }
+
+    {
+        // Qwen3-Coder (tool calling with XML-style format)
+        auto tst = peg_tester("models/templates/Qwen3-Coder.jinja", detailed_debug);
+        tst.specials(qwen3_coder_specials);
+
+        tst.test("Hello, world!\nWhat's up?").expect(message_assist).expect_reconstruction().run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .expect_reconstruction()
+            .run();
+
+        // Some models skip the opening <tool_call> and go straight to <function=>
+        tst.test(
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // Required tool choice constrains from the first token instead of gating on a trigger
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(message_assist_call)
+            .run();
+
+        tst.test(
+               "Let me call it.\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ special_function_tool })
+            .expect_content("Let me call it.\n")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+            })
+            .run();
+
+        // Only the first call may omit it, the rest keep the </tool_call>\n<tool_call> separator
+        tst.test(
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n"
+               "<tool_call>\n"
+               "<function=special_function_with_opt>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "<parameter=arg2>\n"
+               "2\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .expect_rules({ "tool-0", "tool-0-arg-0", "tool-1", "tool-1-arg-0", "tool-1-arg-1" })
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>\n"
+               "<tool_call>\n"
+               "<function=special_function_with_opt>\n"
+               "<parameter=arg1>\n"
+               "1\n"
+               "</parameter>\n"
+               "<parameter=arg2>\n"
+               "2\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Test with code content (multiline)
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "def hello():\n"
+               "    print(\"Hello, world!\")\n"
+               "\n"
+               "hello()\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({
+                python_tool
+        })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"def hello():\\n    print(\\\"Hello, world!\\\")\\n\\nhello()\"}", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Test with code content (asian unicode chars)
+        tst.test(
+               "<tool_call>\n"
+               "<function=python>\n"
+               "<parameter=code>\n"
+               "格\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({
+                python_tool
+        })
+            .expect_tool_calls({
+                { "python", "{\"code\": \"格\"}", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Test with HTML tag content
+        tst.test(
+               "<tool_call>\n"
+               "<function=html>\n"
+               "<parameter=markup>\n"
+               "<html>\n"
+               " <head>\n"
+               "  <title>Hello!</title>\n"
+               " </head>\n"
+               "</html>\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({
+                html_tool
+        })
+            .expect_tool_calls({
+                { "html", "{\"markup\": \"<html>\\n <head>\\n  <title>Hello!</title>\\n </head>\\n</html>\"}", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Test with TODO list (array of objects)
+        tst.test(
+               "<tool_call>\n"
+               "<function=todo_list>\n"
+               "<parameter=todos>\n"
+               "[{\"item\": \"Check stuff\", \"selected\": false}, {\"item\": \"Prepare stuff\", \"selected\": true}]\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({
+                todo_list
+        })
+            .expect_tool_calls({
+                { "todo_list", "{\"todos\": [{\"item\": \"Check stuff\", \"selected\": false}, {\"item\": \"Prepare stuff\", \"selected\": true}]}", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Test flexible required argument ordering (required args still come first, in any order)
+        tst.test(
+               "<tool_call>\n"
+               "<function=edit>\n"
+               "<parameter=newString>\n#include\n</parameter>\n"
+               "<parameter=filename>\nfoo.c\n</parameter>\n"
+               "<parameter=oldString>\n#iclunde\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ edit_tool })
+            .expect_tool_calls({
+                { "edit", R"({"newString": "#include", "filename": "foo.c", "oldString": "#iclunde"})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=tool_2req_4opt>\n"
+               "<parameter=req2>\n42\n</parameter>\n"
+               "<parameter=req1>\nhello\n</parameter>\n"
+               "<parameter=opt2>\n200\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ tool_2req_4opt })
+            .expect_tool_calls({
+                { "tool_2req_4opt", R"({"req2": 42, "req1": "hello", "opt2": 200})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Test flexible optional argument ordering (2 required + 4 optional, reversed optional order)
+        tst.test(
+               "<tool_call>\n"
+               "<function=tool_2req_4opt>\n"
+               "<parameter=req1>\nhello\n</parameter>\n"
+               "<parameter=req2>\n42\n</parameter>\n"
+               "<parameter=opt4>\n100\n</parameter>\n"
+               "<parameter=opt2>\n200\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ tool_2req_4opt })
+            .expect_tool_calls({
+                { "tool_2req_4opt", R"({"req1": "hello", "req2": 42, "opt4": 100, "opt2": 200})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Test flexible optional argument ordering (2 required + 5 optional, reversed optional order)
+        tst.test(
+               "<tool_call>\n"
+               "<function=tool_2req_5opt>\n"
+               "<parameter=req1>\nworld\n</parameter>\n"
+               "<parameter=req2>\n7\n</parameter>\n"
+               "<parameter=opt5>\nlast\n</parameter>\n"
+               "<parameter=opt3>\nmiddle\n</parameter>\n"
+               "<parameter=opt1>\nfirst\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ tool_2req_5opt })
+            .expect_tool_calls({
+                { "tool_2req_5opt", R"({"req1": "world", "req2": 7, "opt5": "last", "opt3": "middle", "opt1": "first"})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Test flexible optional argument ordering (2 required + 5 optional, all 5 in shuffled order)
+        tst.test(
+               "<tool_call>\n"
+               "<function=tool_2req_5opt>\n"
+               "<parameter=req1>\ntest\n</parameter>\n"
+               "<parameter=req2>\n99\n</parameter>\n"
+               "<parameter=opt3>\nc\n</parameter>\n"
+               "<parameter=opt1>\na\n</parameter>\n"
+               "<parameter=opt5>\ne\n</parameter>\n"
+               "<parameter=opt4>\n4\n</parameter>\n"
+               "<parameter=opt2>\n2\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ tool_2req_5opt })
+            .expect_tool_calls({
+                { "tool_2req_5opt", R"({"req1": "test", "req2": 99, "opt3": "c", "opt1": "a", "opt5": "e", "opt4": 4, "opt2": 2})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // nullable string type ["string", "null"]
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_nullable_str>\n"
+               "<parameter=name>\nhello world\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ nullable_string_tool })
+            .expect_tool_calls({
+                { "set_nullable_str", R"({"name": "hello world"})", {} },
+            })
+            .run();
+
+        // nullable string with null first in type array ["null", "string"]
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_nullable_str_nf>\n"
+               "<parameter=name>\nhello world\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ nullable_string_null_first_tool })
+            .expect_tool_calls({
+                { "set_nullable_str_nf", R"({"name": "hello world"})", {} },
+            })
+            .run();
+
+        // nullable integer type ["integer", "null"] - should use JSON value path, not string
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_nullable_int>\n"
+               "<parameter=count>\n42\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ nullable_int_tool })
+            .expect_tool_calls({
+                { "set_nullable_int", R"({"count": 42})", {} },
+            })
+            .run();
+
+        // nullable string given null - parses as JSON null, not the string "null"
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_nullable_str>\n"
+               "<parameter=name>\nnull\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ nullable_string_tool })
+            .expect_tool_calls({
+                { "set_nullable_str", R"({"name": null})", {} },
+            })
+            .run();
+
+        // unions with string - JSON values of the other types are typed, everything else is a string
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_union>\n"
+               "<parameter=value>\n{\"a\": 1}\n</parameter>\n"
+               "<parameter=amount>\n2 dollars\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ string_union_tool })
+            .expect_tool_calls({
+                { "set_union", R"({"value": {"a": 1}, "amount": "2 dollars"})", {} },
+            })
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_union>\n"
+               "<parameter=value>\n{not valid json\n</parameter>\n"
+               "<parameter=amount>\n42\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ string_union_tool })
+            .expect_tool_calls({
+                { "set_union", R"({"value": "{not valid json", "amount": 42})", {} },
+            })
+            .run();
+
+        // enum without explicit type key - should infer string from enum values
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_unit>\n"
+               "<parameter=unit>\ncelsius\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ enum_no_type_tool })
+            .expect_tool_calls({
+                { "set_unit", R"({"unit": "celsius"})", {} },
+            })
+            .run();
+
+        // Continuation tests
+        tst.test("world!\nWhat's up?")
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
             .expect_content("Hello, world!\nWhat's up?")
             .run();
     }
@@ -3684,6 +4668,217 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    {
+        auto tst = peg_tester("models/templates/StepFun3.5-Flash.jinja", detailed_debug);
+        tst.specials(qwen3_coder_specials);
+
+        tst.test("I was thinking\n</think>\nNow I'm not.").
+            enable_thinking(true).
+            reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK).
+            expect_reasoning("I was thinking").
+            expect_content("Now I'm not.")
+        .run();
+
+        // Test that numeric-looking string values are coerced to strings per the schema
+        tst.test(
+               "Let me call the magic tool\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=magic>\n"
+               "<parameter=name>\nfooBar\n</parameter>\n"
+               "<parameter=ref>\n5123123\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ magic_tool })
+            .expect_reasoning("Let me call the magic tool")
+            .expect_tool_calls({
+                { "magic", R"({"name": "fooBar", "ref": "5123123"})", {} },
+            })
+            .run();
+
+        // Test that numeric values are correctly interpreted as numbers when schema calls for number
+        tst.test(
+               "Let me call the special function\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=special_function>\n"
+               "<parameter=arg1>\n42555916\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect_reasoning("Let me call the special function")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 42555916})", {} },
+            })
+            .run();
+
+        tst.test(
+               "Let me call the special function with opt\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=special_function_with_opt>\n"
+               "<parameter=arg1>\n42555916\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool_with_optional_param })
+            .expect_reasoning("Let me call the special function with opt")
+            .expect_tool_calls({
+                { "special_function_with_opt", R"({"arg1": 42555916})", {} },
+            })
+            .run();
+
+        tst.test(
+               "Let me call the magic_int function\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=magic_int>\n"
+               "<parameter=ref>\n42555916\n</parameter>\n"
+               "<parameter=name>\nbaz\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ magic_int_tool })
+            .expect_reasoning("Let me call the magic_int function")
+            .expect_tool_calls({
+                { "magic_int", R"({"ref": 42555916, "name": "baz"})", {} },
+            })
+            .run();
+
+        tst.test(
+               "Call string_param with empty text\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=string_param>\n"
+               "<parameter=text>\n\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ string_param_tool })
+            .expect_reasoning("Call string_param with empty text")
+            .expect_tool_calls({
+                { "string_param", R"({"text": ""})", {} },
+            })
+            .run();
+
+        tst.test(
+               "Test simple quoted unquoted\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=quoted_unquoted>\n"
+               "<parameter=quoted>\n\"foo\"\n</parameter>\n"
+               "<parameter=unquoted>\nfoo\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ quoted_unquoted_tool })
+            .expect_reasoning("Test simple quoted unquoted")
+            .expect_tool_calls({
+                { "quoted_unquoted", R"({"quoted": "\"foo\"", "unquoted": "foo"})", {} },
+            })
+            .run();
+
+        tst.test(
+               "Test complex quoted unquoted\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=quoted_unquoted>\n"
+               "<parameter=quoted>\n\"printf(\\\"foo\\\");\"\n</parameter>\n"
+               "<parameter=unquoted>\nprintf(\"foo\");\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ quoted_unquoted_tool })
+            .expect_reasoning("Test complex quoted unquoted")
+            .expect_tool_calls({
+                { "quoted_unquoted", R"({ "quoted" : "\"printf(\\\"foo\\\");\"", "unquoted": "printf(\"foo\");" })", {} }
+            })
+            .run();
+
+            tst.test(
+               "Test negative number\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=magic_int>\n"
+               "<parameter=ref>\n-14\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ magic_int_tool })
+            .expect_reasoning("Test negative number")
+            .expect_tool_calls({
+                { "magic_int", R"({ "ref" : -14 })", {} }
+            })
+            .run();
+
+            tst.test(
+               "Test decimal number\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=amount>\n"
+               "<parameter=orig>\n3.14\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ amount_tool })
+            .expect_reasoning("Test decimal number")
+            .expect_tool_calls({
+                { "amount", R"({ "orig" : 3.14 })", {} }
+            })
+            .run();
+
+            tst.test(
+               "Test imaginary number\n"
+               "</think>\n"
+               "<tool_call>\n"
+               "<function=imaginary_number>\n"
+               "<parameter=number>\n"
+               "{ \"real\": 3.14, \"imaginary\": 2.71 }\n"
+               "</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ imaginary_number_tool })
+            .expect_reasoning("Test imaginary number")
+            .expect_tool_calls({
+                { "imaginary_number", R"({ "number" : {"real":3.14,"imaginary":2.71 } })", {} }
+            })
+            .run();
+
+        // Continuation tests
+        tst.test("world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(" thinking\n</think>\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+    }
+
     // GigaChat V3.1
     {
         auto tst = peg_tester("models/templates/GigaChat3.1-10B-A1.8B.jinja", detailed_debug);
@@ -3804,6 +4999,13 @@ static void test_template_generation_prompt() {
         assert_equals(expected_generation_prompt, params.generation_prompt);
         assert_ends_with(params.prompt.str(), expected_generation_prompt);
     };
+
+    {
+        auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+        check(tmpls, basic(),                  "<|im_start|>assistant\n<think>\n");
+        check(tmpls, continuation_content(),   "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello, ");
+        check(tmpls, continuation_reasoning(), "<|im_start|>assistant\n<think>\nI'm");
+    }
 
     {
         auto tmpls = read_templates("models/templates/Reka-Edge.jinja");

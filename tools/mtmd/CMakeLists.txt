@@ -39,6 +39,7 @@ add_library(mtmd
             ${MTMD_CORE_SOURCES}
             models/models.h
             models/inkling2v.cpp
+            models/qwen3vl.cpp
             )
 
 set_target_properties(mtmd PROPERTIES

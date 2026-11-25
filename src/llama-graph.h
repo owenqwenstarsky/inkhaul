@@ -29,6 +29,7 @@ struct llama_memory_context_i;
 class llama_kv_cache_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
+class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
 // certain models (typically multi-modal) can produce different types of graphs
@@ -352,6 +353,34 @@ public:
 
 
 
+
+class llm_graph_input_mem_hybrid : public llm_graph_input_i {
+public:
+    llm_graph_input_mem_hybrid(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_attn_kv> inp_attn,
+            std::unique_ptr<llm_graph_input_rs>      inp_rs,
+            const llama_memory_hybrid_context *      mctx) :
+        inp_attn(std::move(inp_attn)),
+        inp_rs(std::move(inp_rs)),
+        cparams(cparams),
+        mctx(mctx) { }
+    virtual ~llm_graph_input_mem_hybrid() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
+    std::unique_ptr<llm_graph_input_rs>      inp_rs;
+
+    llm_graph_input_attn_kv * get_attn() const { return inp_attn.get(); }
+    llm_graph_input_rs      * get_recr() const { return inp_rs.get(); }
+
+    const llama_cparams cparams;
+
+    const llama_memory_hybrid_context * mctx;
+};
 
 // hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell (Inkling)
 // the KQ masks are always dense (rows == nullptr) and are filled from the same cells as the distances, so that the bias
@@ -965,6 +994,8 @@ struct llm_graph_context {
     //
 
 
+
+    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
 
     // extent, extent_swa: the distance that the bias tables of the full and the SWA layers stop at
     llm_graph_input_mem_hybrid_iswa_rel * build_inp_mem_hybrid_iswa_rel(

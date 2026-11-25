@@ -54,6 +54,8 @@
 #define KEY_IMAGE_MEAN              "clip.vision.image_mean"
 #define KEY_IMAGE_STD               "clip.vision.image_std"
 #define KEY_SPATIAL_MERGE_SIZE      "clip.vision.spatial_merge_size"
+#define KEY_IMAGE_MIN_PIXELS        "clip.vision.image_min_pixels"
+#define KEY_IMAGE_MAX_PIXELS        "clip.vision.image_max_pixels"
 
 // audio-specific
 #define KEY_AUDIO_PROJ_TYPE        "clip.audio.projector_type" // for models with mixed modalities
@@ -69,6 +71,7 @@
 #define TN_CLASS_EMBD      "v.class_embd"
 #define TN_CLASS_POS_EMBD  "v.class_position_embd.weight"
 #define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backward compat
+#define TN_PATCH_EMBD_1    "v.patch_embd.weight.1"
 #define TN_PATCH_BIAS      "v.patch_embd.bias"
 #define TN_ATTN_QKV        "%s.blk.%d.attn_qkv.%s"
 #define TN_ATTN_K          "%s.blk.%d.attn_k.%s"
@@ -87,17 +90,22 @@
 #define TN_LN_PRE          "%s.pre_ln.%s"
 #define TN_LN_POST         "%s.post_ln.%s"
 #define TN_LLAVA_PROJ      "mm.%d.%s"
+#define TN_DEEPSTACK_NORM  "v.deepstack.%d.norm.%s"     // qwen3vl deepstack
+#define TN_DEEPSTACK_FC1   "v.deepstack.%d.fc1.%s"      // qwen3vl deepstack
+#define TN_DEEPSTACK_FC2   "v.deepstack.%d.fc2.%s"      // qwen3vl deepstack
 
 // align x to upper multiple of n
 #define MTMD_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
 
 enum projector_type {
     PROJECTOR_TYPE_INKLING2V,
+    PROJECTOR_TYPE_QWEN3VL,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
 static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_INKLING2V,         "inkling2v"},
+    { PROJECTOR_TYPE_QWEN3VL,           "qwen3vl_merger"},
 };
 
 static projector_type projector_type_from_string(const std::string & str) {

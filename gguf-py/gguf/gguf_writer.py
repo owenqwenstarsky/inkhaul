@@ -733,6 +733,9 @@ class GGUFWriter:
         else:
             self.add_array(Keys.LLM.EXPERT_FEED_FORWARD_LENGTH.format(arch=self.arch), length)
 
+    def add_expert_shared_feed_forward_length(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.EXPERT_SHARED_FEED_FORWARD_LENGTH.format(arch=self.arch), length)
+
     def add_decoder_start_token_id(self, id: int) -> None:
         self.add_uint32(Keys.LLM.DECODER_START_TOKEN_ID.format(arch=self.arch), id)
 
@@ -1231,6 +1234,9 @@ class GGUFWriter:
 
     def add_vision_image_grid_pinpoints(self, layers: Sequence[Sequence[int]]) -> None:
         self.add_array(Keys.ClipVision.IMAGE_GRID_PINPOINTS, layers)
+
+    def add_vision_is_deepstack_layers(self, layers: Sequence[bool]) -> None:
+        self.add_array(Keys.ClipVision.IS_DEEPSTACK_LAYERS, layers)
 
     # audio models
 

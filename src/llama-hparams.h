@@ -45,6 +45,7 @@ struct llama_hparams {
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;
     uint32_t n_layer_all;
+    uint32_t n_layer_nextn = 0; // MTP blocks at the end of the file, loaded but not run
     uint32_t n_expert = 0;
 
     // layer il reads the KV cache of layer kv_source_impl[il] (own cache if equal to il)
@@ -74,6 +75,7 @@ struct llama_hparams {
 
     uint32_t n_expert_groups    = 0;
     uint32_t n_group_used       = 0;
+    uint32_t n_ff_shexp         = 0;
 
     float    expert_weights_scale = 0.0f;
     float    expert_weights_norm_eps = 0.0f; // > 0: weights / (sum + eps), else the sum is clamped

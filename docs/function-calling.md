@@ -17,6 +17,7 @@ Function calling is supported for all models (see https://github.com/ggml-org/ll
   - Command R7B
   - DeepSeek R1 (WIP / seems reluctant to call any tools?)
   - Inkling / Inkling 2 (dedicated parser, `common/parsers/inkling.cpp`)
+  - Qwen 3.5 / 3.6 and other templates with Qwen3-Coder XML tool calls (`<tool_call>` with `<function=...>` and `<parameter=...>`, dedicated parser, `common/parsers/qwen3-coder.cpp`), with `<think>` reasoning when the template has it
 
 - Generic tool call is supported when the template isn't recognized by native format handlers (you'll see `Chat format: Generic` in the logs).
   - Use `--chat-template-file` to override the template when appropriate (see examples below)

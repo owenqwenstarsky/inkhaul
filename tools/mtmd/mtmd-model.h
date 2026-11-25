@@ -74,6 +74,8 @@ struct mtmd_hparams {
     int32_t image_min_pixels = -1;
     int32_t image_max_pixels = -1;
     resize_algo image_resize_algo = RESIZE_ALGO_BICUBIC;
+    pad_style image_resize_pad = PAD_CEIL; // padding style when resizing
+    bool image_round_half_even = false;    // smart_resize rounds .5 to even, like Python round() in the HF processor
 
     float image_mean[3];
     float image_std[3];
@@ -152,6 +154,18 @@ struct mtmd_layer {
     // layer scale (no bias)
     ggml_tensor * ls_1_w = nullptr;
     ggml_tensor * ls_2_w = nullptr;
+
+    // qwen3vl deepstack merger
+    ggml_tensor * deepstack_norm_w = nullptr;
+    ggml_tensor * deepstack_norm_b = nullptr;
+    ggml_tensor * deepstack_fc1_w = nullptr;
+    ggml_tensor * deepstack_fc1_b = nullptr;
+    ggml_tensor * deepstack_fc2_w = nullptr;
+    ggml_tensor * deepstack_fc2_b = nullptr;
+
+    bool has_deepstack() const {
+        return deepstack_fc1_w != nullptr;
+    }
 };
 
 // the weights and hparams of one modality of an mmproj file, read-only once loaded
@@ -173,6 +187,7 @@ struct mtmd_model {
     ggml_tensor * class_embedding = nullptr;
     ggml_tensor * class_position_embedding = nullptr;
     ggml_tensor * patch_embeddings_0 = nullptr;
+    ggml_tensor * patch_embeddings_1 = nullptr; // second temporal kernel (Qwen-VL)
     ggml_tensor * patch_bias = nullptr;
     ggml_tensor * position_embeddings = nullptr;
 
@@ -181,10 +196,14 @@ struct mtmd_model {
 
     std::vector<mtmd_layer> layers;
 
+    int32_t n_deepstack_layers = 0; // used by Qwen3-VL, calculated from mtmd_layer
+
     ggml_tensor * post_ln_w = nullptr;
     ggml_tensor * post_ln_b = nullptr;
 
     // projector
+    ggml_tensor * mm_0_w = nullptr;
+    ggml_tensor * mm_0_b = nullptr;
     ggml_tensor * mm_1_w = nullptr;
     ggml_tensor * mm_1_b = nullptr;
     ggml_tensor * mm_2_w = nullptr;

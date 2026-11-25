@@ -136,8 +136,9 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
-# the tokenizer tests take a vocab-only GGUF, none is checked in for Inkling (see LONGHAUL_PLAN.md)
+# the tokenizer tests take a vocab-only GGUF, only Qwen 3.5 has one checked in, Inkling has none (see LONGHAUL_PLAN.md)
 llama_build(test-tokenizer-0.cpp)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen35          LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
 
 if (LLAMA_LLGUIDANCE)
     # takes a vocab-only GGUF as its argument
@@ -255,6 +256,12 @@ llama_test_cmd(python3
     LABEL "python behavior"
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
     ARGS -m unittest discover -s tests -p test_conversion_fp8.py -v
+)
+llama_test_cmd(python3
+    NAME test-conversion-qwen35
+    LABEL "python behavior"
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    ARGS -m unittest discover -s tests -p test_conversion_qwen35.py -v
 )
 llama_test_cmd(python3
     NAME test-kv-cache-scales

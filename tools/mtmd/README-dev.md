@@ -63,4 +63,9 @@ We provide a set of helper functions via `mtmd_helper` to make using libmtmd eas
 
 ## Encoders in this fork
 
-This fork keeps one encoder, `inkling2v` (`models/inkling2v.cpp`): a ViT with a CLS token, learned position embeddings (resized to the input) and 2D RoPE, followed by a patch merge and a 2-layer projector. It is built from the shared `mtmd_graph` helpers (`build_vit`, `build_rope_2d`, `build_patch_merge_permute`, `build_ffn`). Audio input and audio generation (TTS) models are removed.
+This fork keeps two encoders:
+
+- `inkling2v` (`models/inkling2v.cpp`): a ViT with a CLS token, learned position embeddings (resized to the input) and 2D RoPE, followed by a patch merge and a 2-layer projector. It is built from the shared `mtmd_graph` helpers (`build_vit`, `build_rope_2d`, `build_patch_merge_permute`, `build_ffn`).
+- `qwen3vl` (`models/qwen3vl.cpp`, projector type `qwen3vl_merger`): two temporal patch kernels, learned position embeddings (bilinear, align corners, resized to the input), vision M-RoPE, a 2x2 merge into a 2-layer GELU projector, and optional deepstack mergers. It has its own layer loop, as the deepstack mergers take the output of whole layers. The Qwen 3.5 / 3.6 files have no deepstack layers.
+
+Audio input and audio generation (TTS) models are removed.
