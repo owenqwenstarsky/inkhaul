@@ -173,6 +173,12 @@ class TensorNameMap:
             "model.layers.{bid}.pre_attention_norm",                # domynedge
         ),
 
+        # Attention query-key-value
+        MODEL_TENSOR.ATTN_QKV: (
+            "model.layers.{bid}.linear_attn.in_proj_qkv",  # qwen3.5
+            "layers.{bid}.linear_attn.in_proj_qkv",        # qwen3.5 text
+        ),
+
         # Attention query
         MODEL_TENSOR.ATTN_Q: (
             "model.layers.{bid}.self_attn.q_proj",                       # llama-hf nemotron olmoe olmo2 phimoe
@@ -508,6 +514,10 @@ class TensorNameMap:
             "layers.{bid}.moe.expert_router",                   # metis16
         ),
 
+        MODEL_TENSOR.FFN_GATE_INP_SHEXP: (
+            "model.layers.{bid}.mlp.shared_expert_gate",  # qwen2moe
+        ),
+
         MODEL_TENSOR.FFN_EXP_PROBS_B: (
             "layers.{bid}.moe.selection_bias",                              # metis16
             "model.layers.{bid}.mlp.gate.e_score_correction",               # deepseek-v3 dots1
@@ -585,9 +595,9 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.FFN_UP_SHEXP: (
-            "model.layers.{bid}.mlp.shared_experts.up_proj",         # deepseek deepseek2
+            "model.layers.{bid}.mlp.shared_experts.up_proj",  # deepseek deepseek2
+            "model.layers.{bid}.mlp.shared_expert.up_proj",   # qwen2moe
         ),
-
         # Feed-forward gate
         MODEL_TENSOR.FFN_GATE: (
             "model.layers.{bid}.mlp.gate_proj",               # llama-hf refact olmo2
@@ -622,9 +632,9 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.FFN_GATE_SHEXP: (
-            "model.layers.{bid}.mlp.shared_experts.gate_proj",         # deepseek deepseek2
+            "model.layers.{bid}.mlp.shared_experts.gate_proj",  # deepseek deepseek2
+            "model.layers.{bid}.mlp.shared_expert.gate_proj",   # qwen2moe
         ),
-
         MODEL_TENSOR.FFN_GATE_UP_EXP: (
             "model.layers.{bid}.mlp.experts.gate_up_proj",
             "model.layers.{bid}.experts.gate_up_proj", # gemma4
@@ -699,9 +709,9 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.FFN_DOWN_SHEXP: (
-            "model.layers.{bid}.mlp.shared_experts.down_proj",         # deepseek deepseek2
+            "model.layers.{bid}.mlp.shared_experts.down_proj",  # deepseek deepseek2
+            "model.layers.{bid}.mlp.shared_expert.down_proj",   # qwen2moe
         ),
-
         MODEL_TENSOR.ATTN_Q_NORM: (
             "encoder.layers.{bid}.self_attention.q_layernorm",
             "model.layers.{bid}.self_attn.q_layernorm",                       # persimmon
@@ -751,16 +761,43 @@ class TensorNameMap:
             "model.blocks.{bid}.embed_skip.a_g", # talkie
         ),
 
+        MODEL_TENSOR.SSM_CONV1D: (
+            "model.layers.{bid}.linear_attn.conv1d",  # qwen3next
+            "layers.{bid}.linear_attn.conv1d",        # qwen3.5 text
+        ),
+
         MODEL_TENSOR.SSM_DT: (
-            "model.layers.{bid}.attention.dt_proj",     # bailingmoe3
+            "model.layers.{bid}.linear_attn.dt_proj",  # qwen3next
+            "layers.{bid}.linear_attn.dt_proj",        # qwen3.5 text
+            "model.layers.{bid}.attention.dt_proj",    # bailingmoe3
         ),
 
         MODEL_TENSOR.SSM_A: (
-            "model.layers.{bid}.attention.A_log",     # bailingmoe3
+            "model.layers.{bid}.linear_attn.A_log",  # qwen3next
+            "layers.{bid}.linear_attn.A_log",        # qwen3.5 text
+            "model.layers.{bid}.attention.A_log",    # bailingmoe3
         ),
 
         MODEL_TENSOR.SSM_NORM: (
+            "model.layers.{bid}.linear_attn.norm",  # qwen3next
+            "layers.{bid}.linear_attn.norm",        # qwen3.5 text
             "model.layers.{bid}.attention.o_norm",  # bailingmoe3
+        ),
+
+        MODEL_TENSOR.SSM_OUT: (
+            "model.layers.{bid}.linear_attn.out_proj",  # qwen3next
+            "layers.{bid}.linear_attn.out_proj",        # qwen3.5 text
+        ),
+
+        MODEL_TENSOR.SSM_ALPHA: (
+            "model.layers.{bid}.linear_attn.in_proj_a",  # qwen3.5
+            "layers.{bid}.linear_attn.in_proj_a",        # qwen3.5 text
+        ),
+
+        MODEL_TENSOR.SSM_BETA: (
+            "model.layers.{bid}.linear_attn.in_proj_b",  # qwen3.5
+            "layers.{bid}.linear_attn.in_proj_b",        # qwen3.5 text
+            "model.layers.{bid}.attention.b_proj",       # bailingmoe3
         ),
 
         # Kimi Linear KDA (using SSM_ prefix for consistency)
@@ -775,9 +812,6 @@ class TensorNameMap:
         ),
         # bailingmoe3 f_proj and g_proj are renamed in the converter
         MODEL_TENSOR.SSM_F_A: (),
-        MODEL_TENSOR.SSM_BETA: (
-            "model.layers.{bid}.attention.b_proj",       # bailingmoe3
-        ),
         MODEL_TENSOR.SSM_G_A: (),
 
         MODEL_TENSOR.ATTN_Q_A: (
@@ -820,7 +854,6 @@ class TensorNameMap:
         MODEL_TENSOR.NEXTN_HNORM: (
             "model.layers.{bid}.hnorm",
         ),
-
         ############################################################################
         # TODO: these do not belong to block_mappings_cfg - move them to mappings_cfg
         MODEL_TENSOR.ENC_OUTPUT_NORM: (
@@ -1012,6 +1045,10 @@ class TensorNameMap:
             "model.qwen2_model.model.model.layers.{bid}.self_attn.v_proj", # Deepseek-OCR-2 qwen2
             "model.vision_tower.layers.{bid}.attn.v_proj", # muse-glimmer
             "model.visual.backbone.layers.{bid}.self_attn.v_proj", # inkling2
+        ),
+
+        MODEL_TENSOR.V_ENC_ATTN_QKV: (
+            "visual.blocks.{bid}.attn.qkv", # qwen3vl
         ),
 
         MODEL_TENSOR.V_ENC_INPUT_NORM: (

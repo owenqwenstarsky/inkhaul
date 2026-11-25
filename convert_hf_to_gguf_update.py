@@ -86,10 +86,13 @@ CHK_TXT = '\n \n\n \n\n\n \t \t\t \t\n  \n   \n    \n     \n🚀 (normal) 😶�
 models = [
     {"name": "inkling2",         "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/thinkingmachines/Inkling-2-Small", },
     {"name": "bailingmoe2",      "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/inclusionAI/Ling-mini-base-2.0", },
+    {"name": "qwen35",           "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/Qwen/Qwen3.5-9B-Instruct", },
 ]
 
 # some models are known to be broken upstream, so we will skip them as exceptions
-pre_computed_hashes: list[dict] = []
+pre_computed_hashes: list[dict] = [
+    {"name": "qwen35",    "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/openbmb/MiniCPM-V-4_6", "chkhsh": "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f"},
+]
 
 
 def download_file_with_auth(url, token, save_path):

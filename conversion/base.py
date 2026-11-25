@@ -633,11 +633,12 @@ class ModelBase:
         expert_pattern = re.compile(r"(\.[^.]*experts)\.(\d+)\.")
         scale_types = {
             gguf.MODEL_TENSOR.ATTN_Q, gguf.MODEL_TENSOR.ATTN_K, gguf.MODEL_TENSOR.ATTN_V,
-            gguf.MODEL_TENSOR.ATTN_OUT, gguf.MODEL_TENSOR.ATTN_GATE,
+            gguf.MODEL_TENSOR.ATTN_OUT, gguf.MODEL_TENSOR.ATTN_QKV, gguf.MODEL_TENSOR.ATTN_GATE,
             gguf.MODEL_TENSOR.FFN_GATE, gguf.MODEL_TENSOR.FFN_UP, gguf.MODEL_TENSOR.FFN_DOWN,
             gguf.MODEL_TENSOR.FFN_GATE_SHEXP, gguf.MODEL_TENSOR.FFN_UP_SHEXP, gguf.MODEL_TENSOR.FFN_DOWN_SHEXP,
             gguf.MODEL_TENSOR.FFN_GATE_EXP, gguf.MODEL_TENSOR.FFN_UP_EXP, gguf.MODEL_TENSOR.FFN_DOWN_EXP,
-            gguf.MODEL_TENSOR.SSM_BETA, gguf.MODEL_TENSOR.NEXTN_EH_PROJ, gguf.MODEL_TENSOR.OUTPUT,
+            gguf.MODEL_TENSOR.SSM_OUT, gguf.MODEL_TENSOR.SSM_ALPHA, gguf.MODEL_TENSOR.SSM_BETA,
+            gguf.MODEL_TENSOR.NEXTN_EH_PROJ, gguf.MODEL_TENSOR.OUTPUT,
         }
 
         for scale_name in list(self.model_tensors.keys()):
@@ -876,6 +877,8 @@ class ModelBase:
                 self.match_model_tensor_name(new_name, key, bid)
                 for key in (
                     gguf.MODEL_TENSOR.FFN_GATE_INP,
+                    gguf.MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+                    gguf.MODEL_TENSOR.SSM_CONV1D,
                     gguf.MODEL_TENSOR.V_ENC_EMBD_POS,
                     # Kimi KDA conv weights should be F32
                     gguf.MODEL_TENSOR.SSM_CONV1D_Q,
@@ -1779,12 +1782,18 @@ class TextModel(ModelBase):
         # NOTE: if you get an error here, you need to update the convert_hf_to_gguf_update.py script
         #       or pull the latest version of the model from Huggingface
         #       don't edit the hashes manually!
+        if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
+            # ref: https://huggingface.co/openbmb/MiniCPM-V-4_6
+            res = "qwen35"
         if chkhsh == "5635e1c8d621dff7b4825f41f2f97b6ceb39bcf2d5c541db28577080d6efd5e5":
             # ref: https://huggingface.co/thinkingmachines/Inkling-2-Small
             res = "inkling2"
         if chkhsh == "9b1be57e70d20d9501b2b3186e792d81181ae36ada3903c26f9fea418cf87206":
             # ref: https://huggingface.co/inclusionAI/Ling-mini-base-2.0
             res = "bailingmoe2"
+        if chkhsh == "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4":
+            # ref: https://huggingface.co/Qwen/Qwen3.5-9B-Instruct
+            res = "qwen35"
 
         if res is None:
             logger.warning("\n")
@@ -1819,6 +1828,50 @@ class TextModel(ModelBase):
 
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
         special_vocab.add_to_gguf(self.gguf_writer)
+
+    def _try_set_pooling_type(self) -> None:
+        # get pooling path
+        pooling_path = None
+        module_path = self.dir_model / "modules.json"
+        if module_path.is_file():
+            with open(module_path, encoding="utf-8") as f:
+                modules = json.load(f)
+            for mod in modules:
+                if mod["type"].endswith("Pooling"):
+                    pooling_path = mod["path"]
+                    break
+
+        mode_mapping = {
+            "mean": gguf.PoolingType.MEAN,
+            "cls": gguf.PoolingType.CLS,
+            "lasttoken": gguf.PoolingType.LAST,
+        }
+
+        # get pooling type
+        if pooling_path is not None:
+            with open(self.dir_model / pooling_path / "config.json", encoding="utf-8") as f:
+                pooling = json.load(f)
+            if pooling.get("pooling_mode_mean_tokens"):
+                pooling_type = gguf.PoolingType.MEAN
+            elif pooling.get("pooling_mode_cls_token"):
+                pooling_type = gguf.PoolingType.CLS
+            elif pooling.get("pooling_mode_lasttoken"):
+                pooling_type = gguf.PoolingType.LAST
+            elif (pooling_mode := pooling.get("pooling_mode")) in mode_mapping:
+                pooling_type = mode_mapping[pooling_mode]
+            else:
+                raise NotImplementedError("Only MEAN, CLS, and LAST pooling types supported")
+            self.gguf_writer.add_pooling_type(pooling_type)
+        else:
+            embedding_config_path = self.dir_model / "embedding_config.json"
+            if embedding_config_path.is_file():
+                with open(embedding_config_path, encoding="utf-8") as f:
+                    embedding_config = json.load(f)
+                pooling = embedding_config.get("pooling")
+                if pooling == "last_token":
+                    self.gguf_writer.add_pooling_type(gguf.PoolingType.LAST)
+                elif pooling is not None:
+                    raise NotImplementedError(f"unsupported embedding_config.json pooling {pooling!r}")
 
 
 class MmprojModel(ModelBase):

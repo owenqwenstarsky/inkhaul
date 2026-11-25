@@ -39,6 +39,15 @@ struct mtmd_image_preprocessor {
     virtual mtmd_image_preproc_out preprocess_video_frame(const mtmd_image_u8 & img) const { return preprocess(img); }
 };
 
+// resize image to multiple of patch_size*n_merge within [image_min_pixels, image_max_pixels], while preserving aspect ratio ("smart_resize")
+// this is used by models with native support for dynamic image size, for example: Qwen-VL
+struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_dyn_size(const mtmd_model * model) : mtmd_image_preprocessor(model) {}
+    mtmd_image_preprocessor_dyn_size(const mtmd_hparams & hparams) : mtmd_image_preprocessor(hparams) {}
+    static mtmd_image_size get_target_size(const mtmd_hparams & hparams, const mtmd_image_size & original_size);
+    mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
+};
+
 // pad bottom-right to a multiple of patch_size*n_merge; resize only if the image is above image_max_pixels
 struct mtmd_image_preprocessor_inkling2v : mtmd_image_preprocessor {
     using mtmd_image_preprocessor::mtmd_image_preprocessor;

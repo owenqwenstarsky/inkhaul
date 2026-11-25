@@ -304,6 +304,9 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize expert gating tensors
     quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
 
+    // do not quantize the small conv1d weights of the gated delta net (qwen35)
+    quantize &= name.find("ssm_conv1d") == std::string::npos;
+
     // inkling2: short conv kernels, clip scales, residual mix queries, the relative bias projection and the loop tensors
     if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
         quantize &= name.find("_conv.weight")         == std::string::npos;

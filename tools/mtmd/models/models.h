@@ -17,3 +17,8 @@ struct mtmd_graph_inkling2v : mtmd_graph {
     using mtmd_graph::mtmd_graph;
     ggml_cgraph * build() override;
 };
+
+struct mtmd_graph_qwen3vl : mtmd_graph {
+    using mtmd_graph::mtmd_graph;
+    ggml_cgraph * build() override;
+};

@@ -77,20 +77,19 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
 
     // ff shared expert
-    struct ggml_tensor * ffn_gate_shexp = nullptr;
-    struct ggml_tensor * ffn_down_shexp = nullptr;
-    struct ggml_tensor * ffn_up_shexp   = nullptr;
+    struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
+    struct ggml_tensor * ffn_gate_shexp     = nullptr;
+    struct ggml_tensor * ffn_down_shexp     = nullptr;
+    struct ggml_tensor * ffn_up_shexp       = nullptr;
 
     // ff bias
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
 
-    // KDA
+    // KDA (ssm_a and ssm_beta are with the gated delta net tensors below)
     struct ggml_tensor * ssm_q_conv = nullptr;
     struct ggml_tensor * ssm_k_conv = nullptr;
     struct ggml_tensor * ssm_v_conv = nullptr;
     struct ggml_tensor * ssm_f_a    = nullptr;
-    struct ggml_tensor * ssm_beta   = nullptr;
-    struct ggml_tensor * ssm_a      = nullptr;
     struct ggml_tensor * ssm_dt_b   = nullptr;
     struct ggml_tensor * ssm_g_a    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
@@ -111,6 +110,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps_s = nullptr; // per expert
     struct ggml_tensor * ffn_down_exps_s = nullptr;
     struct ggml_tensor * ffn_up_exps_s   = nullptr; // also of ffn_gate_up_exps
+    struct ggml_tensor * ffn_gate_shexp_s = nullptr;
+    struct ggml_tensor * ffn_up_shexp_s   = nullptr;
+    struct ggml_tensor * ffn_down_shexp_s = nullptr;
+    struct ggml_tensor * ssm_out_s        = nullptr;
+    struct ggml_tensor * ssm_alpha_s      = nullptr;
+    struct ggml_tensor * ssm_beta_s       = nullptr;
 
     // input scales, loaded so that files that carry them load, not applied
     struct ggml_tensor * wq_in_s            = nullptr;
@@ -125,6 +130,23 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps_in_s = nullptr;
     struct ggml_tensor * ffn_down_exps_in_s = nullptr;
     struct ggml_tensor * ffn_up_exps_in_s   = nullptr;
+    struct ggml_tensor * ffn_gate_shexp_in_s = nullptr;
+    struct ggml_tensor * ffn_up_shexp_in_s   = nullptr;
+    struct ggml_tensor * ffn_down_shexp_in_s = nullptr;
+    struct ggml_tensor * ssm_out_in_s        = nullptr;
+    struct ggml_tensor * ssm_alpha_in_s      = nullptr;
+    struct ggml_tensor * ssm_beta_in_s       = nullptr;
+
+    // gated delta net (qwen35)
+    struct ggml_tensor * ssm_conv1d         = nullptr;
+    struct ggml_tensor * ssm_dt             = nullptr;
+    struct ggml_tensor * ssm_a              = nullptr;
+    struct ggml_tensor * ssm_beta           = nullptr;
+    struct ggml_tensor * ssm_alpha          = nullptr;
+    struct ggml_tensor * ssm_norm           = nullptr;
+    struct ggml_tensor * ssm_out            = nullptr;
+    struct ggml_tensor * wqkv_z             = nullptr; // [wqkv | wqkv_gate] in one weight
+    struct ggml_tensor * ssm_beta_alpha_cat = nullptr; // [ssm_beta | ssm_alpha] in one weight
 
     // dflash
     struct ggml_tensor * attn_sinks = nullptr;

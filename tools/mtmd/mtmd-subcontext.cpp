@@ -530,6 +530,32 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                 set_input_i32("pos_w", positions_w);
                 set_input_i32("pos_h", positions_h);
             } break;
+        case PROJECTOR_TYPE_QWEN3VL:
+            {
+                const int num_patches = pos_w * pos_h;
+                const int merge_ratio = hparams.n_merge;
+                const int pw = image_size_width  / patch_size / merge_ratio;
+                const int ph = image_size_height / patch_size / merge_ratio;
+                std::vector<int32_t> positions(num_patches * 4);
+                int ptr = 0;
+                for (int ty = 0; ty < ph; ty++) {
+                    for (int tx = 0; tx < pw; tx++) {
+                        for (int dy = 0; dy < merge_ratio; dy++) {
+                            for (int dx = 0; dx < merge_ratio; dx++) {
+                                const int y = ty * merge_ratio + dy;
+                                const int x = tx * merge_ratio + dx;
+                                positions[                  ptr] = y;
+                                positions[    num_patches + ptr] = x;
+                                positions[2 * num_patches + ptr] = y;
+                                positions[3 * num_patches + ptr] = x;
+                                ptr++;
+                            }
+                        }
+                    }
+                }
+
+                set_input_i32("positions", positions);
+            } break;
         default:
             GGML_ABORT("Unknown projector type");
     }

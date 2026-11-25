@@ -1256,6 +1256,9 @@ class GGUFWriter:
     def add_vision_image_grid_pinpoints(self, layers: Sequence[Sequence[int]]) -> None:
         self.add_array(Keys.ClipVision.IMAGE_GRID_PINPOINTS, layers)
 
+    def add_vision_is_deepstack_layers(self, layers: Sequence[bool]) -> None:
+        self.add_array(Keys.ClipVision.IS_DEEPSTACK_LAYERS, layers)
+
     # audio models
 
     def add_clip_audio_projector_type(self, value: str) -> None:
