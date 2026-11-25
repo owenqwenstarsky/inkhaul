@@ -22,12 +22,19 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Inkling2LoopForCausalLM": "inkling2",
     "Inkling2LoopForConditionalGeneration": "inkling2",
     "Qwen3DSparkModel": "dspark",
+    "Qwen3_5ForCausalLM": "qwen",
+    "Qwen3_5ForConditionalGeneration": "qwen",
+    "Qwen3_5MoeForCausalLM": "qwen",
+    "Qwen3_5MoeForConditionalGeneration": "qwen",
+    "Qwen3_5TextModel": "qwen",
 }
 
 
 MMPROJ_MODEL_MAP: dict[str, str] = {
     "Inkling2ForConditionalGeneration": "inkling2",
     "Inkling2LoopForConditionalGeneration": "inkling2",
+    "Qwen3_5ForConditionalGeneration": "qwen3vl",
+    "Qwen3_5MoeForConditionalGeneration": "qwen3vl",
 }
 
 

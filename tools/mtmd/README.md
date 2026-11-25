@@ -1,6 +1,6 @@
 # Multimodal Support in llama.cpp
 
-This directory provides multimodal capabilities for `llama.cpp`. This fork keeps one encoder: `inkling2v`, the vision encoder of Inkling 2 (image input only).
+This directory provides multimodal capabilities for `llama.cpp`. This fork keeps two encoders: `inkling2v`, the vision encoder of Inkling 2, and `qwen3vl_merger`, the vision encoder of Qwen 3.5 / 3.6 (image input only).
 
 > [!IMPORTANT]
 >
@@ -41,4 +41,4 @@ Originally built upon `clip.cpp` (similar to `llava.cpp`), `libmtmd` offers seve
 
 Multimodal projector (`mmproj`) files are specific to each model architecture.
 
-For Inkling 2, use `convert_hf_to_gguf.py` with the `--mmproj` flag on the Hugging Face checkpoint (`Inkling2ForConditionalGeneration` or `Inkling2LoopForConditionalGeneration`). It writes the `inkling2v` projector to its own GGUF file.
+Use `convert_hf_to_gguf.py` with the `--mmproj` flag on the Hugging Face checkpoint: `Inkling2ForConditionalGeneration` or `Inkling2LoopForConditionalGeneration` for Inkling 2 (`inkling2v`), `Qwen3_5ForConditionalGeneration` or `Qwen3_5MoeForConditionalGeneration` for Qwen 3.5 / 3.6 (`qwen3vl_merger`). It writes the projector to its own GGUF file.

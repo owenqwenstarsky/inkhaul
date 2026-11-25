@@ -1,6 +1,6 @@
 # LongHaul
 
-LongHaul runs Inkling 2 MoE models on a Mac or an NVIDIA GPU with less memory than the model needs. The MoE experts stay in the GGUF file on disk. A fixed-size cache in GPU memory (unified memory on a Mac, VRAM with CUDA) keeps the experts that were used recently and often. Everything else (attention, router, norms, embeddings, output) is loaded as usual.
+LongHaul runs Inkling 2 and Qwen 3.5 / 3.6 MoE (`qwen35moe`) models on a Mac or an NVIDIA GPU with less memory than the model needs. The MoE experts stay in the GGUF file on disk. A fixed-size cache in GPU memory (unified memory on a Mac, VRAM with CUDA) keeps the experts that were used recently and often. Everything else (attention, router, norms, embeddings, output) is loaded as usual.
 
 LongHaul is always on for models with experts on disk. Only the cache size can be set:
 
@@ -16,6 +16,7 @@ LongHaul is always on for models with experts on disk. Only the cache size can b
 - Each MoE layer looks up its selected experts in the cache. A miss is read from the file with `pread`, so that the OS file cache does not keep a second copy: on macOS the file is opened with `F_NOCACHE`, on Linux each read is dropped from the page cache with `POSIX_FADV_DONTNEED` (and readahead is off). On Windows the reads go through the file cache. The misses of a layer are read by 4 threads at once, each through its own 8 MiB staging buffer, into the cache, which is a Metal or CUDA buffer. `LLAMA_LONGHAUL_IO_THREADS` sets the number of threads (1 to 64; 1 reads on the compute thread only).
 - With CUDA the staging buffers are pinned host memory, so the uploads to the GPU run at full PCIe speed.
 - The cache keeps experts by recency and frequency (`src/llama-moe-cache.cpp`). In `inkling2_loop` models the passes of the loop core share the slots of their physical layer, so an expert used in several passes is cached once.
+- The Qwen shared expert is small and stays in memory. The experts of a Qwen MTP block are not loaded, the block is not run.
 - Prompt processing also reads through the cache. If the cache cannot hold the experts that one ubatch selects in a layer, `n_ubatch` is reduced at startup (logged as a warning). A larger cache gives larger ubatches and faster prompt processing.
 - A Metal or CUDA GPU is required, with all layers on it (the default `-ngl`). LongHaul supports one GPU: on a machine with several CUDA GPUs, select one with `-dev CUDA0` (or `-sm none -mg N`).
 - `--fit` reduces the context size if needed, but it does not offload fewer layers or move experts to the CPU. If the model does not fit, use a smaller `-lhc` or context.
@@ -50,6 +51,28 @@ To estimate for another file or cache size, with `E` = bytes per expert (gate_up
 
 For Mini (`L` = 48, `k` = 8, `E` ~ 5 MB) at a hit rate of 50%, a token reads about 0.96 GB. The hit rate depends on the prompt and the routing, so measure it with the stats line below or replay a trace.
 
+## Sizing for Qwen 3.5 / 3.6
+
+The MoE models have 256 or 512 experts per layer and a shared expert. All layers are MoE layers, including the linear attention ones. The 35B-A3B numbers are from the GGUF headers of the two common Q4_K_M files of Qwen3.6-35B-A3B, the others are estimates for Q4_K experts from the model configs:
+
+| Model | `L` | `k` | `E` | Experts on disk | No-hit read per token |
+|---|---|---|---|---|---|
+| 35B-A3B (3.5 and 3.6), ggml-org Q4_K_M | 40 | 8 | 1.77 MB | 16.9 GiB | 0.57 GB |
+| 35B-A3B (3.5 and 3.6), unsloth UD-Q4_K_M | 40 | 8 | 1.90 MB, 2.04 MB in 3 layers | 18.2 GiB | 0.61 GB |
+| 122B-A10B, Q4_K | 48 | 8 | 5.3 MB | 61 GiB | 2.0 GB |
+| 397B-A17B, Q4_K | 60 | 10 | 7.1 MB | 202 GiB | 4.3 GB |
+
+The ubatch limit by cache size (the cache holds all experts of a layer from 256 slots, 512 for the 397B):
+
+| Model | 512M | 1G | 2G | 4G |
+|---|---|---|---|---|
+| 35B-A3B, ggml-org Q4_K_M (300 slots at 512M) | any | any | any | any |
+| 35B-A3B, unsloth UD-Q4_K_M | 2 | 5 | 10 | 21 |
+| 122B-A10B | 12 | 25 | any | any |
+| 397B-A17B | 7 | 15 | 30 | any |
+
+The unsloth file gives `ffn_down_exps` Q6_K in 3 of its 40 layers and Q5_K in the others, so the cache builds two groups. The budget is split by the size of the groups, so the 3-layer group gets about 8% of it, about 21 slots at 512M, and its slots set the ubatch limit. Prefer a file with one expert type in all layers, such as the ggml-org Q4_K_M, or give the cache more memory.
+
 ## Reading the stats
 
 At exit the cache logs one line per batch class:
@@ -64,4 +87,4 @@ The time and speed are for the disk reads only. If the read time is most of the 
 
 ## Tests
 
-`LLAMA_LONGHAUL_RESIDENT=1` with a cache size of 0 keeps the experts in the mapped file without a RAM bound. It exists for tests that compare against the old behavior. `test-llama-archs` checks LongHaul against the same model in memory for caches from 2 slots to all experts.
+`LLAMA_LONGHAUL_RESIDENT=1` with a cache size of 0 keeps the experts in the mapped file without a RAM bound. It exists for tests that compare against the old behavior. `test-llama-archs` checks LongHaul against the same file with its experts in the mapped file, for caches from 2 slots to all experts. For `qwen35moe` it also checks files with separate gate and up experts, with two expert groups, and with an MTP block.

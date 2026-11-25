@@ -10,6 +10,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -45,6 +46,10 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_inkling2_loop(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
+        case LLM_ARCH_QWEN35:
+            return new llama_model_qwen35(params);
+        case LLM_ARCH_QWEN35MOE:
+            return new llama_model_qwen35moe(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -432,9 +437,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
-    uint32_t n_layer_nextn = 0;
-    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    n_layer_nextn,           false);
-    if (n_layer_nextn > 0) {
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
+    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all);
+    // Qwen 3.5 loads its MTP block and skips it, the other archs have none
+    if (hparams.n_layer_nextn > 0 && arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) {
         throw std::runtime_error("NextN/MTP layers are not supported");
     }
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
@@ -796,6 +802,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            }
+
+            // gated delta net and shared expert scales (qwen35)
+            struct w_scale_slots { ggml_tensor * w; llm_tensor t; ggml_tensor ** s; ggml_tensor ** in_s; };
+            for (const w_scale_slots & ws : {
+                    w_scale_slots { layer.ssm_out,        LLM_TENSOR_SSM_OUT,        &layer.ssm_out_s,        &layer.ssm_out_in_s        },
+                    w_scale_slots { layer.ssm_alpha,      LLM_TENSOR_SSM_ALPHA,      &layer.ssm_alpha_s,      &layer.ssm_alpha_in_s      },
+                    w_scale_slots { layer.ssm_beta,       LLM_TENSOR_SSM_BETA,       &layer.ssm_beta_s,       &layer.ssm_beta_in_s       },
+                    w_scale_slots { layer.ffn_gate_shexp, LLM_TENSOR_FFN_GATE_SHEXP, &layer.ffn_gate_shexp_s, &layer.ffn_gate_shexp_in_s },
+                    w_scale_slots { layer.ffn_up_shexp,   LLM_TENSOR_FFN_UP_SHEXP,   &layer.ffn_up_shexp_s,   &layer.ffn_up_shexp_in_s   },
+                    w_scale_slots { layer.ffn_down_shexp, LLM_TENSOR_FFN_DOWN_SHEXP, &layer.ffn_down_shexp_s, &layer.ffn_down_shexp_in_s }}) {
+                if (ws.w && !*ws.s) {
+                    *ws.s = create_tensor(tn(ws.t, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                }
+                if (ws.w && !*ws.in_s) {
+                    *ws.in_s = create_tensor(tn(ws.t, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                }
             }
 
             // input scales
@@ -1290,6 +1313,16 @@ void llama_model::print_info() const {
             }
         }
 
+        if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+            LLAMA_LOG_INFO("%s: ssm_d_conv            = %u\n",     __func__, hparams.ssm_d_conv);
+            LLAMA_LOG_INFO("%s: ssm_d_inner           = %u\n",     __func__, hparams.ssm_d_inner);
+            LLAMA_LOG_INFO("%s: ssm_d_state           = %u\n",     __func__, hparams.ssm_d_state);
+            LLAMA_LOG_INFO("%s: ssm_dt_rank           = %u\n",     __func__, hparams.ssm_dt_rank);
+            LLAMA_LOG_INFO("%s: ssm_n_group           = %u\n",     __func__, hparams.ssm_n_group);
+            LLAMA_LOG_INFO("%s: n_ff_shexp            = %u\n",     __func__, hparams.n_ff_shexp);
+            LLAMA_LOG_INFO("%s: n_layer_nextn         = %u (not run)\n", __func__, hparams.n_layer_nextn);
+        }
+
         LLAMA_LOG_INFO("%s: model type            = %s\n",     __func__, type_name().c_str());
         if (pimpl->n_elements >= 1e12) {
             LLAMA_LOG_INFO("%s: model params          = %.2f T\n", __func__, pimpl->n_elements*1e-12);
@@ -1403,6 +1436,29 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & /*cparams*/, i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+    // Qwen 3.5: each layer has either attention or gated delta net state, the MTP block has neither
+    if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+        return new llama_memory_hybrid(
+            /* model             */ *this,
+            /* no_alloc          */ params.no_alloc,
+            /* attn_type_k       */ params.type_k,
+            /* attn_type_v       */ params.type_v,
+            /* attn_v_trans      */ !cparams.flash_attn,
+            /* attn_kv_size      */ cparams.n_ctx_seq,
+            /* attn_n_swa        */ hparams.n_swa,
+            /* attn_swa_type     */ hparams.swa_type,
+            /* recurrent_type_k  */ GGML_TYPE_F32,
+            /* recurrent_type_v  */ GGML_TYPE_F32,
+            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+            /* n_seq_max         */ cparams.n_seq_max,
+            /* n_rs_seq          */ cparams.n_rs_seq,
+            /* rs_replay         */ cparams.rs_replay,
+            /* offload           */ cparams.offload_kqv,
+            /* unified           */ cparams.kv_unified,
+            /* filter_attn       */ [&](uint32_t il) { return il < hparams.n_layer() && !hparams.is_recr(il); },
+            /* filter_recr       */ [&](uint32_t il) { return il < hparams.n_layer() &&  hparams.is_recr(il); });
+    }
+
     // Inkling 2: every layer has attention and short convolution state, some layers use a sliding window
     if (llm_arch_is_hybrid(arch)) {
         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
@@ -1595,6 +1651,11 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_INKLING2_LOOP:
             return LLAMA_ROPE_TYPE_NONE;
 
+        // M-RoPE with interleaved sections
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return LLAMA_ROPE_TYPE_IMROPE;
+
         // the dense DSpark backbone uses NeoX RoPE
         case LLM_ARCH_DFLASH:
             // drafts for M-RoPE targets carry rope sections and follow the target's temporal dim
@@ -1783,7 +1844,8 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
         return;
     }
 
-    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+    // the merged tensor is optional, but stays on disk like the separate ones (TENSOR_LONGHAUL)
+    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED | (flags & TENSOR_LONGHAUL));
     if (layer.ffn_gate_up_exps == nullptr) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);

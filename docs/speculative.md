@@ -36,6 +36,7 @@ llama-server -m Inkling-2-Mini-AD-Q4_K.gguf -md dspark-Inkling-2-Mini-Q8_0.gguf 
 ```
 
 Only DSpark drafts are supported. A DFlash draft without the Markov head (no `markov_w1.weight` tensor) fails to load.
+DSpark is tested with Inkling 2 targets only. The Qwen 3.5 / 3.6 MTP (multi-token prediction) block is not supported: it is skipped when the main GGUF has it, and `mtp-*.gguf` files are not downloaded.
 `draft-dflash` is an alias that runs the DSpark draft. Without `--spec-type`, a draft model with the `dflash` architecture is detected as `draft-dflash`.
 `draft-dflash` and `draft-dspark` cannot be combined.
 

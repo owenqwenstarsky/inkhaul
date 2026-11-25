@@ -1,7 +1,7 @@
-# llama.cpp (Inkling 2 Mini + LongHaul fork)
+# llama.cpp (Inkling 2 Mini + Qwen 3.5 / 3.6 + LongHaul fork)
 
 > [!NOTE]
-> This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) trimmed to run [Inkling 2 Mini](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF) (arch `inkling2_loop`) with LongHaul on Apple Silicon Macs (Metal) and on NVIDIA GPUs (CUDA, Linux and Windows on x86_64).
+> This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) trimmed to run [Inkling 2 Mini](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF) (arch `inkling2_loop`) and Qwen 3.5 / 3.6 (archs `qwen35` and `qwen35moe`, text and images) with LongHaul on Apple Silicon Macs (Metal) and on NVIDIA GPUs (CUDA, Linux and Windows on x86_64).
 > LongHaul keeps the MoE experts on disk and holds the recently used ones in a fixed-size GPU memory cache, so the model runs with less memory than the model file needs.
 > Set the cache size with `-lhc, --longhaul-cache` (default: `512M`). See [docs/longhaul.md](docs/longhaul.md) for how it works and how to size the cache.
 >
@@ -33,7 +33,12 @@ The binaries are in `build/bin`. Then:
 
 # Launch an OpenAI-compatible API server
 ./build/bin/llama-server -hf AtomicChat/Inkling-2-Mini-GGUF:Q4_K -lhc 1G
+
+# Qwen 3.6 35B-A3B, with its experts on disk and the vision projector (mmproj) downloaded with it
+./build/bin/llama-server -hf ggml-org/Qwen3.6-35B-A3B-GGUF:Q4_K_M -lhc 1G
 ```
+
+The Qwen MTP (multi-token prediction) block is not run, and `mtp-*.gguf` files are not downloaded. Files with the block in the main GGUF load and skip it.
 
 On Linux or Windows with an NVIDIA GPU, build with CUDA (needs the [CUDA toolkit](https://developer.nvidia.com/cuda-toolkit)) and run the same commands:
 
