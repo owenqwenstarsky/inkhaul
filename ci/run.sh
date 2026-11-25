@@ -10,6 +10,9 @@
 # # with Metal support
 # GG_BUILD_METAL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
+# # with CUDA support
+# GG_BUILD_CUDA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
 # # with KLEIDIAI support
 # GG_BUILD_KLEIDIAI=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
@@ -48,6 +51,24 @@ if [ ! -z ${GG_BUILD_METAL} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=ON"
 else
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=OFF"
+fi
+
+if [ ! -z ${GG_BUILD_CUDA} ]; then
+    # TODO: Drop GGML_CUDA_CCCL_VERSION when CUDA CI uses CTK >= 13.5, which bundles CCCL >= 3.5.
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_CUDA=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3"
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '.')
+        if [[ -n "$CUDA_ARCH" && "$CUDA_ARCH" =~ ^[0-9]+$ ]]; then
+            CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"
+        else
+            echo "Warning: Using fallback CUDA architectures"
+            CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_CUDA_ARCHITECTURES=61;70;75;80;86;89"
+        fi
+    else
+        echo "Error: nvidia-smi not found, cannot build with CUDA"
+        exit 1
+    fi
 fi
 
 if [ ! -z ${GG_BUILD_NO_SVE} ]; then
@@ -135,6 +156,13 @@ function gg_run_test_llama_archs_tensor_split {
     cd ${SRC}
 
     set -e
+
+    if [ ! -z ${GG_BUILD_CUDA} ]; then
+        GGML_CUDA_DEVICES=1 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        GGML_CUDA_DEVICES=2 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        GGML_CUDA_DEVICES=3 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        GGML_CUDA_DEVICES=4 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+    fi
 
     if [ ! -z ${GG_BUILD_METAL} ]; then
         GGML_METAL_DEVICES=1 ./build-ci-release/bin/test-llama-archs -s 1 2>&1

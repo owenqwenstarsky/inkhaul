@@ -114,6 +114,10 @@ if (NOT GGML_LLAMAFILE_DEFAULT)
     set(GGML_LLAMAFILE_DEFAULT OFF)
 endif()
 
+if (NOT GGML_CUDA_GRAPHS_DEFAULT)
+    set(GGML_CUDA_GRAPHS_DEFAULT OFF)
+endif()
+
 # general
 option(GGML_STATIC "ggml: static link libraries"                     OFF)
 option(GGML_NATIVE "ggml: optimize the build for the current system" ${GGML_NATIVE_DEFAULT})
@@ -133,10 +137,38 @@ option(GGML_SANITIZE_THREAD    "ggml: enable thread sanitizer"    OFF)
 option(GGML_SANITIZE_ADDRESS   "ggml: enable address sanitizer"   OFF)
 option(GGML_SANITIZE_UNDEFINED "ggml: enable undefined sanitizer" OFF)
 
-# CPU (arm64 only)
+# instruction set specific
+if (GGML_NATIVE OR NOT GGML_NATIVE_DEFAULT)
+    set(INS_ENB OFF)
+else()
+    set(INS_ENB ON)
+endif()
+
+message(DEBUG "GGML_NATIVE         : ${GGML_NATIVE}")
+message(DEBUG "GGML_NATIVE_DEFAULT : ${GGML_NATIVE_DEFAULT}")
+message(DEBUG "INS_ENB             : ${INS_ENB}")
+
 option(GGML_CPU_HBM          "ggml: use memkind for CPU HBM" OFF)
 option(GGML_CPU_REPACK       "ggml: use runtime weight conversion of Q4_0 to Q4_X_X" ON)
 option(GGML_CPU_KLEIDIAI     "ggml: use KleidiAI optimized kernels if applicable" OFF)
+option(GGML_SSE42            "ggml: enable SSE 4.2"          ${INS_ENB})
+option(GGML_AVX              "ggml: enable AVX"              ${INS_ENB})
+option(GGML_AVX_VNNI         "ggml: enable AVX-VNNI"         OFF)
+option(GGML_AVX2             "ggml: enable AVX2"             ${INS_ENB})
+option(GGML_BMI2             "ggml: enable BMI2"             ${INS_ENB})
+option(GGML_AVX512           "ggml: enable AVX512F"          OFF)
+option(GGML_AVX512_VBMI      "ggml: enable AVX512-VBMI"      OFF)
+option(GGML_AVX512_VNNI      "ggml: enable AVX512-VNNI"      OFF)
+option(GGML_AVX512_BF16      "ggml: enable AVX512-BF16"      OFF)
+if (NOT MSVC)
+    # in MSVC F16C and FMA is implied with AVX2/AVX512
+    option(GGML_FMA          "ggml: enable FMA"              ${INS_ENB})
+    option(GGML_F16C         "ggml: enable F16C"             ${INS_ENB})
+    # MSVC does not seem to support AMX
+    option(GGML_AMX_TILE     "ggml: enable AMX-TILE"         OFF)
+    option(GGML_AMX_INT8     "ggml: enable AMX-INT8"         OFF)
+    option(GGML_AMX_BF16     "ggml: enable AMX-BF16"         OFF)
+endif()
 
 option(GGML_CPU_ALL_VARIANTS "ggml: build all variants of the CPU backend (requires GGML_BACKEND_DL)" OFF)
 set(GGML_CPU_ARM_ARCH        "" CACHE STRING "ggml: CPU architecture for ARM")
@@ -152,6 +184,22 @@ option(GGML_BLAS                            "ggml: use BLAS"                    
 set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
                                             "ggml: BLAS library vendor")
 option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
+
+option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
+set   (GGML_CUDA_CCCL_VERSION "" CACHE STRING "ggml: CCCL git tag to fetch, empty to use the version bundled with the installed CUDA Toolkit")
+option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
+option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
+option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
+option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
+option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
+option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;f8_e4m3-f8_e4m3" CACHE STRING
+                                            "ggml: FlashAttention K-V type combinations to compile, \"all\" or a list such as \"q8_0-q8_0;q8_0-q4_0\"")
+option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
+option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
+set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
+                                            "ggml: cuda link binary compression mode; requires cuda 12.8+")
+set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
 option(GGML_METAL_NDEBUG                    "ggml: disable Metal debugging"                   OFF)
@@ -218,6 +266,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-backend.h
     include/ggml-blas.h
     include/ggml-cpp.h
+    include/ggml-cuda.h
     include/ggml-opt.h
     include/ggml-metal.h
     include/gguf.h)
@@ -316,6 +365,25 @@ if (MSVC)
     configure_msvc_target(ggml-base)
     configure_msvc_target(ggml)
     configure_msvc_target(ggml-cpu)
+    configure_msvc_target(ggml-cpu-x64)
+    configure_msvc_target(ggml-cpu-sse42)
+    configure_msvc_target(ggml-cpu-sandybridge)
+    # __FMA__ and __F16C__ are not defined in MSVC, however they are implied with AVX2/AVX512
+    # skipping            ggml-cpu-ivybridge
+    # skipping            ggml-cpu-piledriver
+    configure_msvc_target(ggml-cpu-haswell)
+    configure_msvc_target(ggml-cpu-skylakex)
+    configure_msvc_target(ggml-cpu-cannonlake)
+    configure_msvc_target(ggml-cpu-cascadelake)
+    configure_msvc_target(ggml-cpu-icelake)
+    # MSVC 2022 doesn't support BF16 intrinsics without `/arch:AVX10.1` ?!
+    # https://learn.microsoft.com/en-us/cpp/intrinsics/x64-amd64-intrinsics-list?view=msvc-170
+    # https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64?view=msvc-170
+    # skipping            ggml-cpu-cooperlake
+    # skipping            ggml-cpu-zen4
+    configure_msvc_target(ggml-cpu-alderlake)
+    # MSVC doesn't support AMX
+    # skipping            ggml-cpu-sapphirerapids
 
     if (GGML_BUILD_EXAMPLES)
         configure_msvc_target(common-ggml)

@@ -1,6 +1,6 @@
 # CI
 
-`ci/run.sh` runs the heavy-duty CI (debug and release builds, `ctest`, `test-backend-ops` and the `test-llama-archs` tensor-split check) on an Apple Silicon Mac. It builds the CPU backend by default and can enable Metal, BLAS (Accelerate) and KleidiAI.
+`ci/run.sh` runs the heavy-duty CI (debug and release builds, `ctest`, `test-backend-ops` and the `test-llama-archs` tensor-split check) on an Apple Silicon Mac or an x86_64 Linux machine with an NVIDIA GPU. It builds the CPU backend by default and can enable Metal, CUDA, BLAS (Accelerate) and KleidiAI.
 
 It is a good practice, before publishing changes, to execute the full CI locally on your machine. For example:
 
@@ -12,6 +12,9 @@ bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
 # with Metal support
 GG_BUILD_METAL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+
+# with CUDA support (the GPU architecture is read from nvidia-smi)
+GG_BUILD_CUDA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
 # with BLAS support (Accelerate)
 GG_BUILD_BLAS=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt

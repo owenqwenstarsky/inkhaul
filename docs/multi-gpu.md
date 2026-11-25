@@ -27,7 +27,7 @@ Set with `--split-mode` / `-sm`.
 
 > The experimental `tensor` split mode (tensor parallelism through a "meta device") is removed from this fork. `LLAMA_SPLIT_MODE_TENSOR` stays in `llama.h`, but loading a model with it fails.
 
-> LongHaul turns pipeline parallelism off, and it needs all layers on the Metal GPU (see [longhaul.md](longhaul.md)).
+> LongHaul (Inkling 2 models) supports one GPU only: it needs all layers on one Metal or CUDA GPU and turns pipeline parallelism off. On a machine with several GPUs, select one with `-dev CUDA0` or `-sm none -mg N` (see [longhaul.md](longhaul.md)). The rest of this guide applies to models without experts on disk.
 
 ---
 

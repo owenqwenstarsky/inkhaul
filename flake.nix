@@ -13,7 +13,7 @@
 # Cf. https://jade.fyi/blog/flakes-arent-real/ for a more detailed exposition
 # of the relation between Nix and the Nix Flakes.
 {
-  description = "llama.cpp fork for Inkling 2 Mini on Apple Silicon (Metal, CPU, BLAS)";
+  description = "llama.cpp fork for Inkling 2 Mini on Apple Silicon (Metal) and NVIDIA GPUs (CUDA)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -44,6 +44,7 @@
       {
 
         imports = [
+          .devops/nix/nixpkgs-instances.nix
           .devops/nix/apps.nix
           .devops/nix/devshells.nix
         ];
@@ -71,15 +72,18 @@
           }
         );
 
-        # this fork targets Apple Silicon Macs only
+        # this fork targets Apple Silicon Macs and x86_64 Linux with CUDA
         systems = [
           "aarch64-darwin"
+          "x86_64-linux"
         ];
 
         perSystem =
           {
             config,
+            lib,
             pkgs,
+            pkgsCuda,
             ...
           }:
           {
@@ -96,14 +100,19 @@
             # the same path you would with an overlay.
             legacyPackages = {
               llamaPackages = pkgs.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
+              llamaPackagesCuda = pkgsCuda.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
             };
 
             # We don't use the overlay here so as to avoid making too many instances of nixpkgs,
             # cf. https://zimbatm.com/notes/1000-instances-of-nixpkgs
-            packages = {
-              default = config.legacyPackages.llamaPackages.llama-cpp;
-              python-scripts = config.legacyPackages.llamaPackages.python-scripts;
-            };
+            packages =
+              {
+                default = config.legacyPackages.llamaPackages.llama-cpp;
+                python-scripts = config.legacyPackages.llamaPackages.python-scripts;
+              }
+              // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+                cuda = config.legacyPackages.llamaPackagesCuda.llama-cpp;
+              };
 
             # Packages exposed in `.#checks` will be built by the CI and by
             # `nix flake check`.
