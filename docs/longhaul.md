@@ -19,7 +19,7 @@ LongHaul is always on for models with experts on disk. Only the cache size can b
 - Layers whose experts have the same types and shapes share one group of slots. When a file gives the experts of some layers other types (common in community quants), each layout is its own group. The budget is then split in two steps: first every group gets the slots for the largest ubatch `U` (`U * n_expert_used` slots, at most all its experts) that fits in half the budget, then the rest is split by the size of each group's experts. The startup log shows the slots of each group and `U`. A file with one layout gets the whole budget, as before. The smallest working cache is the one that gives every group `n_expert_used` slots; a smaller `-lhc` fails with an error that names it.
 - The shared experts of Qwen and Ling are small and stay in memory. The experts of a Qwen MTP block or a Ling MTP layer are not loaded, and the block is not run.
 - Prompt processing also reads through the cache. If the cache cannot hold the experts that one ubatch selects in a layer, `n_ubatch` is reduced at startup (logged as a warning). A larger cache gives larger ubatches and faster prompt processing.
-- A Metal or CUDA GPU is required, with all layers on it (the default `-ngl`). LongHaul supports one GPU: on a machine with several CUDA GPUs, select one with `-dev CUDA0` (or `-sm none -mg N`).
+- A Metal or CUDA GPU is required, with all layers on GPUs (the default `-ngl`). The layers can be split over several GPUs, or over several laptops with RPC (see [Several laptops](#several-laptops)): each device caches the experts of its own layers in its own memory.
 - `--fit` reduces the context size if needed, but it does not offload fewer layers or move experts to the CPU. If the model does not fit, use a smaller `-lhc` or context.
 
 The budget covers the expert cache only. The resident weights, the KV cache, the compute buffers and the staging buffers (32 MiB) come on top.
@@ -27,6 +27,40 @@ The budget covers the expert cache only. The resident weights, the KV cache, the
 ## CUDA
 
 On a discrete GPU the expert cache, the resident weights and the KV cache are in VRAM; the experts on disk use no RAM. A GPU with enough VRAM can hold every expert: set `-lhc` to the size of the experts (about 16 GiB for Mini Q4_K) and after the first reads every expert is a hit. Below that, the hit rate and the SSD speed set the generation speed as on a Mac.
+
+## Several laptops
+
+The layers of one model can run on several Macs connected with Thunderbolt cables. The main laptop runs `llama-cli` or `llama-server` with `--rpc`. Each other laptop runs `ggml-rpc-server` (see [tools/rpc](../tools/rpc/README.md#this-fork-several-macs-over-thunderbolt) for the cable and network setup). All laptops must run a build of the same commit.
+
+- Each device (the GPU of a laptop) holds a contiguous slice of the layers and caches the experts of those layers in its own memory, so the memory of all laptops caches experts.
+- `-lhc` is the total for all devices. It is split across the devices like the layers: by `-ts` if given, otherwise by free memory. There is no per-device size.
+- The RPC devices come first and the main laptop's GPU last, so the output layer and sampling run on the main laptop.
+- In `inkling2_loop` models `-ngl` and `-ts` count the layers that hold weights (25 for Mini: 24 layers and the output), not the 49 layer passes. Each pass of the loop core runs on the device that holds its layer, so a token crosses the link several times (6 times for Mini on two laptops with an even split).
+- Pipeline parallelism stays off: the cache needs the experts that a layer selects before the layer runs.
+- A remote MoE layer costs about one round trip on the link even when every expert hits: the main laptop reads the selected expert ids before it fills the cache.
+
+A miss of a remote layer is read in one of two ways:
+
+- **By the remote laptop**, when its `ggml-rpc-server` was started with `--model-dir DIR` and DIR holds the same GGUF file (the same size, the same first 4 MiB and the same 64 blocks of 4 KiB at evenly spaced offsets). Only activations, expert ids and slot maps cross the link. The startup log of the cache ends with `read by the server`.
+- **By the main laptop**, which reads the experts from its own file and sends them over the link. This needs no setup on the remote laptop, but the link is likely slower than the SSD. The main laptop logs `RPC0[...] has no copy of <file> (see ggml-rpc-server --model-dir), the experts are sent from this host`.
+
+The file check is not a full hash: two files that differ only outside the sampled blocks would give wrong output. Copy the GGUF file to the other laptops as is, do not re-quantize it there.
+
+Keep a draft model (`-md`) on the main laptop with `-devd MTL0`: a draft on a remote laptop would pay a round trip for every draft token.
+
+```sh
+# on the remote laptop
+ggml-rpc-server -H 10.0.0.2 -p 50052 --model-dir ~/models
+
+# on the main laptop
+llama-cli -m ~/models/Inkling-2-Mini-AD-Q4_K.gguf --rpc 10.0.0.2:50052 -lhc 16G
+```
+
+### Inkling 2 Mini on two laptops
+
+With an even split, the remote laptop (first) holds layers 0-11 and the main laptop holds layers 12-23 and the output. A token runs the prefix 0-5 and the core 6-11 on the remote laptop, the core 12-17 on the main laptop, then passes 2 and 3 go remote, main, remote, main, then the suffix 18-23 runs on the main laptop. Each laptop runs 24 of the 48 layer passes.
+
+The experts of Mini Q4_K are about 15.5 GB, so `-lhc 16G` split over two laptops (about 8 GiB each) holds every expert: after the first reads no expert is read from disk, and the round trips on the link set the speed. With a smaller cache each laptop reads about half of the misses. These numbers are computed from the model card, not measured: measure the speed of your own link and SSDs.
 
 ## Sizing for Inkling 2 Mini
 
@@ -98,13 +132,13 @@ To give every expert one type, quantize from a BF16 or F16 GGUF with `llama-quan
 At exit the cache logs one line per batch class:
 
 ```
-llama_moe_cache: ubatch <= 8: hits = ..., misses = ..., hit rate = ...%, read = ... MiB in ... s (... MiB/s)
+llama_moe_cache: ubatch <= 8: hits = ..., misses = ..., hit rate = ...%, read = ... MiB, local ... MiB in ... s (... MiB/s)
 ```
 
-The time and speed are for the disk reads only. If the read time is most of the run time, a larger cache helps. To compare I/O thread counts, run `llama-bench` with `LLAMA_LONGHAUL_IO_THREADS` set to 1, 2, 4 and 8 and compare the MiB/s.
+`read` counts all misses, `local` the ones this host read from its own file (all of them without RPC servers that read for themselves). The time and speed are for the local reads only. If the read time is most of the run time, a larger cache helps. To compare I/O thread counts, run `llama-bench` with `LLAMA_LONGHAUL_IO_THREADS` set to 1, 2, 4 and 8 and compare the MiB/s.
 
 `LLAMA_MOE_CACHE_TRACE=<file>` writes the selected experts of each lookup to a file, to replay the routing offline with other cache sizes.
 
 ## Tests
 
-`LLAMA_LONGHAUL_RESIDENT=1` with a cache size of 0 keeps the experts in the mapped file without a RAM bound. It exists for tests that compare against the old behavior. `test-llama-archs` checks LongHaul against the same file with its experts in the mapped file, or against the model in memory, for caches from 2 slots to all experts. For `qwen35moe` it also checks files with separate gate and up experts, with two expert groups, and with an MTP block. For `bailingmoe3` it checks files with several expert layouts, split files and a file with an MTP layer.
+`LLAMA_LONGHAUL_RESIDENT=1` with a cache size of 0 keeps the experts in the mapped file without a RAM bound. It exists for tests that compare against the old behavior. `test-llama-archs` checks LongHaul against the same file with its experts in the mapped file, or against the model in memory, for caches from 2 slots to all experts. For `qwen35moe` it also checks files with separate gate and up experts, with two expert groups, and with an MTP block. For `bailingmoe3` it checks files with several expert layouts, split files and a file with an MTP layer. With `GGML_METAL_DEVICES=2` (two emulated Metal devices) it also checks every LongHaul arch with its layers split over the two devices. `test-llama-archs --rpc` (CTest label `rpc`) starts an RPC server on a thread of the test, on `127.0.0.1` only, and checks the experts read by the server and the experts sent from the client against the local GPU.

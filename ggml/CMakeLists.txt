@@ -96,10 +96,12 @@ if (APPLE)
     set(GGML_METAL_DEFAULT ON)
     set(GGML_BLAS_DEFAULT ON)
     set(GGML_BLAS_VENDOR_DEFAULT "Apple")
+    set(GGML_RPC_DEFAULT ON)
 else()
     set(GGML_METAL_DEFAULT OFF)
     set(GGML_BLAS_DEFAULT OFF)
     set(GGML_BLAS_VENDOR_DEFAULT "Generic")
+    set(GGML_RPC_DEFAULT OFF)
 endif()
 
 if (CMAKE_CROSSCOMPILING OR DEFINED ENV{SOURCE_DATE_EPOCH})
@@ -212,6 +214,7 @@ set   (GGML_METAL_TARGET_OS "macos" CACHE STRING
                                             "ggml: metal -mtargetos OS name (macos, ios, xros, tvos)")
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_OPENMP_FETCH                    "ggml: fetch LLVM OpenMP"                         OFF)
+option(GGML_RPC                             "ggml: use RPC"                                   ${GGML_RPC_DEFAULT})
 
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
@@ -269,6 +272,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cuda.h
     include/ggml-opt.h
     include/ggml-metal.h
+    include/ggml-rpc.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")

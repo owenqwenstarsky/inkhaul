@@ -7,8 +7,10 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
+#include "ggml-rpc.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -16,12 +18,15 @@
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <random>
 #include <regex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -182,6 +187,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
+    LOG("  --rpc                    Check LongHaul over an RPC server on a thread of this process (127.0.0.1)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -498,7 +504,7 @@ static llama_model_ptr get_model(
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr,
-        const std::vector<std::string> & splits = {}) {
+        const std::vector<std::string> & splits = {}, const float * tensor_split = nullptr) {
     GGML_ASSERT((gguf_ctx != nullptr) + (file != nullptr) + !splits.empty() == 1);
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -507,6 +513,7 @@ static llama_model_ptr get_model(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    model_params.tensor_split = tensor_split;
 
     tensor_data_params tensor_params = { seed, stdev };
     std::vector<const char *> split_paths;
@@ -528,8 +535,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t longhaul_cache_size = 0,
-        const std::vector<std::string> & splits = {}) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, splits);
+        const std::vector<std::string> & splits = {}, const float * tensor_split = nullptr) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, splits, tensor_split);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -1254,6 +1261,66 @@ static ggml_backend_dev_t get_gpu(const char * name, ggml_backend_dev_t skip) {
     return nullptr;
 }
 
+// LongHaul with the layers split over two GPUs: each GPU caches the experts of its layers in its own banks
+// size_dev is the budget that the GPU with the smallest share of a split gets, the logits must match the reference
+// a small model can have all its layers on one GPU in some splits, but at least one split must use both
+static bool test_longhaul_two_gpus(const std::string & label, const std::string & path, const size_t seed, const float stdev,
+        ggml_backend_dev_t gpu, ggml_backend_dev_t gpu2, const size_t size_dev,
+        const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref) {
+    struct split_case {
+        const char * name;
+        float        ts[2];
+        size_t       size;
+    };
+    const split_case cases[] = {
+        { "even split",           { 1.0f, 1.0f }, 2*size_dev       },
+        { "split 1/3",            { 1.0f, 3.0f }, 4*size_dev       },
+        { "even split, 512 MiB",  { 1.0f, 1.0f }, 512ull*1024*1024 },
+    };
+    bool all_ok = true;
+    bool spanned = false;
+    for (const split_case & sc : cases) {
+        FILE * file = fopen(path.c_str(), "rb");
+        GGML_ASSERT(file != nullptr);
+        bool ok = true;
+        std::string detail;
+        try {
+            auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu, gpu2 }, LLAMA_SPLIT_MODE_LAYER, nullptr, sc.size, {}, sc.ts);
+            const llama_model * model = model_and_ctx.first.get();
+
+            // both GPUs hold layers, and a slot that aliases another layer is on the GPU of that layer
+            int n_dev[2] = { 0, 0 };
+            for (int32_t il = 0; il < llama_model_n_layer(model); il++) {
+                ggml_backend_dev_t dev = llama_model_dev_layer(model, il);
+                n_dev[dev == gpu2]++;
+                if (dev != llama_model_dev_layer(model, llama_model_layer_phys(model, il))) {
+                    ok = false;
+                    detail = "layer " + std::to_string(il) + " is not on the device of its weights";
+                }
+            }
+            spanned = spanned || (n_dev[0] > 0 && n_dev[1] > 0);
+            detail += (detail.empty() ? "" : ", ") + std::string("layers ") + std::to_string(n_dev[0]) + "/" + std::to_string(n_dev[1]);
+
+            const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+            const double nmse_val = nmse(logits_ref, logits);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+            detail += detail.empty() ? buf : std::string(", ") + buf;
+            ok = ok && nmse_val <= 1e-4;
+        } catch (const std::exception & err) {
+            ok = false;
+            detail = err.what();
+        }
+        fclose(file);
+        LOG("LongHaul %s, two GPUs, %s: %s (%s)\n", label.c_str(), sc.name, ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    }
+    if (!spanned) {
+        LOG("LongHaul %s, two GPUs: FAIL (no split puts layers on both GPUs)\n", label.c_str());
+    }
+    return all_ok && spanned;
+}
+
 // a file for the LongHaul test, rewritten from the file saved from the in-memory model
 struct longhaul_variant {
     const char * name;
@@ -1343,7 +1410,7 @@ static void write_longhaul_variant(const std::string & src, const std::string & 
 // the logits must match the same file with its experts in the mapped file, for caches from the smallest (evictions in every layer) to one that holds all experts
 static int test_longhaul(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
     ggml_backend_dev_t gpu  = get_gpu(target_backend, nullptr);
-    // a second GPU, for the error of a cache on two GPUs (GGML_CUDA_DEVICES=2 or GGML_METAL_DEVICES=2 emulate one)
+    // a second GPU, for the layers split over two GPUs (GGML_CUDA_DEVICES=2 or GGML_METAL_DEVICES=2 emulate one)
     ggml_backend_dev_t gpu2 = get_gpu(nullptr, gpu);
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
@@ -1522,6 +1589,10 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
                 all_ok = all_ok && ok;
             }
 
+            if (gpu2 != nullptr) {
+                all_ok = test_longhaul_two_gpus(label, path, seed, stdev, gpu, gpu2, cache_size(5), tokens, logits_ref) && all_ok;
+            }
+
             // a cache that cannot hold the experts of one token, no cache without the test hook, and no GPU are errors
             if (&v == &av.variants.front() && type_exps == GGML_TYPE_COUNT) {
                 struct error_case {
@@ -1534,9 +1605,6 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
                     { "no cache",        0,                    { gpu } },
                     { "no GPU",          cache_size(n_expert), {} },
                 };
-                if (gpu2 != nullptr) {
-                    errors.push_back({ "two GPUs", cache_size(n_expert), { gpu, gpu2 } });
-                }
                 set_longhaul_resident(false);
                 for (const error_case & ec : errors) {
                     FILE * file = fopen(path.c_str(), "rb");
@@ -1830,6 +1898,10 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
             all_ok = all_ok && ok;
         }
 
+        if (gpu2 != nullptr) {
+            all_ok = test_longhaul_two_gpus(name, path, seed, stdev, gpu, gpu2, v.mixed ? reserve(2) : cache_size(5), tokens, logits_ref) && all_ok;
+        }
+
         if (v.mixed) {
             // below the reserve of one token, the error names the smallest cache
             std::string log;
@@ -1882,7 +1954,7 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
             all_ok = all_ok && ok;
         }
 
-        // a cache that cannot hold the experts of one token, no cache without the test hook, no GPU and two GPUs are errors
+        // a cache that cannot hold the experts of one token, no cache without the test hook and no GPU are errors
         struct error_case {
             const char *                    name;
             size_t                          size;
@@ -1893,9 +1965,6 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
             { "no cache",        0,                             { gpu } },
             { "no GPU",          cache_size(n_expert),          {} },
         };
-        if (gpu2 != nullptr) {
-            errors.push_back({ "two GPUs", cache_size(n_expert), { gpu, gpu2 } });
-        }
         set_longhaul_resident(false);
         for (const error_case & ec : errors) {
             FILE * file = fopen(path.c_str(), "rb");
@@ -1914,6 +1983,176 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
 
         std::filesystem::remove(path);
     }
+    return all_ok ? 0 : 1;
+}
+
+// LongHaul over RPC: an RPC server on a thread of this process (127.0.0.1 only) exposes the GPU
+// a file the server has a copy of is read by the server, a file whose copy differs is sent from the client; the logits must match either way
+static int test_longhaul_rpc(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    ggml_backend_dev_t gpu = get_gpu(target_backend, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    if (gpu == nullptr || reg == nullptr) {
+        LOG("LongHaul RPC: SKIP (%s)\n", gpu == nullptr ? "no GPU" : "no RPC backend");
+        return 0;
+    }
+    auto start_server_fn  = (decltype(ggml_backend_rpc_start_server) *)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    auto set_model_dir_fn = (decltype(ggml_backend_rpc_server_set_model_dir) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_server_set_model_dir");
+    auto add_server_fn    = (decltype(ggml_backend_rpc_add_server) *)           ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_add_server");
+    GGML_ASSERT(start_server_fn && set_model_dir_fn && add_server_fn);
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    const uint32_t n_expert      = 16;
+    const uint32_t n_expert_used = 2;
+    const longhaul_variant base  = { "", false, false, false };
+
+    std::random_device rd;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("test-llama-archs-rpc-" + std::to_string(rd()));
+    const std::filesystem::path dir_client = dir / "client";
+    const std::filesystem::path dir_server = dir / "server";
+    std::filesystem::create_directories(dir_client);
+    std::filesystem::create_directories(dir_server);
+
+    // per arch: file "a" with an exact copy on the server, file "b" (another name in the metadata) whose server copy has one changed byte
+    // the weights come from a pool keyed on the tensor names, so both files have the same weights
+    struct rpc_file {
+        llm_arch    arch;
+        std::string path;
+        bool        server_copy; // the server has the same file
+    };
+    std::vector<rpc_file> files;
+    for (const llm_arch arch : { LLM_ARCH_INKLING2, LLM_ARCH_INKLING2_LOOP }) {
+        if (!arch_matches(arch_filter, arch)) {
+            continue;
+        }
+        // "b" first: the logits read by the server must match the logits sent from the client bit for bit
+        for (const bool server_copy : { false, true }) {
+            const std::string name = std::string(llama_arch_name(arch)) + (server_copy ? "-a" : "-b") + ".gguf";
+            const std::string path = (dir_client / name).string();
+
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true, 0);
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_COUNT).c_str(), n_expert);
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_USED_COUNT).c_str(), n_expert_used);
+            gguf_set_val_str(gguf_ctx.get(), "general.name", name.c_str());
+            const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT).c_str()));
+            const std::string path_saved = get_tmp_gguf_path();
+            {
+                llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+                llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path_saved.c_str());
+            }
+            write_longhaul_variant(path_saved, path, arch, base, n_layer);
+            std::filesystem::remove(path_saved);
+
+            const std::filesystem::path path_server = dir_server / name;
+            std::filesystem::copy_file(path, path_server);
+            if (!server_copy) {
+                // the last byte is in a block of the fingerprint
+                std::fstream f(path_server, std::ios::binary | std::ios::in | std::ios::out);
+                f.seekg(-1, std::ios::end);
+                const char c = (char) (f.get() ^ 0xff);
+                f.seekp(-1, std::ios::end);
+                f.put(c);
+            }
+            files.push_back({ arch, path, server_copy });
+        }
+    }
+    if (files.empty()) {
+        std::filesystem::remove_all(dir);
+        return 0;
+    }
+
+    GGML_ASSERT(set_model_dir_fn(dir_server.string().c_str(), 2) == files.size());
+    const std::string endpoint = "127.0.0.1:" + std::to_string(40000 + rd() % 20000);
+    std::thread([start_server_fn, endpoint, gpu]() mutable {
+        start_server_fn(endpoint.c_str(), nullptr, 4, 1, &gpu);
+    }).detach();
+    ggml_backend_reg_t reg_server = nullptr;
+    for (int i = 0; i < 400 && reg_server == nullptr; i++) {
+        reg_server = add_server_fn(endpoint.c_str());
+        if (reg_server == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    if (reg_server == nullptr) {
+        LOG("LongHaul RPC: FAIL (the RPC server on %s did not start)\n", endpoint.c_str());
+        std::filesystem::remove_all(dir);
+        return 1;
+    }
+    ggml_backend_dev_t rpc = ggml_backend_reg_dev_get(reg_server, 0);
+
+    bool all_ok = true;
+    std::map<std::pair<llm_arch, size_t>, std::vector<float>> logits_sent;
+    for (const rpc_file & rf : files) {
+        const std::string label = std::string(llama_arch_name(rf.arch)) + (rf.server_copy ? ", server copy" : ", changed server copy");
+
+        // the reference: the experts in the mapped file, on the local GPU
+        std::vector<float> logits_ref;
+        {
+            FILE * file = fopen(rf.path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu });
+            logits_ref = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+            fclose(file);
+        }
+
+        uint32_t n_expert_file = 0;
+        const std::vector<expert_group> groups = get_expert_groups(rf.path, rf.arch, n_expert_file);
+        const size_t alignment = std::max(ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(rpc)), ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(gpu)));
+        const size_t size_5 = get_cache_size(groups, n_expert, n_expert_used, alignment, 5);
+
+        struct rpc_case {
+            const char *                    name;
+            std::vector<ggml_backend_dev_t> devs;
+            std::vector<float>              ts;
+            size_t                          size;
+        };
+        const rpc_case cases[] = {
+            { "RPC, 5 slots",            { rpc },      {},           size_5           },
+            { "RPC, 512 MiB",            { rpc },      {},           512ull*1024*1024 },
+            { "RPC + GPU 1/3, 5 slots",  { rpc, gpu }, { 1.0f, 3.0f }, 4*size_5       },
+        };
+        for (size_t ic = 0; ic < sizeof(cases)/sizeof(cases[0]); ic++) {
+            const rpc_case & rc = cases[ic];
+            std::string log;
+            ggml_log_callback log_cb;
+            void * log_ud;
+            llama_log_get(&log_cb, &log_ud);
+            llama_log_set([](ggml_log_level, const char * text, void * ud) { ((std::string *) ud)->append(text); }, &log);
+            bool ok = true;
+            std::string detail;
+            try {
+                auto model_and_ctx = get_model_and_ctx(nullptr, nullptr, seed, stdev, rc.devs, LLAMA_SPLIT_MODE_LAYER, nullptr, rc.size,
+                    { rf.path }, rc.ts.empty() ? nullptr : rc.ts.data());
+                const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                const double nmse_val = nmse(logits_ref, logits);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail = buf;
+                ok = nmse_val <= 1e-4;
+                if (!rf.server_copy) {
+                    logits_sent[{ rf.arch, ic }] = logits;
+                } else if (logits != logits_sent[{ rf.arch, ic }]) {
+                    ok = false;
+                    detail += ", differs from the experts sent from the client";
+                }
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            llama_log_set(log_cb, log_ud);
+
+            // the server reads the experts only from an exact copy
+            const bool read_by_server = log.find("read by the server") != std::string::npos;
+            const bool sent           = log.find("has no copy of") != std::string::npos;
+            if (read_by_server != rf.server_copy || sent == rf.server_copy) {
+                ok = false;
+                detail += rf.server_copy ? ", not read by the server" : ", not sent from the client";
+            }
+            LOG("LongHaul %s, %s: %s (%s)\n", label.c_str(), rc.name, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+    }
+
+    std::filesystem::remove_all(dir);
     return all_ok ? 0 : 1;
 }
 
@@ -2253,6 +2492,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool kv_shift = false;
+    bool rpc      = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2322,6 +2562,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--kv-shift") == 0) {
             kv_shift = true;
+        } else if (strcmp(argv[i], "--rpc") == 0) {
+            rpc = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2342,6 +2584,9 @@ int main(int argc, char ** argv) {
         }
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
+        }
+        if (rpc) {
+            return test_longhaul_rpc(arch_filter, seed, stdev, target_backend);
         }
         int ret = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
         ret = test_rope_type(arch_filter, seed, stdev) != 0 ? 1 : ret;

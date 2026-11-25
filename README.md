@@ -5,7 +5,7 @@
 > LongHaul keeps the MoE experts on disk and holds the recently used ones in a fixed-size GPU memory cache, so the model runs with less memory than the model file needs.
 > Set the cache size with `-lhc, --longhaul-cache` (default: `512M`). See [docs/longhaul.md](docs/longhaul.md) for how it works and how to size the cache.
 >
-> Other model architectures and the backends other than Metal, CUDA, CPU and BLAS (Accelerate) are removed. LongHaul uses one GPU.
+> Other model architectures and the backends other than Metal, CUDA, CPU, BLAS (Accelerate) and RPC are removed. LongHaul can split a model over several GPUs, or over several Macs connected with Thunderbolt cables (see [docs/longhaul.md](docs/longhaul.md#several-laptops)).
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
@@ -64,6 +64,7 @@ A larger cache gives faster generation and prompt processing; with enough VRAM, 
 - [quantize](tools/quantize/README.md)
 - [perplexity](tools/perplexity/README.md)
 - [llama-bench](tools/llama-bench/README.md)
+- [rpc](tools/rpc/README.md)
 - [gguf-py](gguf-py/README.md)
 - [GBNF grammars](grammars/README.md)
 

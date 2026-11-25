@@ -201,6 +201,11 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
 endif()
 
+# LongHaul over an RPC server on a thread of the test (127.0.0.1 only)
+if (GGML_RPC)
+    llama_test(test-llama-archs NAME test-llama-archs-rpc LABEL rpc ARGS --rpc -s 1)
+endif()
+
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
 file(MAKE_DIRECTORY "${MODEL_DIR}")
 

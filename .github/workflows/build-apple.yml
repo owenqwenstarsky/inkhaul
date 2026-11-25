@@ -22,7 +22,9 @@ on:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-apple.yml',
-      'ggml/src/ggml-metal/**'
+      'ggml/src/ggml-metal/**',
+      'ggml/src/ggml-rpc/**',
+      'tools/rpc/**'
     ]
 
 cache-mode: none
@@ -98,4 +100,6 @@ jobs:
           # ref: https://github.com/ggml-org/llama.cpp/pull/19802#issuecomment-4013704023
           # test-thread-safety: LongHaul needs MUL_MAT_ID on the GPU, the Paravirtual device has no simdgroup reduction
           ctest -L main -E "test-llama-archs|test-llama-context|test-speculative-rejection-sampling|test-thread-safety" --verbose --timeout 900
+          # test-llama-archs-rpc: LongHaul on the Paravirtual device, as above
+          ctest -L rpc -E "test-llama-archs-rpc" --verbose --timeout 900
 

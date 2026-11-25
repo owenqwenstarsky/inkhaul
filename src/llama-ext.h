@@ -31,8 +31,12 @@ LLAMA_API std::string llama_arch_kv_name(llm_arch arch, llm_kv key);
 
 LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
 
-// true if the model keeps its experts on disk (LongHaul), then all its layers must be on one GPU
+// true if the model keeps its experts on disk (LongHaul), then all its layers must be on the GPUs
 LLAMA_API bool llama_model_has_longhaul(const struct llama_model * model);
+
+// number of layers that hold weights, the unit of n_gpu_layers and tensor_split
+// smaller than llama_model_n_layer() for looped architectures whose extra cache slots alias other layers
+LLAMA_API int32_t llama_model_n_layer_offload(const struct llama_model * model);
 
 // FIXME temporary function for better error messages
 LLAMA_API bool llama_arch_supports_save(llm_arch arch);
@@ -119,6 +123,10 @@ LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+
+// for tests: the device of cache slot il, and the layer whose weights it uses
+LLAMA_API ggml_backend_dev_t llama_model_dev_layer (const struct llama_model * model, int32_t il);
+LLAMA_API int32_t            llama_model_layer_phys(const struct llama_model * model, int32_t il);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
