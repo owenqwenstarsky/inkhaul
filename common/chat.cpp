@@ -1046,6 +1046,14 @@ static json common_chat_extra_context() {
 
 // Pick the dedicated handler for a template from its source, or null for the autoparser.
 static common_chat_params_init_fn common_chat_template_detect_params_init(const std::string & src) {
+    // Ling 3.0 / Bailing V3 - <role>X</role> sections with <arg_key>/<arg_value> tagged
+    // tool calls. <role> sections are unique to this family among the tagged-arg templates.
+    if (src.find("<role>ASSISTANT</role>") != std::string::npos &&
+        src.find("<arg_key>") != std::string::npos) {
+        LOG_DBG("Using specialized template: Ling 3.0 (Bailing V3)\n");
+        return common_chat_params_init_ling3;
+    }
+
     // Inkling 1 and 2
     if (is_inkling_template(src)) {
         LOG_DBG("Using specialized template: Inkling\n");

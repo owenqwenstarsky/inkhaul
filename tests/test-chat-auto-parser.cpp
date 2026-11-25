@@ -2525,9 +2525,8 @@ static void test_role_markers_all_templates(testing & t) {
     }
 }
 
-static void test_bailing_v3_tool_format(testing & t) {
-    const std::string template_source = R"JINJA(
-{# Bailing V3 chat template #}
+static void test_bailing_v3_tool_format_header(testing & t, const std::string & header) {
+    const std::string template_source = "\n{# " + header + " #}" + R"JINJA(
 {%- if tools %}{{ tools | tojson }}{%- endif %}
 {%- for message in messages %}
     {%- if message.role == "user" %}
@@ -2585,6 +2584,13 @@ static void test_bailing_v3_tool_format(testing & t) {
         "</tool_call>";
     common_peg_parse_context ctx(output, COMMON_PEG_PARSE_FLAG_LENIENT);
     t.assert_true("multi-argument tool call", parser.parse(ctx).success());
+}
+
+static void test_bailing_v3_tool_format(testing & t) {
+    // Ling 3.0 and Ling 3.2 template headers
+    for (const std::string header : { "Bailing V3 chat template", "Bailing V3 unified chat template" }) {
+        t.test(header, [&](testing & t) { test_bailing_v3_tool_format_header(t, header); });
+    }
 }
 
 // Test that reproduces the Seed-OSS template issue with embedded quotes

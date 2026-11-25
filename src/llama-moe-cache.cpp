@@ -380,6 +380,7 @@ struct llama_moe_cache::impl {
         ggml_backend_buffer_type_t buft;
         size_t host_bytes = 0; // experts on disk of the layers it caches
         double split = 0.0;    // share of the budget
+        int32_t n_ubatch_reserved = 0; // tokens per ubatch that every group can hold before the rest is shared
 
         // banks and their views
         ggml_context_ptr ctx;
@@ -568,7 +569,6 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         if (const char * path = getenv("LLAMA_MOE_CACHE_TRACE"); path != nullptr && *path != '\0') {
             trace = fopen(path, "wb");
             if (trace == nullptr) {
@@ -578,26 +578,72 @@ struct llama_moe_cache::impl {
         }
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
-        size_t min_size = 0; // smallest budget that gives every group n_expert_used slots
-        for (group & g : groups) {
-            const device & d = devices[g.id];
-            const int32_t n_expert  = g.ref[0]->ne[2];
-            const double  share     = d.split/split_sum*g.host_bytes/d.host_bytes;
-            const size_t  budget    = (size_t) ((double) size*share);
-            const int32_t max_slots = g.n_owners*n_expert;
-            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
-                g.n_slots++;
+
+        // within a device, every group first gets the slots of the same ubatch: the slots are reused layer by layer, so the
+        // need of a group does not depend on its layer count, and it stops at the experts of one layer (see max_ubatch).
+        // The largest ubatch that fits in half of the budget is reserved, the rest is split by the size of the experts, so
+        // each group caches the same fraction of its experts on top. With one group the whole budget goes to it either way.
+        auto max_slots = [&](const group & g) {
+            return g.n_owners*(int32_t) g.ref[0]->ne[2];
+        };
+        auto reserved_slots = [&](const group & g, int32_t n_ubatch) {
+            return (int32_t) std::min<int64_t>((int64_t) n_ubatch*n_expert_used, g.ref[0]->ne[2]);
+        };
+        auto reserve = [&](int32_t id, int32_t n_ubatch) {
+            size_t res = 0;
+            for (const group & g : groups) {
+                if (g.id == id) {
+                    res += alloc_size(g, reserved_slots(g, n_ubatch));
+                }
             }
-            min_size = std::max(min_size, (size_t) std::ceil(alloc_size(g, n_expert_used)/share));
-            g.lru.init(model.layers.size(), n_expert, std::max(g.n_slots, 1));
+            return res;
+        };
+        size_t min_size = 0; // smallest budget that gives every group n_expert_used slots
+        bool too_small = false;
+        for (size_t id = 0; id < devices.size(); ++id) {
+            device & d = devices[id];
+            if (d.host_bytes == 0) {
+                continue;
+            }
+            const double dev_share = d.split/split_sum;
+            const size_t dev_size  = (size_t) ((double) size*dev_share);
+
+            const size_t reserve_min = reserve(id, 1);
+            min_size  = std::max(min_size, (size_t) std::ceil(reserve_min/dev_share));
+            too_small = too_small || reserve_min > dev_size;
+
+            // the reserve stops growing once every group holds the experts of one layer
+            int32_t n_max = 1;
+            for (const group & g : groups) {
+                if (g.id == (int32_t) id) {
+                    n_max = std::max(n_max, (int32_t) ((g.ref[0]->ne[2] + n_expert_used - 1)/n_expert_used));
+                }
+            }
+            d.n_ubatch_reserved = 1;
+            while (d.n_ubatch_reserved < n_max && reserve(id, d.n_ubatch_reserved + 1) <= dev_size/2) {
+                d.n_ubatch_reserved++;
+            }
+
+            const size_t rest = dev_size - std::min(dev_size, reserve(id, d.n_ubatch_reserved));
+            for (group & g : groups) {
+                if (g.id != (int32_t) id) {
+                    continue;
+                }
+                g.n_slots = reserved_slots(g, d.n_ubatch_reserved);
+                const size_t budget = alloc_size(g, g.n_slots) + (size_t) ((double) rest*g.host_bytes/d.host_bytes);
+                while (g.n_slots < max_slots(g) && alloc_size(g, g.n_slots + 1) <= budget) {
+                    g.n_slots++;
+                }
+            }
+        }
+        if (too_small) {
+            throw std::runtime_error(format("the LongHaul cache of %.0f MiB is too small to hold the experts of one token, use at least %.0f MiB",
+                size/1024.0/1024.0, std::ceil(min_size/1024.0/1024.0)));
+        }
+        for (group & g : groups) {
+            g.lru.init(model.layers.size(), g.ref[0]->ne[2], std::max(g.n_slots, 1));
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size();
-        }
-        for (const group & g : groups) {
-            if (g.n_slots < n_expert_used) {
-                throw std::runtime_error(format("the LongHaul cache of %.0f MiB is too small to hold the experts of one token, use at least %.0f MiB",
-                    size/1024.0/1024.0, std::ceil(min_size/1024.0/1024.0)));
-            }
         }
 
         auto init_ctx = [](size_t n_tensors) {
@@ -719,8 +765,8 @@ struct llama_moe_cache::impl {
             if (d.host_bytes == 0) {
                 continue;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: %10s LongHaul cache size = %8.2f MiB for %.2f MiB of experts on disk, %d I/O threads\n",
-                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, io_pool ? io_pool->n_threads() : 0);
+            LLAMA_LOG_INFO("llama_moe_cache: %10s LongHaul cache size = %8.2f MiB for %.2f MiB of experts on disk, %d I/O threads, %d tokens reserved per group\n",
+                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, io_pool ? io_pool->n_threads() : 0, d.n_ubatch_reserved);
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("llama_moe_cache: %2zu layers (%d with own experts), %s: %5d slots (%.1f%%, %.1f tokens worth)\n",
@@ -947,11 +993,8 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
         }
     }
 
-    ggml_tensor * ids = selected_experts;
-    if (!ggml_is_contiguous(ids)) {
-        ids = ggml_cont(ctx0, ids);
-    }
-    ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+    // always a copy: the top-k view is contiguous for 1 token only, and the graph topology must not depend on the ubatch size
+    ggml_tensor * ids = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), ggml_nelements(selected_experts));
 
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
     // the callback reads the selected experts, reads the missing ones from disk and updates the slot map

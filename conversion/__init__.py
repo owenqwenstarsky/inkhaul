@@ -15,6 +15,8 @@ __all__ = [
 
 
 TEXT_MODEL_MAP: dict[str, str] = {
+    "BailingMoeV3ForCausalLM": "bailingmoe3",
+    "BailingMoeV3VLForConditionalGeneration": "bailingmoe3",
     "DSparkDraftModel": "dspark",
     "DSparkSpeculator": "dspark",
     "Inkling2ForCausalLM": "inkling2",

@@ -2,7 +2,7 @@
 
 > [!NOTE]
 >
-> This fork keeps only the Inkling 2 architectures (`inkling2`, `inkling2_loop`), the DSpark draft model (`dflash`), the `clip` stub for mmproj files and the `inkling2v` vision encoder.
+> This fork keeps only the Inkling 2 architectures (`inkling2`, `inkling2_loop`), the Ling 3 architecture (`bailingmoe3`, text only, used by Ling-3.2-air), the DSpark draft model (`dflash`), the `clip` stub for mmproj files and the `inkling2v` vision encoder.
 > The steps below describe where an architecture lives in the code. Use the Inkling 2 files as the reference: `conversion/inkling2.py`, `src/models/inkling2.cpp`, `src/models/inkling2-loop.cpp` and `tools/mtmd/models/inkling2v.cpp`.
 
 Adding a model requires few steps:

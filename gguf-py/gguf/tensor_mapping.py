@@ -584,6 +584,10 @@ class TensorNameMap:
             "model.layers.{bid}.moe.up_proj",                       # step3.5
         ),
 
+        MODEL_TENSOR.FFN_UP_SHEXP: (
+            "model.layers.{bid}.mlp.shared_experts.up_proj",         # deepseek deepseek2
+        ),
+
         # Feed-forward gate
         MODEL_TENSOR.FFN_GATE: (
             "model.layers.{bid}.mlp.gate_proj",               # llama-hf refact olmo2
@@ -615,6 +619,10 @@ class TensorNameMap:
             "model.layers.{bid}.feed_forward.experts.gate_proj",        # llama4
             "model.layers.{bid}.block_sparse_moe.experts.gate",         # smallthinker
             "model.layers.{bid}.moe.gate_proj",                         # step3.5
+        ),
+
+        MODEL_TENSOR.FFN_GATE_SHEXP: (
+            "model.layers.{bid}.mlp.shared_experts.gate_proj",         # deepseek deepseek2
         ),
 
         MODEL_TENSOR.FFN_GATE_UP_EXP: (
@@ -690,6 +698,10 @@ class TensorNameMap:
             "layers.{bid}.moe.local_experts.down",                  # metis16
         ),
 
+        MODEL_TENSOR.FFN_DOWN_SHEXP: (
+            "model.layers.{bid}.mlp.shared_experts.down_proj",         # deepseek deepseek2
+        ),
+
         MODEL_TENSOR.ATTN_Q_NORM: (
             "encoder.layers.{bid}.self_attention.q_layernorm",
             "model.layers.{bid}.self_attn.q_layernorm",                       # persimmon
@@ -729,10 +741,84 @@ class TensorNameMap:
             "encoder.layers.{bid}.self_attention.rotary_emb.inv_freq",  # persimmon
         ),
 
+        MODEL_TENSOR.LAYER_OUT_NORM: (
+            "model.layers.{bid}.final_layernorm",           # bailingmoe2
+        ),
+
         MODEL_TENSOR.LAYER_OUT_SCALE: (
             "model.layers.{bid}.layer_scalar", # gemma4
             "layers.{bid}.layer_scalar", # embeddinggemma2
             "model.blocks.{bid}.embed_skip.a_g", # talkie
+        ),
+
+        MODEL_TENSOR.SSM_DT: (
+            "model.layers.{bid}.attention.dt_proj",     # bailingmoe3
+        ),
+
+        MODEL_TENSOR.SSM_A: (
+            "model.layers.{bid}.attention.A_log",     # bailingmoe3
+        ),
+
+        MODEL_TENSOR.SSM_NORM: (
+            "model.layers.{bid}.attention.o_norm",  # bailingmoe3
+        ),
+
+        # Kimi Linear KDA (using SSM_ prefix for consistency)
+        MODEL_TENSOR.SSM_CONV1D_Q: (
+            "model.layers.{bid}.attention.q_conv1d",
+        ),
+        MODEL_TENSOR.SSM_CONV1D_K: (
+            "model.layers.{bid}.attention.k_conv1d",
+        ),
+        MODEL_TENSOR.SSM_CONV1D_V: (
+            "model.layers.{bid}.attention.v_conv1d",
+        ),
+        # bailingmoe3 f_proj and g_proj are renamed in the converter
+        MODEL_TENSOR.SSM_F_A: (),
+        MODEL_TENSOR.SSM_BETA: (
+            "model.layers.{bid}.attention.b_proj",       # bailingmoe3
+        ),
+        MODEL_TENSOR.SSM_G_A: (),
+
+        MODEL_TENSOR.ATTN_Q_A: (
+            "model.layers.{bid}.attention.q_a_proj",  # bailingmoe3 (Ling-3.0-tiny)
+        ),
+
+        MODEL_TENSOR.ATTN_Q_B: (
+            "model.layers.{bid}.attention.q_b_proj",  # bailingmoe3 (Ling-3.0-tiny)
+        ),
+
+        MODEL_TENSOR.ATTN_KV_A_MQA: (
+            "model.layers.{bid}.attention.kv_a_proj_with_mqa", # bailingmoe3
+        ),
+
+        MODEL_TENSOR.ATTN_K_B: (
+            "model.layers.{bid}.attention.k_b_proj",  # bailingmoe3
+        ),
+
+        MODEL_TENSOR.ATTN_V_B: (
+            "model.layers.{bid}.attention.v_b_proj",  # bailingmoe3
+        ),
+
+        MODEL_TENSOR.ATTN_Q_A_NORM: (
+            "model.layers.{bid}.attention.q_a_layernorm", # bailingmoe3 (Ling-3.0-tiny)
+        ),
+
+        MODEL_TENSOR.ATTN_KV_A_NORM: (
+            "model.layers.{bid}.attention.kv_a_layernorm", # bailingmoe3
+        ),
+
+        # NextN/MTP tensors
+        MODEL_TENSOR.NEXTN_EH_PROJ: (
+            "model.layers.{bid}.eh_proj",
+        ),
+
+        MODEL_TENSOR.NEXTN_ENORM: (
+            "model.layers.{bid}.enorm",
+        ),
+
+        MODEL_TENSOR.NEXTN_HNORM: (
+            "model.layers.{bid}.hnorm",
         ),
 
         ############################################################################

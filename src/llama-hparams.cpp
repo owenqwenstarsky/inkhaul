@@ -174,6 +174,11 @@ uint32_t llama_hparams::n_embd_r() const {
         return n_sconv_channels * (n_shortconv_l_cache - 1);
     }
 
+    if (n_embd_head_kda != 0) {
+        // KDA: conv states of q, k and v
+        return 3 * (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * n_head() * n_embd_head_kda;
+    }
+
     // TODO: maybe support other convolution strides than 1
     // NOTE: since the first column of the conv_state is shifted out each time, it's not actually needed
     return (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
@@ -230,5 +235,20 @@ bool llama_hparams::has_rope(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_layer() const {
-    return n_layer_all;
+    return n_layer_all - n_layer_nextn;
+}
+
+bool llama_hparams::is_mla() const {
+    assert((n_embd_head_k_mla_impl == 0 && n_embd_head_v_mla_impl == 0) ||
+           (n_embd_head_k_mla_impl != 0 && n_embd_head_v_mla_impl != 0));
+
+    return n_embd_head_k_mla_impl != 0 && n_embd_head_v_mla_impl != 0;
+}
+
+uint32_t llama_hparams::n_embd_head_k_mla() const {
+    return is_mla() ? n_embd_head_k_mla_impl : n_embd_head_k();
+}
+
+uint32_t llama_hparams::n_embd_head_v_mla() const {
+    return is_mla() ? n_embd_head_v_mla_impl : n_embd_head_v();
 }

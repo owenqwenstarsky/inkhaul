@@ -82,5 +82,41 @@ int main() {
         success = false;
     }
 
+    // LLAMA_VOCAB_PRE_TYPE_BAILINGMOE (Ling), the expected splits come from the pre-tokenizer of the Ling-3.2-air HF tokenizer
+    const std::vector<std::string> regex_bailingmoe = {
+        "'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+",
+    };
+    const struct {
+        std::string text;
+        std::vector<std::string> expected;
+    } bailingmoe_tests[] = {
+        { "Hello world", { "Hello", " world" } },
+        { " Hello  world ", { " Hello", " ", " world", " " } },
+        { "I've been 'told he's there, 'RE you sure? 'M not sure I'll make it, 'D you like some tea? We'Ve a'lL", { "I", "'ve", " been", " '", "told", " he", "'s", " there", ",", " '", "RE", " you", " sure", "?", " '", "M", " not", " sure", " I", "'ll", " make", " it", ",", " '", "D", " you", " like", " some", " tea", "?", " We", "'Ve", " a", "'lL" } },
+        { "3 33 333 3333 3.14 1,000,000", { "3", " ", "3", "3", " ", "3", "3", "3", " ", "3", "3", "3", "3", " ", "3", ".", "1", "4", " ", "1", ",", "0", "0", "0", ",", "0", "0", "0" } },
+        { "line one\nline two\r\n\n  indented\ttab", { "line", " one", "\n", "line", " two", "\r\n\n", " ", " indented", "\ttab" } },
+        { "foo!!! bar??? (baz) [qux] {x}", { "foo", "!!!", " bar", "???", " (", "baz", ")", " [", "qux", "]", " {", "x", "}" } },
+        { "\346\210\221\346\203\263\345\234\250apple\345\267\245\344\275\2341314151\345\244\251\357\275\236", { "\346\210\221\346\203\263\345\234\250apple\345\267\245\344\275\234", "1", "3", "1", "4", "1", "5", "1", "\345\244\251", "\357\275\236" } },
+        { "\320\275\320\265\321\211\320\276 \320\275\320\260 \320\221\321\212\320\273\320\263\320\260\321\200\321\201\320\272\320\270", { "\320\275\320\265\321\211\320\276", " \320\275\320\260", " \320\221\321\212\320\273\320\263\320\260\321\200\321\201\320\272\320\270" } },
+        { "\360\237\232\200 (normal) \360\237\230\266\342\200\215\360\237\214\253\357\270\217 \342\234\205 \360\237\246\231\360\237\246\231", { "\360\237\232\200", " (", "normal", ")", " \360\237\230\266\342\200\215\360\237\214\253\357\270\217", " \342\234\205", " \360\237\246\231\360\237\246\231" } },
+        { "a-b_c.d/e\\f", { "a", "-b", "_c", ".d", "/e", "\\f" } },
+        { "   \n\n   x", { "   \n\n", "  ", " x" } },
+        { "def f(x):\n    return x**2  # comment\n", { "def", " f", "(x", "):\n", "   ", " return", " x", "**", "2", " ", " #", " comment", "\n" } },
+        { "<think>ok</think><tool_call>", { "<think", ">ok", "</", "think", "><", "tool", "_call", ">" } },
+        { "\303\204\303\226\303\234 \303\244\303\266\303\274 \303\237 caf\303\251", { "\303\204\303\226\303\234", " \303\244\303\266\303\274", " \303\237", " caf\303\251" } },
+        { "...\n\n---\n", { "...\n\n", "---\n" } },
+    };
+    for (const auto & test : bailingmoe_tests) {
+        const auto pieces = unicode_regex_split(test.text, regex_bailingmoe, false);
+        if (pieces != test.expected) {
+            fprintf(stderr, "unexpected bailingmoe split of \"%s\":", test.text.c_str());
+            for (const auto & piece : pieces) {
+                fprintf(stderr, " [%s]", piece.c_str());
+            }
+            fprintf(stderr, "\n");
+            success = false;
+        }
+    }
+
     return success ? 0 : 1;
 }
