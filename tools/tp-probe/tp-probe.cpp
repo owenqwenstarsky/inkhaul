@@ -291,11 +291,13 @@ struct gpu_result {
     double compute_p50, compute_p99; // graph compute + synchronize, us
     double event_p50,   event_p99;   // event record + host wait after an async compute, us
     double turn_p50,    turn_p99;    // host reaches an event the GPU waits for -> graph -> host sees the GPU's event, us
+    double awake_p50,   awake_p99;   // the same with the device kept awake (ggml_backend_dev_keep_awake), us
     double gpu_us;                   // GPU time of one graph, from back-to-back runs, us
 };
 
 // n_work: matrix-vector products of 4096 x 4096 (f16, 32 MiB) per graph, to keep the GPU busy like a layer
-static bool run_gpu(int iters, int n_work, gpu_result & res, std::string & dev_name) {
+// wait_us: the host waits this long before it reaches each event, like the peer's partial on the cable
+static bool run_gpu(int iters, int n_work, int wait_us, gpu_result & res, std::string & dev_name) {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -378,8 +380,12 @@ static bool run_gpu(int iters, int n_work, gpu_result & res, std::string & dev_n
     }
 
     // the GPU side of one sync of the async all-reduce: the queue never drains, the GPU waits at
-    // an event that the host reaches, runs a tiny graph, and reaches an event that the host spins on
+    // an event that the host reaches, runs a tiny graph, and reaches an event that the host spins on;
+    // then the same with the device kept awake, as the RPC server does during the all-reduces
     res.turn_p50 = res.turn_p99 = -1.0;
+    res.awake_p50 = res.awake_p99 = -1.0;
+    auto keep_awake = (ggml_backend_dev_keep_awake_t)
+        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_keep_awake");
     const int n_slots = 4;
     std::vector<ggml_backend_event_t> done(n_slots), ready(n_slots);
     bool host_events = true;
@@ -396,26 +402,34 @@ static bool run_gpu(int iters, int n_work, gpu_result & res, std::string & dev_n
     };
     if (host_events && ggml_backend_event_arm_host(done[0])) {
         ggml_backend_event_signal_host(done[0]); // the probe arm above is reached right away
-        for (int k = 0; k < n_slots; ++k) {
-            queue_slot(k);
-        }
-        t.clear();
-        for (int it = 0; it < iters; ++it) {
-            const int k = it % n_slots;
-            const int64_t t0 = now_us();
-            ggml_backend_event_signal_host(done[k]);
-            while (!ggml_backend_event_query(ready[k])) {
+        for (int awake = 0; awake < (keep_awake != nullptr ? 2 : 1); ++awake) {
+            for (int k = 0; k < n_slots; ++k) {
+                queue_slot(k);
             }
-            t.push_back((double) (now_us() - t0));
-            queue_slot(k);
+            t.clear();
+            for (int it = 0; it < iters; ++it) {
+                const int k = it % n_slots;
+                if (awake) {
+                    keep_awake(dev, 100000);
+                }
+                const int64_t t_wait = now_us();
+                while (now_us() - t_wait < wait_us) {
+                }
+                const int64_t t0 = now_us();
+                ggml_backend_event_signal_host(done[k]);
+                while (!ggml_backend_event_query(ready[k])) {
+                }
+                t.push_back((double) (now_us() - t0));
+                queue_slot(k);
+            }
+            // let the queued slots run, so that nothing waits when the backend is freed
+            for (int i = 0; i < n_slots; ++i) {
+                ggml_backend_event_signal_host(done[(iters + i) % n_slots]);
+            }
+            ggml_backend_synchronize(backend);
+            (awake ? res.awake_p50 : res.turn_p50) = percentile(t, 0.5);
+            (awake ? res.awake_p99 : res.turn_p99) = percentile(t, 0.99);
         }
-        // let the queued slots run, so that nothing waits when the backend is freed
-        for (int i = 0; i < n_slots; ++i) {
-            ggml_backend_event_signal_host(done[(iters + i) % n_slots]);
-        }
-        ggml_backend_synchronize(backend);
-        res.turn_p50 = percentile(t, 0.5);
-        res.turn_p99 = percentile(t, 0.99);
     }
     for (int k = 0; k < n_slots; ++k) {
         if (done[k] != nullptr) {
@@ -712,7 +726,8 @@ static void usage(const char * argv0) {
     printf("usage:\n");
     printf("  %s listen  -H ADDR [-p PORT]                         wait for one 'connect' and answer it\n", argv0);
     printf("  %s connect -H ADDR [-p PORT] [-s SIZES] [-n N]        measure the link (sizes like 8K,64K,2M)\n", argv0);
-    printf("  %s gpu [-n N] [--work W]                            measure the local GPU sync delay (W: 32 MiB products per graph)\n", argv0);
+    printf("  %s gpu [-n N] [--work W] [--wait US]                measure the local GPU sync delay (W: 32 MiB products per graph,\n", argv0);
+    printf("                                                        US: the host waits this long per sync, like the cable)\n");
     printf("  %s budget -m MODEL [--bw GB/s] [--t US,US,...]      bytes per token and the estimate per mode\n", argv0);
     printf("  %s self-test                                        check this tool over 127.0.0.1\n", argv0);
     printf("\nBind 'listen' to the Thunderbolt address only, never to 0.0.0.0.\n");
@@ -731,6 +746,7 @@ int main(int argc, char ** argv) {
     int port = 50100;
     int iters = 1000;
     int n_work = 0;
+    int wait_us = 0;
     double bw = 120.0;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -749,6 +765,7 @@ int main(int argc, char ** argv) {
         else if (a == "--bw") { bw = std::stod(next()); }
         else if (a == "--t") { t_str = next(); }
         else if (a == "--work") { n_work = std::stoi(next()); }
+        else if (a == "--wait") { wait_us = std::stoi(next()); }
         else { usage(argv[0]); return 1; }
     }
 
@@ -791,7 +808,7 @@ int main(int argc, char ** argv) {
     if (cmd == "gpu") {
         gpu_result r;
         std::string name;
-        if (!run_gpu(iters, n_work, r, name)) {
+        if (!run_gpu(iters, n_work, wait_us, r, name)) {
             fprintf(stderr, "no GPU or the GPU check failed\n");
             return 1;
         }
@@ -806,6 +823,10 @@ int main(int argc, char ** argv) {
             // back-to-back graphs can overlap on the GPU, so the difference is an upper bound; with --work 0 it is close
             printf("%s: one sync of the async all-reduce costs the GPU at most about %.1f us (turnaround - GPU time), plus the one-way time of the link\n",
                    name.c_str(), r.turn_p50 - r.gpu_us);
+        }
+        if (r.awake_p50 >= 0) {
+            printf("%s: the same with the GPU kept awake: p50 %.1f us, p99 %.1f us, so about %.1f us per sync\n",
+                   name.c_str(), r.awake_p50, r.awake_p99, r.awake_p50 - r.gpu_us);
         }
         return 0;
     }

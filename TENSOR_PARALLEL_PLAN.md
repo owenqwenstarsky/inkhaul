@@ -551,3 +551,26 @@ Not done: the measured gain. It needs the laptops.
 CI:
 - A C style cast dropped `const` in `log_tensor_split` (GCC `-Wcast-qual`).
 - The virtual GPU of the macOS runners has no bf16, so the server aborted on the copy to bf16 for large partials. The ranks now agree at comm init whether every GPU can convert to and from bf16, and send f32 otherwise. That adds a step to comm init, so the protocol is 10.4 and the client refuses older servers for the comm.
+
+## 20. A faster sync on Metal (2026-11-26)
+
+Two Macs were about as slow as one. With 48 syncs per token, each sync cost the GPU about 200 us before the link, about 10 ms per token.
+
+Measured on an M5 (`llama-tp-probe gpu`, and a raw Metal probe that is not kept):
+- The host reading `MTLSharedEvent.signaledValue` is not the cost. Polling a word that a kernel writes was as slow once the GPU had idled.
+- An Apple GPU that waits on an event for more than about 50 us goes to sleep. It then starts the next work 100 to 200 us after the event is reached, whatever reaches it. A wait followed by a record alone took 6 us; a wait followed by any kernel took about 190 us.
+- A second queue that runs a one-thread kernel back to back keeps the GPU awake. The turnaround minus the GPU time fell from about 175 us to about 60 us with one 32 MiB product per sync, and from about 180 us to about 40 us with none. The products ran as fast as without it.
+- A GPU kernel that spins on a flag the CPU writes never sees the write (shared memory, device scope fences, MSL 3.2), so the GPU cannot wait by spinning.
+- Within one command buffer, the GPU's writes to shared memory do not reach the CPU in order: a word written after the partial was seen before the partial (the ranks differed in `test-tp-comm`). Only the end of the command buffer, which reaches the event, makes the partial safe to read.
+
+Changes:
+- Metal keeps the device awake on request (`ggml_backend_dev_keep_awake`, found by proc address): a second queue runs `kernel_keep_awake`, about 250 us per run, two command buffers in flight, until the deadline. `GGML_METAL_NO_KEEP_AWAKE` turns it off.
+- The RPC server asks for 100 ms after each async all-reduce (`GGML_RPC_COMM_KEEP_AWAKE_MS`, `0` turns it off).
+- Metal puts an event wait in the next command buffer it submits (the graph, or an event record) instead of committing a buffer with only the wait. Any other use of the queue (tensor copies, synchronize, free) commits the waits first.
+- Metal no longer submits empty command buffers for a graph that fits in the first one. A tiny graph took 29 us of GPU time back to back, now about 15 us. The all-reduce runs two tiny graphs per sync, and a layer part between syncs often fits too.
+- `signal_host` keeps its own count instead of reading the event back, and event values are 64 bits.
+- `llama-tp-probe gpu` prints the turnaround with the GPU kept awake too, and `--wait US` makes the host wait like the cable.
+
+Not done:
+- Measured on one Mac only. The gain on two laptops, and whether their GPUs sleep the same way, needs a run on them.
+- The copy out and the record are still two command buffers, and the sum and the next layer part too.

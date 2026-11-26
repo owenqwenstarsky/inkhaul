@@ -254,6 +254,9 @@ extern "C" {
         const char * value;
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+    // Keep the device awake for the next us microseconds, so that it starts quickly after a short wait on an event
+    // (a GPU that sleeps between the steps of a tensor parallel all-reduce loses about 100 us per step)
+    typedef void                         (*ggml_backend_dev_keep_awake_t)(ggml_backend_dev_t device, int64_t us);
 
     //
     // Backend registry

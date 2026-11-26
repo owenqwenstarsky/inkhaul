@@ -983,6 +983,10 @@ static ggml_backend_feature g_ggml_backend_metal_features[] = {
     { NULL, NULL },
 };
 
+static void ggml_backend_metal_dev_keep_awake(ggml_backend_dev_t dev, int64_t us) {
+    ggml_metal_device_keep_awake((ggml_metal_device_t) dev->context, us);
+}
+
 static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t reg) {
     return g_ggml_backend_metal_features;
 
@@ -1043,6 +1047,9 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_dev_keep_awake") == 0) {
+        return (void *)ggml_backend_metal_dev_keep_awake;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

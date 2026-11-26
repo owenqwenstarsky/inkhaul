@@ -339,6 +339,9 @@ void ggml_metal_device_rsets_rm (ggml_metal_device_t dev, ggml_metal_rset_t rset
 
 void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev);
 
+// keep the GPU awake for the next us microseconds: a second queue runs a tiny kernel back to back until then
+void ggml_metal_device_keep_awake(ggml_metal_device_t dev, int64_t us);
+
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev);
 void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev);
 void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev);

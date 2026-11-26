@@ -18,6 +18,8 @@ llama-tp-probe connect -H 10.0.0.2 -p 50100
 llama-tp-probe gpu
 #    the same with each graph reading 64 MiB of weights, closer to a real layer
 llama-tp-probe gpu --work 2
+#    and with the host waiting 100 us per sync, like the partial on the cable
+llama-tp-probe gpu --work 1 --wait 100
 
 # 3. the model: bytes read per token by part, and the estimated speed of each mode for a few sync costs
 llama-tp-probe budget -m ~/models/Inkling-2-Mini-AD-Q4_K.gguf --bw 120 --t 50,100,300
@@ -28,6 +30,7 @@ llama-tp-probe budget -m ~/models/Inkling-2-Mini-AD-Q4_K.gguf --bw 120 --t 50,10
 - `gpu` prints:
   - the time of a graph run plus the wait for it, which the blocking all-reduce pays at every sync;
   - the busy-queue turnaround: the host reaches an event that the GPU waits for, the GPU runs the graph and reaches an event that the host spins on. Minus the GPU time of the graph, this is what the async all-reduce costs the GPU per sync, before the link. It is an upper bound, because back-to-back graphs can overlap on the GPU; with `--work 0` it is close.
+  - the same with the GPU kept awake, as the servers do during a run (see below).
 - `budget` reads the GGUF header only. `--bw` is the memory bandwidth of one Mac in GB/s, `--t` the sync costs to compare in microseconds. The last column is the sync cost above which a mode is slower than one Mac.
 - `llama-tp-probe self-test` checks the tool itself over `127.0.0.1`.
 
@@ -73,6 +76,8 @@ On Metal the sync does not stop the GPU queue:
 - A thread of the server sends the partial to the other server and receives the other partial at the same time.
 - The GPU waits for that thread, then adds the two partials.
 - Meanwhile the server thread has already queued the next part, so the GPU starts it as soon as the sum is done.
+- The wait goes in the same Metal command buffer as the add. A GPU that wakes from a wait and then has to start a new command buffer loses more time.
+- While syncs come, the server keeps its GPU awake: a second Metal queue runs a kernel of one thread, about 250 us long, back to back. An Apple GPU that waits on an event for more than about 50 us goes to sleep and starts again 100 to 200 us late; awake it starts in about 40 us. On an M5 this cut the GPU cost of one sync from about 175 us to about 60 us, and the kernel did not slow the matrix products next to it. It stops 100 ms after the last sync.
 
 Payloads of 32768 values or more (prompt processing) go over the wire in bf16. Each server rounds its own partial to bf16 too, so both Macs get the same bits. If one GPU cannot convert to bf16, both servers agree at the start to send f32 instead (the log says `large partials in f32`).
 
@@ -80,6 +85,7 @@ Payloads of 32768 values or more (prompt processing) go over the wire in bf16. E
 |---|---|---|
 | `GGML_RPC_COMM_TIMEOUT_MS` | `30000` | A server whose peer does not answer for this long stops the run with an error, instead of hanging (TCP only). `0` waits forever. |
 | `GGML_RPC_COMM_SPIN_US` | `500` | How long the sync thread spins before it sleeps, while it waits for the GPU and for small messages. Spinning costs a CPU core, sleeping costs tens of microseconds per wake-up. |
+| `GGML_RPC_COMM_KEEP_AWAKE_MS` | `100` | How long the server keeps its GPU awake after each sync. `0` turns it off (the GPU uses a little less power between tokens, and each sync costs about 100 us more). `GGML_METAL_NO_KEEP_AWAKE` turns it off in Metal itself. |
 | `GGML_RPC_COMM_SYNC` | unset | Set it to use the blocking sync: the server waits for its GPU, exchanges, then queues the add. Use it to compare, or for backends without host events. |
 | `GGML_RPC_COMM_PORT` | port of rank 0 + 1000 | Set on the client: the port rank 0 listens on for the other servers. |
 

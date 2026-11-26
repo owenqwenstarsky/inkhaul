@@ -1964,7 +1964,8 @@ private:
     // Per all-reduce the GPU copies its partial to the send half of a host slot and reaches `ready`.
     // The comm thread exchanges the slot with the peer, fills the recv half and reaches `done`.
     // The GPU waits for `done`, then adds the two partials. The server thread does not wait, so it
-    // encodes the next graph while the bytes are on the cable.
+    // encodes the next graph while the bytes are on the cable. While all-reduces come, the device is
+    // kept awake if it can be: a GPU that sleeps during the wait for `done` starts about 100 us late.
     struct comm_async {
         static constexpr int N_SLOTS = 4;
         struct slot {
@@ -1986,6 +1987,8 @@ private:
         socket_ptr              peer;
         uint32_t                rank    = 0;
         int64_t                 spin_us = 0;
+        ggml_backend_dev_keep_awake_t keep_awake = nullptr;
+        int64_t                 keep_awake_us = 0; // after each all-reduce
         int64_t                 test_delay_ms = 0; // for the timeout test: wait this long before each exchange
         bool                    test_ids_flip = false;
         slot                    slots[N_SLOTS];
@@ -3026,6 +3029,9 @@ std::unique_ptr<rpc_server::comm_async> rpc_server::comm_async_init(ggml_backend
     ca->peer    = peer;
     ca->rank    = rank;
     ca->spin_us = rpc_comm_env_int("GGML_RPC_COMM_SPIN_US", 500);
+    ca->keep_awake = (ggml_backend_dev_keep_awake_t)
+        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_keep_awake");
+    ca->keep_awake_us = rpc_comm_env_int("GGML_RPC_COMM_KEEP_AWAKE_MS", 100) * 1000;
     // test hook "RANK:MS": that rank waits MS before each exchange, so its peer times out
     if (const char * delay = std::getenv("GGML_RPC_COMM_TEST_DELAY")) {
         if ((uint32_t) std::strtoul(delay, nullptr, 10) == rank && strchr(delay, ':') != nullptr) {
@@ -3063,6 +3069,9 @@ bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst, ggml
     const size_t  xfer       = wire_bytes + (t_check != nullptr ? sizeof(uint64_t) : 0);
     const size_t  ids_offs   = t_check != nullptr ? (2*xfer + 63) / 64 * 64 : 0;
     const size_t  ids_bytes  = t_check != nullptr ? (size_t) ggml_nelements(t_check)*sizeof(int32_t) : 0;
+    if (ca.keep_awake != nullptr && ca.keep_awake_us > 0) {
+        ca.keep_awake(ggml_backend_get_device(backend), ca.keep_awake_us);
+    }
 
     // the next slot, once the comm thread is done with it
     const int k = ca.next;
