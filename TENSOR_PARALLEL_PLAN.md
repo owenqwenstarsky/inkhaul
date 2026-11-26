@@ -496,3 +496,31 @@ Tests, all OK:
   - children with different ids on the async and the blocking path (must stop with the message), and with the same ids on the blocking path (must pass; values outside the view differ and must not count);
   - `GGML_RPC_COMM_PORT` with a free port, and with 70000 (refused).
 - `test-arg-expert-split`: `--tp-attn`, and the errors of `--tp-host`.
+
+## 17. Phase 4 results (2026-11-26)
+
+Why upstream refused `inkling2`: each layer keeps one recurrent state tensor, `cache_r_l`, laid out as K conv channels, V conv channels, `attn_post_conv` channels and `ffn_post_conv` channels.
+- With heads split, the K/V parts would be split by heads.
+- The post-conv parts need the full vector on every rank: after the all-reduce if the conv runs on the sum, or as each rank's own partial history if a PARTIAL passes through the conv (the idea of 5.10).
+- A meta split state can split a tensor in segments, but every segment is shared out between the devices. A segment that each device holds whole cannot be written down. So this needs a new kind of split state in the meta backend or a separate state tensor for the post convs in the recurrent memory. Both are larger changes than this phase.
+
+Done:
+- `inkling2` and `inkling2_loop` load with `-sm tensor`.
+  - Attention is always mirrored, as with `--tp-attn mirror` (`llm_arch_sm_tensor_splits_attn`, and `llama_model::tp_attn()` returns the policy in effect). `split` gives a warning.
+  - The fused `ffn_gate_up_exps` and `ffn_down_exps` are split as for Qwen.
+  - One sync per layer pass (48 per token for Inkling 2 Mini). By section 15 that is the better mode for two laptops anyway.
+- The output matrix is mirrored when the model cuts padded vocabulary rows off the logits (`n_vocab_unpadded`, which Inkling 2 sets).
+  - The meta backend splits a view of a split tensor in the same ratio as its source. A view that cuts the end off does not keep that ratio.
+  - Found by the test: on 1:1 the logits came out silently wrong (NMSE 1.03), on 3:1 an assert.
+- Not done, and not needed: the propagation of a PARTIAL through SSM_CONV, add and scale (5.10). With mirrored attention the layer syncs once whether the all-reduce is before or after `ffn_post_conv`. The rule only pays with split attention, which the state tensor rules out.
+
+Tests, all OK:
+- `test-llama-archs` with two devices:
+  - the Meta rows (split, 3:1, mirror, mirror 3:1) for both inkling archs, with NMSE, and the roundtrip for `inkling2`;
+  - "Tensor syncs" with an expert FFN of 256: one all-reduce per layer pass with either `--tp-attn` (3 for `inkling2`, 4 for the unrolled `inkling2_loop`), and the share line (experts 50/50, attention and output mirrored).
+- `test-llama-archs --rpc`: 1:1, 3:1 and `--tp-host` for both inkling archs, with an expert FFN of 512.
+  - With 256, 3:1 gives 0 rows to one server in every other layer. The comm then refuses that sum and the client adds it, which is right but slow. Real models split evenly.
+- The limit of the RPC test is now NMSE 1e-7, not 1e-4.
+  - Right sums gave at most 2e-8.
+  - A mutation that drops the peer's partial gave 2.5e-6 to 7e-5 depending on the seed and the model, so the old limit let it pass for `qwen35` and `inkling2`.
+  - With the new limit all 12 cases fail under that mutation.

@@ -249,8 +249,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
         }
 
-        // output, split by vocab rows
+        // output, split by vocab rows; mirrored if the graph cuts the padded rows off the logits,
+        // since the meta backend splits a view of a split tensor in the same ratio, which a cut does not keep
         if (std::regex_match(tensor_name, pattern_output_weight)) {
+            if (hparams.n_vocab_unpadded > 0 && hparams.n_vocab_unpadded != tensor->ne[1]) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
 
@@ -1636,7 +1640,8 @@ uint32_t llama_model::n_gpu_layers() const {
 }
 
 llama_tp_attn llama_model::tp_attn() const {
-    return params.tp_attn;
+    // the policy in effect: some archs cannot split attention
+    return llm_arch_sm_tensor_splits_attn(arch) ? params.tp_attn : LLAMA_TP_ATTN_MIRROR;
 }
 
 llama_split_mode llama_model::split_mode() const {
@@ -1879,6 +1884,10 @@ void llama_model::log_tensor_split() const {
     const size_t n_devices = get_split_state_ud.n_devices;
     if (n_devices == 0) {
         return;
+    }
+    if (params.tp_attn != tp_attn()) {
+        LLAMA_LOG_WARN("%s: %s cannot split attention, every device holds and computes all of it (--tp-attn mirror)\n",
+            __func__, llm_arch_name(arch));
     }
 
     // sums the slices of one tensor class over all layers, as the rounding moves between the devices per layer

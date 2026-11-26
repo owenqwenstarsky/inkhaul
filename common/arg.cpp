@@ -3049,7 +3049,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
         "- row: split weight across GPUs by rows (parallelized)\n"
         "- expert: LongHaul only, layers and KV on --main-gpu, the experts of each layer split by --tensor-split (see --expert-share)\n"
-        "- tensor: every layer split over all GPUs at once (tensor parallelism, qwen35 and qwen35moe, needs flash attention)",
+        "- tensor: every layer split over all GPUs at once (tensor parallelism, qwen35, qwen35moe, inkling2 and inkling2_loop, needs flash attention)",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;

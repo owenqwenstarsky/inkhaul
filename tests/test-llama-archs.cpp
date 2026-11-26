@@ -260,7 +260,8 @@ struct kv_writer {
     }
 };
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0) {
+// n_ff_min: a larger FFN, so that -sm tensor gives each of two devices some rows (it splits in steps of 128)
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0, const uint32_t n_ff_min = 0) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -283,6 +284,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
 
     uint32_t n_head_kv = n_head;
     n_layer = std::max(n_layer, n_layer_min);
+    n_ff    = std::max(n_ff, n_ff_min);
     const uint32_t n_embd_head = n_embd / n_head;
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llama_arch_name(arch));
@@ -2394,7 +2396,8 @@ static int test_longhaul_rpc(const std::string & arch_filter, const size_t seed,
 // the all-reduce runs between the two servers, the logits must match the local GPU
 static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend, const char * argv0) {
     std::vector<std::pair<llm_arch, bool>> archs; // arch, moe
-    for (const auto & am : { std::make_pair(LLM_ARCH_QWEN35, false), std::make_pair(LLM_ARCH_QWEN35MOE, true) }) {
+    for (const auto & am : { std::make_pair(LLM_ARCH_QWEN35, false), std::make_pair(LLM_ARCH_QWEN35MOE, true),
+                             std::make_pair(LLM_ARCH_INKLING2, true), std::make_pair(LLM_ARCH_INKLING2_LOOP, true) }) {
         if (arch_matches(arch_filter, am.first)) {
             archs.push_back(am);
         }
@@ -2484,7 +2487,9 @@ static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, c
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
     bool all_ok = true;
     for (const auto & am : archs) {
-        gguf_context_ptr gguf_ctx = get_gguf_ctx(am.first, am.second);
+        // an expert FFN of 512, so that each server computes a slice of every expert, also with 3:1 (384/128);
+        // a server with no rows of a tensor would send its sum through this process
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(am.first, am.second, 0, 512);
         std::vector<float> logits_ref;
         {
             auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { gpu });
@@ -2515,7 +2520,9 @@ static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, c
                 char buf[32];
                 snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
                 detail = buf;
-                ok = nmse_val <= 1e-4;
+                // the same GPU kernels as the reference: right sums give at most ~2e-8 here (bf16 on the wire for the prompt);
+                // without the peer's partial it is 2.5e-6 or more (inkling2, whose experts add little to the logits)
+                ok = nmse_val <= 1e-7;
             } catch (const std::exception & err) {
                 ok = false;
                 detail = err.what();
@@ -2550,7 +2557,7 @@ static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, c
 #ifndef _WIN32
     // ranks that pick different experts must stop the run and name the layer: a child process where rank 1
     // changes the hash of its ids (the hook does nothing else); the client aborts once a server stops
-    const bool has_moe = std::any_of(archs.begin(), archs.end(), [](const auto & am) { return am.second; });
+    const bool has_moe = std::any_of(archs.begin(), archs.end(), [](const auto & am) { return am.first == LLM_ARCH_QWEN35MOE; });
     if (has_moe && std::getenv("GGML_RPC_COMM_TEST_IDS_FLIP") == nullptr) {
         const std::string cmd = std::string("GGML_RPC_COMM_TEST_IDS_FLIP=1 GGML_RPC_COMM_TIMEOUT_MS=5000 '") + argv0 +
             "' --rpc -a '^qwen35moe$' 2>&1";
@@ -2577,7 +2584,8 @@ static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, c
 // (the shared experts go into the sum of the routed experts) and once with --tp-attn mirror
 static int test_tensor_syncs(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
     std::vector<std::pair<llm_arch, bool>> archs; // arch, moe
-    for (const auto & am : { std::make_pair(LLM_ARCH_QWEN35, false), std::make_pair(LLM_ARCH_QWEN35MOE, true) }) {
+    for (const auto & am : { std::make_pair(LLM_ARCH_QWEN35, false), std::make_pair(LLM_ARCH_QWEN35MOE, true),
+                             std::make_pair(LLM_ARCH_INKLING2, true), std::make_pair(LLM_ARCH_INKLING2_LOOP, true) }) {
         if (arch_matches(arch_filter, am.first)) {
             archs.push_back(am);
         }
@@ -2595,11 +2603,14 @@ static int test_tensor_syncs(const std::string & arch_filter, const size_t seed,
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
     bool all_ok = true;
     for (const auto & am : archs) {
-        gguf_context_ptr gguf_ctx = get_gguf_ctx(am.first, am.second);
-        const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(),
-            llama_arch_kv_name(am.first, LLM_KV_BLOCK_COUNT).c_str()));
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(am.first, am.second, 0, 256);
+        // inkling2 always mirrors attention; it pads the vocab and cuts the logits, so its output is mirrored too
+        const bool is_inkling  = am.first == LLM_ARCH_INKLING2 || am.first == LLM_ARCH_INKLING2_LOOP;
+        const bool splits_attn = llama_arch_sm_tensor_splits_attn(am.first);
         for (const llama_tp_attn tp_attn : { LLAMA_TP_ATTN_SPLIT, LLAMA_TP_ATTN_MIRROR }) {
-            const size_t expected = (tp_attn == LLAMA_TP_ATTN_SPLIT ? 2 : 1) * n_layer;
+            const bool attn_split = splits_attn && tp_attn == LLAMA_TP_ATTN_SPLIT;
+            uint32_t n_layer = 0; // the layer passes, with the loop of inkling2_loop unrolled
+            size_t   expected = 0;
 
             std::string log;
             ggml_log_callback log_cb;
@@ -2611,6 +2622,8 @@ static int test_tensor_syncs(const std::string & arch_filter, const size_t seed,
             try {
                 auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { gpu, gpu2 }, LLAMA_SPLIT_MODE_TENSOR,
                     nullptr, 0, {}, nullptr, 0, nullptr, tp_attn);
+                n_layer  = (uint32_t) llama_model_n_layer(model_and_ctx.first.get());
+                expected = (attn_split ? 2 : 1) * (size_t) n_layer;
                 get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
             } catch (const std::exception & err) {
                 ok = false;
@@ -2638,15 +2651,16 @@ static int test_tensor_syncs(const std::string & arch_filter, const size_t seed,
             // the load log gives the share of each class after rounding
             const size_t pos_split = log.find("tensor split: ");
             const std::string split_line = pos_split == std::string::npos ? "" : log.substr(pos_split, log.find('\n', pos_split) - pos_split);
-            const std::string attn_expected = tp_attn == LLAMA_TP_ATTN_SPLIT ? "attention 50/50" : "attention mirrored";
+            const std::string attn_expected = attn_split ? "attention 50/50" : "attention mirrored";
+            const std::string out_expected  = is_inkling ? "output mirrored" : "output 50/50";
             // the dense FFN of 384 rounds to 128/256 in both layers, as each layer type rotates the rounding on its own
-            if (ok && (split_line.find("experts ") == std::string::npos || split_line.find(attn_expected) == std::string::npos ||
-                    split_line.find("output 50/50") == std::string::npos ||
-                    (am.second && split_line.find("shared experts 50/50") == std::string::npos))) {
+            if (ok && (split_line.find(am.second ? "experts 50/50" : "experts ") == std::string::npos ||
+                    split_line.find(attn_expected) == std::string::npos || split_line.find(out_expected) == std::string::npos ||
+                    (am.first == LLM_ARCH_QWEN35MOE && split_line.find("shared experts 50/50") == std::string::npos))) {
                 ok = false;
                 detail = "unexpected shares: '" + split_line + "'";
             }
-            LOG("Tensor syncs %s, %s attention: %s (%zu all-reduces for %u layers%s%s)\n", llama_arch_name(am.first),
+            LOG("Tensor syncs %s, --tp-attn %s: %s (%zu all-reduces for %u layer passes%s%s)\n", llama_arch_name(am.first),
                 tp_attn == LLAMA_TP_ATTN_SPLIT ? "split" : "mirror", ok ? "OK" : "FAIL", expected, n_layer,
                 detail.empty() ? "" : ", ", detail.c_str());
             all_ok = all_ok && ok;

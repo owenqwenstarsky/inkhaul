@@ -1,6 +1,6 @@
 # Tensor parallelism over several Macs
 
-With `-sm tensor` two Macs run one Qwen 3.5 model (`qwen35`, `qwen35moe`) as if it were on one machine: every large matrix of every layer is split between the two GPUs, so the memory bandwidth and the GPU compute of both Macs add up on every token. The price is a sync between the Macs inside every layer. Whether that pays off depends on the cable, so measure it first.
+With `-sm tensor` two Macs run one Qwen 3.5 model (`qwen35`, `qwen35moe`) or Inkling 2 model (`inkling2`, `inkling2_loop`) as if it were on one machine: every large matrix of every layer is split between the two GPUs, so the memory bandwidth and the GPU compute of both Macs add up on every token. The price is a sync between the Macs inside every layer. Whether that pays off depends on the cable, so measure it first.
 
 See [TENSOR_PARALLEL_PLAN.md](../TENSOR_PARALLEL_PLAN.md) for the design.
 
@@ -61,7 +61,8 @@ llama-cli -m ~/models/Qwen3.5-35B-A3B-Q4_K_M.gguf --rpc 10.0.0.1:50052,10.0.0.2:
 - All experts stay in memory, split between the Macs: LongHaul (experts on disk) is off, and `-lhc`, `-lhcd` and `-es` do not apply.
 - Flash attention is turned on (it cannot be off). Backend sampling is off. `--fit` skips this mode with a warning, so set `-c` yourself.
 - The model must fit in the memory of both Macs together, with each Mac holding its share plus the mirrored tensors.
-- Only `qwen35` and `qwen35moe` support this mode for now. Other models fail to load with `-sm tensor`.
+- Only `qwen35`, `qwen35moe`, `inkling2` and `inkling2_loop` support this mode for now. Other models fail to load with `-sm tensor`.
+- Inkling 2 always mirrors attention, as with `--tp-attn mirror`, and warns if `split` was given: each layer keeps the state of its K/V convolutions and of its post convolutions in one tensor, and the meta backend cannot split one part of a tensor and copy the other. Its experts are split, so it syncs once per layer pass (48 per token for Inkling 2 Mini). Its output matrix is on both Macs too, because the model pads the vocabulary and cuts the logits back, which a split of the vocabulary cannot follow.
 
 ### How the servers sync
 
