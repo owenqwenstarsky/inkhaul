@@ -177,6 +177,14 @@ struct llama_device {
     ggml_backend_dev_t dev;
 };
 
+// tensor parallelism (LLAMA_SPLIT_MODE_TENSOR): how each tensor is split over the devices of the meta device
+struct llama_meta_device_get_split_state_userdata {
+    size_t                     n_devices;
+    const struct llama_model * model;
+};
+
+struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
+
 struct llama_prec_policy {
     // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op
     std::unordered_map<const ggml_tensor *, ggml_prec> prec_acc;
@@ -290,6 +298,9 @@ struct llama_model {
 
     // list of devices used in this model
     std::vector<llama_device> devices;
+
+    // for the meta device of LLAMA_SPLIT_MODE_TENSOR
+    struct llama_meta_device_get_split_state_userdata get_split_state_ud = {};
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;

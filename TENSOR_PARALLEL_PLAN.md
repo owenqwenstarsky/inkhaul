@@ -341,3 +341,46 @@ Measured on this Mac (M5, macOS 26.6.2), not on the cable:
 - **A tiny graph run plus the wait for it: p50 306 us, p99 679 us** (300 runs; the same through an event record and host wait). That is the cost of stopping the GPU and starting it again, and the blocking all-reduce of section 4 pays it at every sync, before any cable latency. Part of it may be the idle GPU clocking down between the runs of the probe; Phase 2 measures the delay inside a busy queue. Either way, section 5.3 (never drain the queue) matters more than the plan assumed.
 
 Not done: the cable measurement and the budget of your model files. No GGUF model is on this machine, and the cable needs your laptops.
+
+## 14. Phase 1 results (2026-11-26)
+
+Done:
+- `-sm tensor` loads `qwen35` and `qwen35moe` again. Other archs fail at load with a clear error (`llm_arch_supports_sm_tensor`).
+  - `llama_prepare_model_devices` builds one meta device from `-dev` or from all GPUs (RPC first).
+  - It warns when RPC and local devices are mixed, because then the comm between the servers cannot start and every sum goes through the client.
+- The split table (`llama_meta_device_get_split_state` in `src/llama-model.cpp`) is upstream's, adapted to this fork:
+  - It covers the fused full-attention QKV, the GDN head ratio and the replay caches (`r`, `spk`, `spv`, `spgb`).
+  - The KV cache layer is read from the end of the name.
+  - The router and the shared experts are mirrored, as upstream. Slicing the shared experts is Phase 3.
+- The experts are resident: in tensor mode `create_tensor` drops the LongHaul flag, so the experts load sliced like any other weight. `-lhcd` and `-es` are rejected with `-sm tensor`.
+- In tensor mode:
+  - Flash attention is forced on, or the load fails if it is set off.
+  - Backend sampling is off.
+  - `--fit` skips the mode with a warning.
+- `llama-bench -sm tensor` and `-sm tensor` in the common arguments.
+- The model saver copies the meta tensors to host first. The meta buffer finds tensors by pointer, so the save roundtrip of a tensor-mode model crashed before.
+- `ggml-backend-meta.cpp`:
+  - The device name was always `Meta()`: the constructor read a vector it had moved from.
+  - It logs once when the backend all-reduce refuses a tensor and the slow fallback is used.
+- `ggml-rpc.cpp`: rank 0 now listens for its peer on the address its server was started with (`-H`), not on `0.0.0.0`.
+- Docs: `docs/tensor-parallel.md` (how to run it on two Macs), `docs/multi-gpu.md`, `tools/rpc/README.md`.
+
+Tests (section 8):
+- Test 1:
+  - `GGML_METAL_DEVICES=2 test-llama-archs -a 'qwen35|qwen35moe'` adds the rows `Meta` (even) and `Meta 3:1`. All pass.
+  - The NMSE against the CPU is 2.1e-07, the same as one Metal device.
+  - The save roundtrip and the mixed batch pass.
+  - The logs confirm the split: the KV cache of the meta device is half of one device's.
+- Test 2:
+  - `test-llama-archs --rpc` starts two RPC servers on 127.0.0.1 threads and runs `-sm tensor` over `RPC0,RPC1` at 1:1 and 3:1.
+  - It requires that the servers connect to each other and that no sum falls back to the client.
+  - The NMSE against one local GPU: `qwen35` 1.0e-15, `qwen35moe` 8.8e-13.
+  - Mutation check: with the server's sum skipped, all four cases fail (NMSE 2.6e-03 to 2.7e-03), and 1:1 and 3:1 then give different logits, so the two splits really differ.
+- Test 6: `test-arg-expert-split` checks that `-sm tensor` parses and that `-es`, `-lhcd` and `-kvd` fail with it.
+- The tests reused before also pass:
+  - `test-llama-archs` on one device.
+  - `GGML_METAL_DEVICES=2` for the LongHaul archs.
+  - The LongHaul RPC cases.
+  - `ctest -L "main|behavior|rpc"` passes, except 5 tests that already failed on this machine: the Python tests (no numpy, torch, jinja2) and the missing `ggml-vocab-qwen35.gguf`.
+
+Not done: the speed of tensor vs layer vs expert split on the laptops. That needs your approval and your laptops.

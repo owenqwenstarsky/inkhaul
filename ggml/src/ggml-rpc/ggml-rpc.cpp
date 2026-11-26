@@ -1727,8 +1727,8 @@ static bool rpc_check_node(const ggml_tensor * node) {
 
 class rpc_server {
 public:
-    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
-        : backends(std::move(all_backends)), cache_dir(cache_dir) {
+    rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, std::string host)
+        : backends(std::move(all_backends)), cache_dir(cache_dir), host(std::move(host)) {
         stored_graphs.resize(backends.size());
         comm_states.resize(backends.size());
         ggml_init_params params {
@@ -1814,6 +1814,7 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    std::string  host; // the address the server listens on, the comm port of rank 0 uses it too
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
@@ -2554,7 +2555,8 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
 
     // Rank 0 listens and accepts world-1 peers; every other rank connects back to it.
     if (request.rank == 0) {
-        socket_ptr srv = socket_t::create_server("0.0.0.0", request.port);
+        // listen on the address this server serves on, not on every interface
+        socket_ptr srv = socket_t::create_server(host.c_str(), request.port);
         if (srv == nullptr) {
             LOG_ERROR("[%s] failed to listen on comm port %u\n", __func__, request.port);
             return true;
@@ -2885,9 +2887,9 @@ static bool rpc_serve(const socket_ptr & sock, rpc_server & server, handler_t ha
     }
 }
 
-static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir, const std::string & host,
                              socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+    rpc_server server(backends, cache_dir, host);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -3050,7 +3052,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             return;
         }
         LOG_INFO("Accepted client connection\n");
-        rpc_serve_client(backends, cache_dir, client_socket);
+        rpc_serve_client(backends, cache_dir, host, client_socket);
         LOG_INFO("Client connection closed\n");
     }
     rpc_transport_shutdown();

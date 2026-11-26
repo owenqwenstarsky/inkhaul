@@ -1,6 +1,7 @@
 #include "llama-model-saver.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include "llama-arch.h"
@@ -117,6 +118,18 @@ void llama_model_saver::add_tensor(const struct ggml_tensor * tensor) {
         GGML_ASSERT(
             tensor_name == "rope_freqs.weight" || tensor_name == "rope_factors_long.weight" ||
             tensor_name == "rope_factors_short.weight"); // FIXME
+        return;
+    }
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_backend_dev_t dev = buf ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)) : nullptr;
+    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
+        std::vector<uint8_t> & data = host_data.emplace_back(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+        ggml_tensor copy = *tensor;
+        copy.buffer   = nullptr;
+        copy.view_src = nullptr;
+        copy.data     = data.data();
+        gguf_add_tensor(gguf_ctx, &copy);
         return;
     }
     gguf_add_tensor(gguf_ctx, tensor);

@@ -22,6 +22,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <stdexcept>
@@ -197,7 +198,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
-    LOG("  --rpc                    Check LongHaul over an RPC server on a thread of this process (127.0.0.1)\n");
+    LOG("  --rpc                    Check LongHaul and -sm tensor over RPC servers on threads of this process (127.0.0.1)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -523,7 +524,13 @@ static llama_model_ptr get_model(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
-    model_params.tensor_split = tensor_split;
+    // the model reads llama_max_devices() values, the callers give one per device
+    std::vector<float> tensor_split_full;
+    if (tensor_split != nullptr) {
+        tensor_split_full.assign(llama_max_devices(), 0.0f);
+        std::copy(tensor_split, tensor_split + std::min(devs.size(), tensor_split_full.size()), tensor_split_full.begin());
+    }
+    model_params.tensor_split = tensor_split != nullptr ? tensor_split_full.data() : nullptr;
     model_params.main_gpu = main_gpu;
 
     tensor_data_params tensor_params = { seed, stdev };
@@ -859,13 +866,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         std::vector<ggml_backend_dev_t> devs;
         std::string                     label;
         llama_split_mode                split_mode;
+        std::vector<float>              tensor_split;
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, std::vector<float> ts = {})
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), tensor_split(std::move(ts)) {}
     };
 
     std::vector<device_config> dev_configs;
     size_t max_device_label_length = 4;
+    std::vector<ggml_backend_dev_t> devices_meta;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (target_backend != nullptr && strcmp(target_backend, ggml_backend_dev_name(dev)) != 0) {
@@ -873,6 +882,22 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         }
         dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, get_device_label(dev), LLAMA_SPLIT_MODE_LAYER);
         max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+        // CPU-based devices cannot be used in tensor split mode
+        if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
+            devices_meta.push_back(dev);
+        }
+    }
+    // tensor parallelism over all GPUs, with an even and an uneven split
+    if (target_backend == nullptr && !devices_meta.empty()) {
+        dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        if (devices_meta.size() > 1) {
+            std::vector<float> ts(devices_meta.size(), 1.0f);
+            ts[0] = 3.0f;
+            dev_configs.emplace_back(devices_meta, "Meta 3:1", LLAMA_SPLIT_MODE_TENSOR, ts);
+        }
+        for (const auto & dc : dev_configs) {
+            max_device_label_length = std::max(max_device_label_length, dc.label.length());
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -937,16 +962,17 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 char nmse_str[12] = {0};
                 char mixed_str[12] = {0};
 
-                bool skip = !arch_supported(arch);
+                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llama_arch_supports_sm_tensor(arch));
                 bool test_executed = false;
                 bool test_ok = true;
+                const float * dc_ts = dc.tensor_split.empty() ? nullptr : dc.tensor_split.data();
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens);
                     }
                     test_executed = true;
-                    model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode);
+                    model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, nullptr, 0, {}, dc_ts);
                     logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens);
                     const double nmse_val = nmse(logits_cpu, logits_dev);
                     snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -1019,7 +1045,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         GGML_ASSERT(file != nullptr);
 
                         {
-                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode);
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, nullptr, 0, {}, dc_ts);
                             const std::vector<float> logits_roundtrip = get_logits(
                                 model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens);
                             status_roundtrip = "\033[1;32mOK\033[0m";
@@ -2353,6 +2379,118 @@ static int test_longhaul_rpc(const std::string & arch_filter, const size_t seed,
     return all_ok ? 0 : 1;
 }
 
+// tensor parallelism over two RPC servers on threads of this process (127.0.0.1)
+// the all-reduce runs between the two servers, the logits must match the local GPU
+static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    std::vector<std::pair<llm_arch, bool>> archs; // arch, moe
+    for (const auto & am : { std::make_pair(LLM_ARCH_QWEN35, false), std::make_pair(LLM_ARCH_QWEN35MOE, true) }) {
+        if (arch_matches(arch_filter, am.first)) {
+            archs.push_back(am);
+        }
+    }
+    if (archs.empty()) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu = get_gpu(target_backend, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    if (gpu == nullptr || reg == nullptr) {
+        LOG("Tensor RPC: SKIP (%s)\n", gpu == nullptr ? "no GPU" : "no RPC backend");
+        return 0;
+    }
+    auto start_server_fn = (decltype(ggml_backend_rpc_start_server) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    auto add_server_fn   = (decltype(ggml_backend_rpc_add_server) *)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_add_server");
+    GGML_ASSERT(start_server_fn && add_server_fn);
+
+    // two servers on ports p and p+1, rank 0 listens for rank 1 on p+1000
+    std::random_device rd;
+    const int port0 = 40000 + (int) (rd() % 18000);
+    std::vector<ggml_backend_dev_t> rpcs;
+    for (int i = 0; i < 2; i++) {
+        const std::string endpoint = "127.0.0.1:" + std::to_string(port0 + i);
+        std::thread([start_server_fn, endpoint, gpu]() mutable {
+            start_server_fn(endpoint.c_str(), nullptr, 4, 1, &gpu);
+        }).detach();
+        ggml_backend_reg_t reg_server = nullptr;
+        for (int j = 0; j < 400 && reg_server == nullptr; j++) {
+            reg_server = add_server_fn(endpoint.c_str());
+            if (reg_server == nullptr) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
+        if (reg_server == nullptr) {
+            LOG("Tensor RPC: FAIL (the RPC server on %s did not start)\n", endpoint.c_str());
+            return 1;
+        }
+        rpcs.push_back(ggml_backend_reg_dev_get(reg_server, 0));
+    }
+
+    // the servers log from their own threads
+    struct log_capture {
+        std::mutex  mutex;
+        std::string text;
+    };
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    bool all_ok = true;
+    for (const auto & am : archs) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(am.first, am.second);
+        std::vector<float> logits_ref;
+        {
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { gpu });
+            logits_ref = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+        }
+        struct tensor_case {
+            const char *       name;
+            std::vector<float> ts;
+        };
+        const tensor_case cases[] = {
+            { "1:1", {}             },
+            { "3:1", { 3.0f, 1.0f } },
+        };
+        for (const tensor_case & tc : cases) {
+            log_capture log;
+            ggml_log_callback log_cb;
+            void * log_ud;
+            llama_log_get(&log_cb, &log_ud);
+            llama_log_set([](ggml_log_level, const char * text, void * ud) {
+                log_capture * lc = (log_capture *) ud;
+                std::lock_guard<std::mutex> lock(lc->mutex);
+                lc->text.append(text);
+            }, &log);
+            bool ok = true;
+            std::string detail;
+            try {
+                auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, rpcs, LLAMA_SPLIT_MODE_TENSOR,
+                    nullptr, 0, {}, tc.ts.empty() ? nullptr : tc.ts.data());
+                const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                const double nmse_val = nmse(logits_ref, logits);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail = buf;
+                ok = nmse_val <= 1e-4;
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            llama_log_set(log_cb, log_ud);
+
+            // the sums must go between the servers, not through this process
+            std::lock_guard<std::mutex> lock(log.mutex);
+            if (log.text.find("pairwise communicator initialized") == std::string::npos) {
+                ok = false;
+                detail += ", the servers did not connect to each other";
+            }
+            if (log.text.find("using the fallback") != std::string::npos) {
+                ok = false;
+                detail += ", some sums went through this process";
+            }
+            LOG("Tensor RPC %s, 2 ranks %s: %s (%s)\n", llama_arch_name(am.first), tc.name, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+    }
+    return all_ok ? 0 : 1;
+}
+
 // Ling 3 rotates adjacent pairs: a bailingmoe3 model ropes with NORM (one position per token) even with the mrope sections of the VL files
 static int test_rope_type(const std::string & arch_filter, const size_t seed, const float stdev) {
     if (!arch_matches(arch_filter, LLM_ARCH_BAILINGMOE3)) {
@@ -2783,7 +2921,8 @@ int main(int argc, char ** argv) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
         }
         if (rpc) {
-            return test_longhaul_rpc(arch_filter, seed, stdev, target_backend);
+            const int ret = test_longhaul_rpc(arch_filter, seed, stdev, target_backend);
+            return test_tensor_rpc(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         }
         int ret = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
         ret = test_rope_type(arch_filter, seed, stdev) != 0 ? 1 : ret;

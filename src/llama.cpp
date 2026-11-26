@@ -157,10 +157,54 @@ int64_t llama_time_us(void) {
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
     if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR is not supported\n", __func__);
-        return false;
-    }
-    if (params.devices) {
+        // one meta device over the given devices, or over all GPUs (RPC first, like the other modes)
+        std::vector<ggml_backend_dev_t> devs;
+        if (params.devices) {
+            for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+                devs.push_back(*dev);
+            }
+        } else {
+            std::vector<ggml_backend_dev_t> rpc;
+            std::vector<ggml_backend_dev_t> gpus;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                const auto type = ggml_backend_dev_type(dev);
+                if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    continue;
+                }
+                const bool is_rpc = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) == std::string("RPC");
+                (is_rpc ? rpc : gpus).push_back(dev);
+            }
+            devs = rpc;
+            devs.insert(devs.end(), gpus.begin(), gpus.end());
+        }
+        if (devs.empty()) {
+            LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 GPU devices\n", __func__);
+            return false;
+        }
+        if (devs.size() > GGML_BACKEND_META_MAX_DEVICES) {
+            LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR supports at most %d devices\n", __func__, GGML_BACKEND_META_MAX_DEVICES);
+            return false;
+        }
+        // the servers sum between each other only when every device is an RPC device
+        size_t n_rpc = 0;
+        for (ggml_backend_dev_t dev : devs) {
+            n_rpc += ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) == std::string("RPC");
+        }
+        if (n_rpc > 0 && n_rpc < devs.size()) {
+            LLAMA_LOG_WARN("%s: RPC and local devices are mixed, so the sums of every layer go through this process (slow); "
+                "run an RPC server on this machine too and give only RPC devices, e.g. -dev RPC0,RPC1\n", __func__);
+        }
+        LLAMA_LOG_INFO("%s: creating a meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
+        for (size_t i = 0; i < devs.size(); ++i) {
+            LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
+        }
+        model->get_split_state_ud.n_devices = devs.size();
+        model->get_split_state_ud.model     = model;
+        model->devices.push_back({
+            true, ggml_backend_meta_device(devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
+        });
+    } else if (params.devices) {
         for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
             model->devices.push_back({false, *dev});
         }

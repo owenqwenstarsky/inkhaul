@@ -64,13 +64,14 @@ struct ggml_backend_meta_device_context {
             simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
         name        = std::string("Meta(");
         description = std::string("Meta(");
-        for (size_t i = 0; i < simple_devs.size(); i++) {
+        // the parameter was moved from, so read the member
+        for (size_t i = 0; i < this->simple_devs.size(); i++) {
             if (i > 0) {
                 name        += ",";
                 description += ",";
             }
-            name        += ggml_backend_dev_name       (simple_devs[i]);
-            description += ggml_backend_dev_description(simple_devs[i]);
+            name        += ggml_backend_dev_name       (this->simple_devs[i]);
+            description += ggml_backend_dev_description(this->simple_devs[i]);
         }
         name        += ")";
         description += ")";
@@ -1914,6 +1915,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    bool                                 comm_warned    = false; // the fallback was logged once
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2574,6 +2576,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             if (!backend_allreduce_success) {
+                if (backend_ctx->comm_ctx && !backend_ctx->comm_warned) {
+                    // the sums now go through this process, which is slower
+                    const ggml_tensor * node = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->nodes[
+                        backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
+                    GGML_LOG_WARN("%s: the backend all-reduce refused %s (%s), using the fallback\n",
+                        __func__, node->name, ggml_type_name(node->type));
+                    backend_ctx->comm_warned = true;
+                }
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;

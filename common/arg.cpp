@@ -864,6 +864,9 @@ static void common_params_resolve_expert_split(common_params & params) {
     if (params.expert_share.empty() && params.kv_device.empty() && params.longhaul_cache_devices.empty()) {
         return;
     }
+    if (!params.longhaul_cache_devices.empty() && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::invalid_argument("--longhaul-cache-device does not apply to --split-mode tensor, which keeps all experts in memory");
+    }
     if (!params.kv_device.empty() && !split_expert) {
         throw std::invalid_argument("--kv-device needs --expert-share (with the layer split the KV cache follows the layers, see --tensor-split)");
     }
@@ -2939,12 +2942,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row,expert}",
+        {"-sm", "--split-mode"}, "{none,layer,row,expert,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
         "- row: split weight across GPUs by rows (parallelized)\n"
-        "- expert: LongHaul only, layers and KV on --main-gpu, the experts of each layer split by --tensor-split (see --expert-share)",
+        "- expert: LongHaul only, layers and KV on --main-gpu, the experts of each layer split by --tensor-split (see --expert-share)\n"
+        "- tensor: every layer split over all GPUs at once (tensor parallelism, qwen35 and qwen35moe, needs flash attention)",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -2954,6 +2958,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
             } else if (value == "expert") {
                 params.split_mode = LLAMA_SPLIT_MODE_EXPERT;
+            } else if (value == "tensor") {
+                params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
             } else {
                 throw std::invalid_argument("invalid value");
             }

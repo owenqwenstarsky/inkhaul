@@ -567,6 +567,17 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     }
 }
 
+// archs whose tensors llama_meta_device_get_split_state knows how to split
+bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llm_arch_mmid_down_bf16(const llm_arch & arch) {
     switch (arch) {
         default:
@@ -601,4 +612,8 @@ std::string llama_arch_kv_name(llm_arch arch, llm_kv key) {
 
 bool llama_arch_supports_mixed_batch(llm_arch arch) {
     return llm_arch_supports_mixed_batch(arch);
+}
+
+bool llama_arch_supports_sm_tensor(llm_arch arch) {
+    return llm_arch_supports_sm_tensor(arch);
 }

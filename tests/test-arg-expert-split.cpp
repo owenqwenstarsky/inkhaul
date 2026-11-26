@@ -122,6 +122,12 @@ int main(void) {
     assert(parse_fails({ "-es", "100", "-ts", "1" }));
     assert(parse_fails({ "-es", gpu0 + "=100", "-sm", "row" }));
     assert(parse_fails({ "-es", gpu0 + "=100", "-sm", "expert" }));
+    // the tensor split keeps all experts in memory and splits each of them
+    assert(parse_ok({ "-sm", "tensor" }, params));
+    assert(params.split_mode == LLAMA_SPLIT_MODE_TENSOR);
+    assert(parse_fails({ "-es", gpu0 + "=100", "-sm", "tensor" }));
+    assert(parse_fails({ "-sm", "tensor", "-lhcd", gpu0 + "=1G" }));
+    assert(parse_fails({ "-sm", "tensor", "-kvd", gpu0 }));
     assert(parse_fails({ "-es", gpu0 + "=101" }));
     assert(parse_fails({ "-es", gpu0 + "=-1" }));
     assert(parse_fails({ "-es", gpu0 + "=abc" }));

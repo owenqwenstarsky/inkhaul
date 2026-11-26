@@ -38,7 +38,7 @@ If there are no accelerators, it exposes a single `CPU` device.
 
 ## This fork: several Macs over Thunderbolt
 
-This fork uses RPC to run one LongHaul model over several Macs connected with Thunderbolt cables. Each Mac holds some of the layers and caches the experts of those layers in its own memory. See [docs/longhaul.md](../../docs/longhaul.md#several-laptops) for how the layers and the cache are split. With `-es` (for example `-es 60`, the remote computes about 60% of the experts) all Macs work on every MoE layer at the same time instead of in turns, see [Expert split](../../docs/longhaul.md#expert-split).
+This fork uses RPC to run one LongHaul model over several Macs connected with Thunderbolt cables. Each Mac holds some of the layers and caches the experts of those layers in its own memory. See [docs/longhaul.md](../../docs/longhaul.md#several-laptops) for how the layers and the cache are split. With `-es` (for example `-es 60`, the remote computes about 60% of the experts) all Macs work on every MoE layer at the same time instead of in turns, see [Expert split](../../docs/longhaul.md#expert-split). For Qwen 3.5 models in memory, `-sm tensor` splits every matrix over two Macs, see [docs/tensor-parallel.md](../../docs/tensor-parallel.md).
 
 1. Build the same commit on every Mac. RPC is built by default on macOS. The server rejects other protocol versions, and both ends must have the same kernels.
 2. Connect the Macs with Thunderbolt cables. On each Mac open System Settings -> Network -> Thunderbolt Bridge -> Details -> TCP/IP, set "Configure IPv4" to "Manually" and give each Mac its own address in one subnet, for example `10.0.0.1` for the main Mac and `10.0.0.2`, `10.0.0.3`, ... for the others, with the subnet mask `255.255.255.0`.

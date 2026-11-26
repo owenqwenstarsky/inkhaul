@@ -202,7 +202,7 @@ extern "C" {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
         LLAMA_SPLIT_MODE_ROW    = 2, // split layers and KV across GPUs, use tensor parallelism if supported
-        LLAMA_SPLIT_MODE_TENSOR = 3, // not supported, model loading fails
+        LLAMA_SPLIT_MODE_TENSOR = 3, // split the tensors of every layer over the devices (tensor parallelism, qwen35 and qwen35moe)
         LLAMA_SPLIT_MODE_EXPERT = 4, // LongHaul only: every layer and the KV on main_gpu, the routed experts of each MoE layer split over the devices by tensor_split
     };
 

@@ -1396,8 +1396,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
+    // the logits of tensor parallelism are split by vocab over the devices, backend sampling cannot see all of them
     const bool can_offload =
         sampler &&
+        model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
         sampler->iface->backend_init &&
         sampler->iface->backend_apply &&
         llama_sampler_chain_n(sampler) > 0;
@@ -4063,6 +4065,20 @@ llama_context * llama_init_from_model(
                     return nullptr;
                 }
             }
+        }
+    }
+
+    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
+            return nullptr;
+        }
+        if (model->get_split_state_ud.n_devices == 1) {
+            LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
         }
     }
 
