@@ -146,7 +146,7 @@ void llama_model_kolibri1::llm_graph_input_sparse::set_input(const llama_ubatch 
     const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
 
-    // indexer rules are stated in sequence positions, so we need a mapping to 
+    // indexer rules are stated in sequence positions, so we need a mapping to
     // translate between cells and positions within the sequences of the ubatch
     std::map<llama_seq_id, std::vector<int32_t>> cell_to_pos;
     std::map<llama_seq_id, std::vector<int32_t>> pos_to_cell;
