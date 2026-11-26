@@ -23,6 +23,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Inkling2ForConditionalGeneration": "inkling2",
     "Inkling2LoopForCausalLM": "inkling2",
     "Inkling2LoopForConditionalGeneration": "inkling2",
+    "Kolibri1ForCausalLM": "kolibri1",
+    "Kolibri1_1ForCausalLM": "kolibri1",
     "Qwen3DSparkModel": "dspark",
     "Qwen3_5ForCausalLM": "qwen",
     "Qwen3_5ForConditionalGeneration": "qwen",

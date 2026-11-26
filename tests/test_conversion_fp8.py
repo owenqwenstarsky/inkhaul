@@ -24,6 +24,7 @@ from conversion import get_model_class
 from conversion.base import LazyTorchTensor, ModelType, get_model_architecture, gguf
 from conversion.bailingmoe3 import BailingMoeV3Model, BailingMoeV3VLModel
 from conversion.inkling2 import Inkling2Model, _E4M3, _E2M1
+from conversion.kolibri1 import Kolibri1Model, Kolibri11Model
 
 
 class ConversionTestCase(unittest.TestCase):
@@ -721,6 +722,214 @@ class TestBailingMoeV3Conversion(ConversionTestCase):
             self.assertFalse(args.mtp)
         with mock.patch.object(sys, "argv", ["convert_hf_to_gguf.py", "--mtp", "model"]):
             self.assertTrue(convert_hf_to_gguf.parse_args().mtp)
+
+
+class TestKolibri1Conversion(ConversionTestCase):
+    """Synthetic Kolibri-1.1 checkpoint: layer 0 is a sliding layer with a dense FFN, layer 1 an indexer, layer 2 a sliding layer
+    and layer 3 a reindexer that reads the K/V of layer 1 but keeps unused K/V projections, as the released checkpoints do."""
+
+    N_EMBD, N_VOCAB, HEAD_DIM, N_HEAD, N_HEAD_KV, N_FF, N_FF_EXP, N_FF_SHEXP, N_EXPERT = 128, 32, 32, 4, 2, 256, 64, 64, 4
+    FP8_CONFIG = {"quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128]}
+
+    def config(self, sparse=True):
+        config = {
+            "architectures": ["Kolibri1_1ForCausalLM" if sparse else "Kolibri1ForCausalLM"],
+            "model_type": "kolibri1_1" if sparse else "kolibri1",
+            "vocab_size": self.N_VOCAB,
+            "hidden_size": self.N_EMBD,
+            "num_hidden_layers": 4,
+            "num_attention_heads": self.N_HEAD,
+            "num_key_value_heads": self.N_HEAD_KV,
+            "head_dim": self.HEAD_DIM,
+            "max_position_embeddings": 4096,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "num_experts": self.N_EXPERT,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": self.N_FF_EXP,
+            "shared_expert_intermediate_size": self.N_FF_SHEXP,
+            "norm_topk_prob": False,
+            "sliding_window": 513,
+            "layer_types": ["sliding_attention", "indexed_attention", "sliding_attention", "indexed_attention"],
+            "quantization_config": self.FP8_CONFIG,
+        }
+        if sparse:
+            config.update({
+                "mlp_only_layers": [0],
+                "mlp_only_intermediate_size": self.N_FF,
+                "index_layers": [1],
+                "kv_source_layers": [0, 1, 2, 1],
+                "index_topk": 2048,
+                "index_pool_size": 16384,
+                "index_compression": 16,
+                "index_num_local_tokens": 128,
+                "index_num_sink_tokens": 8,
+                "index_num_heads": self.N_HEAD // self.N_HEAD_KV,
+                "kv_cache_qat": True,
+            })
+        return config
+
+    def checkpoint(self, sparse=True):
+        """Returns the checkpoint tensors and the FP8 reference values by source weight name."""
+        generator = torch.Generator().manual_seed(0)
+        tensors: dict[str, torch.Tensor] = {}
+        fp8_reference: dict[str, np.ndarray] = {}
+
+        def add(name, *shape, dtype=torch.bfloat16):
+            tensors[name] = torch.randn(shape, generator=generator).to(dtype)
+
+        def add_fp8(name, shape, scale):
+            weight, scale_inv, reference = TestBailingMoeV3Conversion.fp8(shape, scale)
+            tensors[name + ".weight"] = weight
+            tensors[name + ".weight_scale_inv"] = scale_inv
+            fp8_reference[name + ".weight"] = reference
+
+        H, D = self.N_EMBD, self.HEAD_DIM
+        add("model.embed_tokens.weight", self.N_VOCAB, H)
+        add("model.norm.weight", H)
+        add("lm_head.weight", self.N_VOCAB, H)
+        for bid in range(4):
+            p = f"model.layers.{bid}."
+            for norm in ("input_layernorm", "post_attn_norm", "post_attention_layernorm", "post_ffn_norm"):
+                add(p + norm + ".weight", H)
+            add(p + "self_attn.q_proj.weight", self.N_HEAD * D, H)
+            add(p + "self_attn.k_proj.weight", self.N_HEAD_KV * D, H)
+            add(p + "self_attn.v_proj.weight", self.N_HEAD_KV * D, H)
+            add(p + "self_attn.o_proj.weight", H, self.N_HEAD * D)
+            add(p + "self_attn.q_norm.weight", D)
+            add(p + "self_attn.k_norm.weight", D)
+            if sparse and bid == 0:
+                add_fp8(p + "mlp.gate_proj", (self.N_FF, H), [[0.5], [2.0]])
+                add_fp8(p + "mlp.up_proj", (self.N_FF, H), [[0.25], [4.0]])
+                add_fp8(p + "mlp.down_proj", (H, self.N_FF), [[1.5, 0.125]])
+                continue
+            add(p + "mlp.gate.weight", self.N_EXPERT, H, dtype=torch.float32)
+            add(p + "moe.router.expert_bias", self.N_EXPERT, dtype=torch.float32)
+            for xid in range(self.N_EXPERT):
+                add_fp8(p + f"mlp.experts.{xid}.gate_proj", (self.N_FF_EXP, H), [[0.5 + xid]])
+                add_fp8(p + f"mlp.experts.{xid}.up_proj", (self.N_FF_EXP, H), [[0.25 * (xid + 1)]])
+                add_fp8(p + f"mlp.experts.{xid}.down_proj", (H, self.N_FF_EXP), [[2.0 + xid]])
+            add_fp8(p + "mlp.shared_experts.gate_proj", (self.N_FF_SHEXP, H), [[3.0]])
+            add_fp8(p + "mlp.shared_experts.up_proj", (self.N_FF_SHEXP, H), [[0.5]])
+            add_fp8(p + "mlp.shared_experts.down_proj", (H, self.N_FF_SHEXP), [[0.75]])
+        return tensors, fp8_reference
+
+    def expected_shapes(self, sparse=True):
+        H, D = self.N_EMBD, self.HEAD_DIM
+        shapes = {
+            "token_embd.weight": (self.N_VOCAB, H),
+            "output_norm.weight": (H,),
+            "output.weight": (self.N_VOCAB, H),
+        }
+        for bid in range(4):
+            shapes.update({
+                f"blk.{bid}.attn_norm.weight": (H,),
+                f"blk.{bid}.post_attention_norm.weight": (H,),
+                f"blk.{bid}.ffn_norm.weight": (H,),
+                f"blk.{bid}.post_ffw_norm.weight": (H,),
+                f"blk.{bid}.attn_q.weight": (self.N_HEAD * D, H),
+                f"blk.{bid}.attn_output.weight": (H, self.N_HEAD * D),
+                f"blk.{bid}.attn_q_norm.weight": (D,),
+            })
+            # the reindexer reads the K/V of layer 1
+            if not sparse or bid != 3:
+                shapes.update({
+                    f"blk.{bid}.attn_k.weight": (self.N_HEAD_KV * D, H),
+                    f"blk.{bid}.attn_v.weight": (self.N_HEAD_KV * D, H),
+                    f"blk.{bid}.attn_k_norm.weight": (D,),
+                })
+            if sparse and bid == 0:
+                shapes.update({
+                    "blk.0.ffn_gate.weight": (self.N_FF, H),
+                    "blk.0.ffn_up.weight": (self.N_FF, H),
+                    "blk.0.ffn_down.weight": (H, self.N_FF),
+                })
+                continue
+            shapes.update({
+                f"blk.{bid}.ffn_gate_inp.weight": (self.N_EXPERT, H),
+                f"blk.{bid}.exp_probs_b.bias": (self.N_EXPERT,),
+                f"blk.{bid}.ffn_gate_exps.weight": (self.N_EXPERT, self.N_FF_EXP, H),
+                f"blk.{bid}.ffn_up_exps.weight": (self.N_EXPERT, self.N_FF_EXP, H),
+                f"blk.{bid}.ffn_down_exps.weight": (self.N_EXPERT, H, self.N_FF_EXP),
+                f"blk.{bid}.ffn_gate_shexp.weight": (self.N_FF_SHEXP, H),
+                f"blk.{bid}.ffn_up_shexp.weight": (self.N_FF_SHEXP, H),
+                f"blk.{bid}.ffn_down_shexp.weight": (H, self.N_FF_SHEXP),
+            })
+        return shapes
+
+    def run_converter(self, model_class, config, tensors, ftype=gguf.LlamaFileType.ALL_F32, **kwargs):
+        result, kv = self.convert(model_class, tensors, ftype=ftype, hparams_override=config, with_kv=True, **kwargs)
+        prefix = "kolibri1."
+        return result, {key[len(prefix):]: value for key, value in kv.items() if key.startswith(prefix)}
+
+    def test_registered_classes(self):
+        for config, expected in ((self.config(sparse=True), Kolibri11Model), (self.config(sparse=False), Kolibri1Model)):
+            arch = get_model_architecture(config, ModelType.TEXT)
+            self.assertIs(get_model_class(arch), expected)
+
+    def test_kolibri11(self):
+        tensors, fp8_reference = self.checkpoint()
+        result, kv = self.run_converter(Kolibri11Model, self.config(), tensors, check_lazy=True)
+
+        self.assertEqual({name: data.shape for name, (_, data) in result.items()}, self.expected_shapes())
+        for name, (dtype, _) in result.items():
+            self.assertEqual(dtype, gguf.GGMLQuantizationType.F32, name)
+
+        self.assertEqual(kv["block_count"], 4)
+        self.assertEqual((kv["feed_forward_length"], kv["leading_dense_block_count"]), (self.N_FF, 1))
+        self.assertEqual((kv["expert_count"], kv["expert_used_count"]), (self.N_EXPERT, 2))
+        self.assertEqual((kv["expert_feed_forward_length"], kv["expert_shared_feed_forward_length"]), (self.N_FF_EXP, self.N_FF_SHEXP))
+        self.assertEqual((kv["expert_shared_count"], kv["expert_weights_norm"]), (1, False))
+        self.assertEqual(kv["expert_gating_func"], gguf.ExpertGatingFuncType.SIGMOID)
+        self.assertEqual((kv["attention.head_count"], kv["attention.head_count_kv"]), (self.N_HEAD, self.N_HEAD_KV))
+        self.assertEqual((kv["attention.key_length"], kv["attention.value_length"], kv["rope.dimension_count"]), (self.HEAD_DIM,) * 3)
+        self.assertEqual((kv["attention.sliding_window"], kv["vocab_size"]), (513, self.N_VOCAB))
+        self.assertEqual(list(kv["attention.sliding_window_pattern"]), [True, False, True, False])
+        self.assertEqual(list(kv["attention.indexer.types"]), [False, True, False, False])
+        self.assertEqual(list(kv["attention.kv_source_map"]), [0, 1, 2, 1])
+        self.assertEqual(kv["attention.indexer.top_k"], 2048)
+        self.assertEqual((kv["attention.indexer.candidate_block_size"], kv["attention.indexer.candidate_top_k_blocks"]), (16, 1024))
+
+        def source(name):
+            return tensors[name].float().numpy()
+
+        # no rope row permutation
+        np.testing.assert_array_equal(result["blk.1.attn_q.weight"][1], source("model.layers.1.self_attn.q_proj.weight"))
+        np.testing.assert_array_equal(result["blk.1.attn_k.weight"][1], source("model.layers.1.self_attn.k_proj.weight"))
+        # post_attention_layernorm is the norm before the FFN
+        np.testing.assert_array_equal(result["blk.2.ffn_norm.weight"][1], source("model.layers.2.post_attention_layernorm.weight"))
+        np.testing.assert_array_equal(result["blk.2.post_attention_norm.weight"][1], source("model.layers.2.post_attn_norm.weight"))
+        np.testing.assert_array_equal(result["blk.2.post_ffw_norm.weight"][1], source("model.layers.2.post_ffn_norm.weight"))
+        np.testing.assert_array_equal(result["blk.3.exp_probs_b.bias"][1], source("model.layers.3.moe.router.expert_bias"))
+
+        for proj, target in (("gate_proj", "ffn_gate_exps"), ("up_proj", "ffn_up_exps"), ("down_proj", "ffn_down_exps")):
+            experts = np.stack([fp8_reference[f"model.layers.1.mlp.experts.{xid}.{proj}.weight"] for xid in range(self.N_EXPERT)])
+            np.testing.assert_array_equal(result[f"blk.1.{target}.weight"][1], experts)
+        for source_name, target in (
+            ("model.layers.0.mlp.gate_proj.weight", "blk.0.ffn_gate.weight"),
+            ("model.layers.0.mlp.down_proj.weight", "blk.0.ffn_down.weight"),
+            ("model.layers.2.mlp.shared_experts.up_proj.weight", "blk.2.ffn_up_shexp.weight"),
+        ):
+            np.testing.assert_array_equal(result[target][1], fp8_reference[source_name], target)
+
+    def test_kolibri1(self):
+        """Kolibri-1 has no dense prefix and no sparse attention: every layer keeps its K/V, the FFN length is the expert length."""
+        tensors, _ = self.checkpoint(sparse=False)
+        result, kv = self.run_converter(Kolibri1Model, self.config(sparse=False), tensors)
+        self.assertEqual({name: data.shape for name, (_, data) in result.items()}, self.expected_shapes(sparse=False))
+        self.assertEqual(kv["feed_forward_length"], self.N_FF_EXP)
+        for key in ("leading_dense_block_count", "attention.indexer.top_k", "attention.indexer.types", "attention.kv_source_map"):
+            self.assertNotIn(key, kv)
+
+    def test_unsupported_sparse_attention(self):
+        tensors, _ = self.checkpoint()
+        for key, value in (("index_num_sink_tokens", 4), ("index_num_heads", 1), ("kv_cache_qat", False)):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                self.run_converter(Kolibri11Model, {**self.config(), key: value}, tensors)
+        with self.assertRaisesRegex(ValueError, "Sliding-window layers"):
+            self.run_converter(Kolibri11Model, {**self.config(), "index_layers": [0]}, tensors)
+        with self.assertRaisesRegex(ValueError, "leading layers"):
+            self.run_converter(Kolibri11Model, {**self.config(), "mlp_only_layers": [1]}, tensors)
 
 
 if __name__ == "__main__":

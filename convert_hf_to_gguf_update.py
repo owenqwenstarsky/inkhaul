@@ -92,6 +92,8 @@ models = [
 # some models are known to be broken upstream, so we will skip them as exceptions
 pre_computed_hashes: list[dict] = [
     {"name": "qwen35",    "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/openbmb/MiniCPM-V-4_6", "chkhsh": "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f"},
+    # Kolibri-1 and Kolibri-1.1 use a 128k vocabulary with the qwen2 pre-tokenizer regex
+    {"name": "qwen2",     "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/Aleph-Alpha/Kolibri-1.1", "chkhsh": "6e040dfe72e4b85855588c53acf4909ac4e98e55bc3a33cd7db499180dc42a78"},
 ]
 
 

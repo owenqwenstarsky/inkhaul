@@ -118,5 +118,41 @@ int main() {
         }
     }
 
+    // LLAMA_VOCAB_PRE_TYPE_QWEN2 (Kolibri), the expected splits come from the pre-tokenizer of the Kolibri-1.1 HF tokenizer
+    const std::vector<std::string> regex_qwen2 = {
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    };
+    const struct {
+        std::string text;
+        std::vector<std::string> expected;
+    } qwen2_tests[] = {
+        { "Hello world", { "Hello", " world" } },
+        { " Hallo  Welt ", { " Hallo", " ", " Welt", " " } },
+        { "Gr\303\274\303\237e aus M\303\274nchen, \303\204rger \303\274ber \303\226l und Stra\303\237en\303\244cker", { "Gr\303\274\303\237e", " aus", " M\303\274nchen", ",", " \303\204rger", " \303\274ber", " \303\226l", " und", " Stra\303\237en\303\244cker" } },
+        { "I've been 'told he's there, 'RE you sure? 'M not sure I'll make it, 'D you like some tea? We'Ve a'lL", { "I", "'ve", " been", " '", "told", " he", "'s", " there", ",", " '", "RE", " you", " sure", "?", " '", "M", " not", " sure", " I", "'ll", " make", " it", ",", " '", "D", " you", " like", " some", " tea", "?", " We", "'Ve", " a", "'lL" } },
+        { "3 33 333 3333 3.14 1.000.000,50\342\202\254", { "3", " ", "3", "3", " ", "3", "3", "3", " ", "3", "3", "3", "3", " ", "3", ".", "1", "4", " ", "1", ".", "0", "0", "0", ".", "0", "0", "0", ",", "5", "0", "\342\202\254" } },
+        { "Die Bundesrepublik Deutschland (BRD) hat 16 L\303\244nder.", { "Die", " Bundesrepublik", " Deutschland", " (", "BRD", ")", " hat", " ", "1", "6", " L\303\244nder", "." } },
+        { "line one\nline two\r\n\n  indented\ttab", { "line", " one", "\n", "line", " two", "\r\n\n", " ", " indented", "\ttab" } },
+        { "foo!!! bar??? (baz) [qux] {x}", { "foo", "!!!", " bar", "???", " (", "baz", ")", " [", "qux", "]", " {", "x", "}" } },
+        { "\342\200\236Anf\303\274hrungszeichen\342\200\234 und \302\273Guillemets\302\253 \342\200\223 Gedankenstrich", { "\342\200\236Anf\303\274hrungszeichen", "\342\200\234", " und", " \302\273", "Guillemets", "\302\253", " \342\200\223", " Gedankenstrich" } },
+        { "STRASSE \341\272\236 gro\303\237", { "STRASSE", " \341\272\236", " gro\303\237" } },
+        { "   \n\n   x", { "   \n\n", "  ", " x" } },
+        { "def f(x):\n    return x**2  # comment\n", { "def", " f", "(x", "):\n", "   ", " return", " x", "**", "2", " ", " #", " comment", "\n" } },
+        { "<think>ok</think><tool_call>", { "<think", ">ok", "</", "think", "><", "tool", "_call", ">" } },
+        { "<|im_start|>assistant\n", { "<|", "im", "_start", "|>", "assistant", "\n" } },
+        { "...\n\n---\n", { "...\n\n", "---\n" } },
+    };
+    for (const auto & test : qwen2_tests) {
+        const auto pieces = unicode_regex_split(test.text, regex_qwen2, false);
+        if (pieces != test.expected) {
+            fprintf(stderr, "unexpected qwen2 split of \"%s\":", test.text.c_str());
+            for (const auto & piece : pieces) {
+                fprintf(stderr, " [%s]", piece.c_str());
+            }
+            fprintf(stderr, "\n");
+            success = false;
+        }
+    }
+
     return success ? 0 : 1;
 }

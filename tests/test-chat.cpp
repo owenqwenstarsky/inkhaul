@@ -4114,6 +4114,125 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     }
 
 
+    // Aleph-Alpha Kolibri-1.1: Qwen3 tokens, the model opens the think block, JSON tool calls in <tool_call> tags
+    {
+        const char * path = "models/templates/Aleph-Alpha-Kolibri-1.1.jinja";
+        auto tst = peg_tester(path, detailed_debug);
+        tst.specials(qwen3_coder_specials);
+
+        // The template closes the think block when reasoning is off, by enable_thinking or by reasoning_effort none
+        struct gen_case {
+            bool        thinking;
+            const char * effort; // nullptr: not set
+            const char * prompt;
+        };
+        for (const gen_case & gc : {
+                gen_case{ true,  nullptr, "<|im_start|>assistant\n" },
+                gen_case{ false, nullptr, "<|im_start|>assistant\n<think>\n\n</think>\n\n" },
+                gen_case{ true,  "none",  "<|im_start|>assistant\n<think>\n\n</think>\n\n" },
+                gen_case{ true,  "low",   "<|im_start|>assistant\n" },
+            }) {
+            auto tmpls = read_templates(path);
+            common_chat_templates_inputs inputs;
+            inputs.messages        = { message_user };
+            inputs.enable_thinking = gc.thinking;
+            if (gc.effort) {
+                inputs.chat_template_kwargs["reasoning_effort"] = std::string("\"") + gc.effort + "\"";
+            }
+            auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_equals(COMMON_CHAT_FORMAT_PEG_NATIVE, params.format);
+            assert_equals(true, params.supports_thinking);
+            assert_equals(std::string(gc.prompt), params.generation_prompt);
+        }
+
+        // Each effort level writes its own sentence in the system turn
+        for (const auto & [effort, sentence] : std::vector<std::pair<std::string, std::string>>{
+                { "",       "Reasoning effort is set to high." },
+                { "none",   "Reasoning is disabled." },
+                { "low",    "Reasoning effort is set to low." },
+                { "medium", "Reasoning effort is set to medium." },
+                { "max",    "Reasoning effort is set to high." },
+            }) {
+            auto tmpls = read_templates(path);
+            common_chat_templates_inputs inputs;
+            inputs.messages = { message_user };
+            if (!effort.empty()) {
+                inputs.chat_template_kwargs["reasoning_effort"] = "\"" + effort + "\"";
+            }
+            auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_contains(params.prompt.str(), "# Reasoning effort\n\n" + sentence);
+        }
+
+        // Thinking, then content
+        tst.test("<think>\nI'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // Without reasoning extraction, the think block stays in the content
+        tst.test("<think>\nI'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .enable_thinking(true)
+            .expect_content("<think>\nI'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .run();
+
+        // Reasoning off: bare content
+        tst.test("Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .expect(message_assist)
+            .run();
+
+        // Cut by the token limit while thinking
+        tst.test("<think>\nI was still thinking")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .expect_reasoning("I was still thinking")
+            .run();
+
+        // A tool call
+        tst.test("<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .expect_grammar()
+            .run();
+
+        // A tool call after thinking
+        tst.test("<think>\nI'm\nthinking\n</think>\n\n"
+                 "<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .run();
+
+        // Parallel tool calls
+        tst.test("<tool_call>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}\n</tool_call>\n"
+                 "<tool_call>\n{\"name\": \"special_function_with_opt\", \"arguments\": {\"arg1\": 1, \"arg2\": 2}}\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .run();
+
+        // Response format
+        tst.test("<think>\nI need to output the invoice details in JSON\n</think>\n\n"
+                 R"({"amount": 123.45, "date": "2025-12-03"})")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .json_schema(invoice_schema)
+            .expect_reasoning("I need to output the invoice details in JSON")
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+    }
+
     // Inkling 1 and 2
     for (const int version : { 1, 2 }) {
         auto tst = peg_tester(version == 1 ? "models/templates/thinkingmachines-Inkling.jinja" :
@@ -5546,6 +5665,7 @@ static void test_reasoning_effort_caps() {
     assert_supports_effort("models/templates/thinkingmachines-Inkling-2-Small.jinja", true);
     assert_supports_effort("models/templates/tencent-Hy3.jinja", true);
     assert_supports_effort("models/templates/upstage-Solar-Open-100B.jinja", true);
+    assert_supports_effort("models/templates/Aleph-Alpha-Kolibri-1.1.jinja", true);
     assert_supports_effort("models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja", false);
     assert_supports_effort("models/templates/Qwen-Qwen3-0.6B.jinja", false);
 
@@ -5558,6 +5678,8 @@ static void test_reasoning_effort_caps() {
     assert_effort_levels("models/templates/upstage-Solar-Open-100B.jinja", { "low" });
     assert_effort_levels("models/templates/thinkingmachines-Inkling-2-Small.jinja", { "none", "minimal", "low", "medium", "high", "max" });
     assert_effort_levels("models/templates/Qwen-Qwen3-0.6B.jinja", {});
+    // Kolibri-1.1 falls back to high, so high, xhigh and max render as an unknown level; minimal is an alias of low
+    assert_effort_levels("models/templates/Aleph-Alpha-Kolibri-1.1.jinja", { "none", "low", "medium" });
 
     auto assert_effort_rejected = [](const std::string & path, const std::vector<std::string> & expected) {
         auto tmpls = read_templates(path);
@@ -5565,6 +5687,7 @@ static void test_reasoning_effort_caps() {
     };
 
     assert_effort_rejected("models/templates/tencent-Hy3.jinja", { "minimal", "medium", "xhigh", "max" });
+    assert_effort_rejected("models/templates/Aleph-Alpha-Kolibri-1.1.jinja", {});
 }
 
 static void test_msg_diffs_compute() {
