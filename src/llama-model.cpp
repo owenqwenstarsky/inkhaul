@@ -1906,7 +1906,7 @@ void llama_model::log_tensor_split() const {
                 if (t == nullptr) {
                     continue;
                 }
-                const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(t, (void *) &get_split_state_ud);
+                const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(t, const_cast<void *>(static_cast<const void *>(&get_split_state_ud)));
                 found = true;
                 if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
                     mirrored = true;

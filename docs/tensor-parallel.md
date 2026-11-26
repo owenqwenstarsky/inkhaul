@@ -72,7 +72,7 @@ On Metal the sync does not stop the GPU queue:
 - The GPU waits for that thread, then adds the two partials.
 - Meanwhile the server thread has already queued the next part, so the GPU starts it as soon as the sum is done.
 
-Payloads of 32768 values or more (prompt processing) go over the wire in bf16. Each server rounds its own partial to bf16 too, so both Macs get the same bits.
+Payloads of 32768 values or more (prompt processing) go over the wire in bf16. Each server rounds its own partial to bf16 too, so both Macs get the same bits. If one GPU cannot convert to bf16, both servers agree at the start to send f32 instead (the log says `large partials in f32`).
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -81,7 +81,7 @@ Payloads of 32768 values or more (prompt processing) go over the wire in bf16. E
 | `GGML_RPC_COMM_SYNC` | unset | Set it to use the blocking sync: the server waits for its GPU, exchanges, then queues the add. Use it to compare, or for backends without host events. |
 | `GGML_RPC_COMM_PORT` | port of rank 0 + 1000 | Set on the client: the port rank 0 listens on for the other servers. |
 
-- Both servers need protocol 10.3 or newer (this build). With an older server the client logs a warning and the partials go through the client.
+- Both servers need protocol 10.4 or newer (this build). The client and the servers must run the same build. With an older server the client logs a warning and the partials go through the client.
 - Each Mac runs the router of every MoE layer itself. On two Macs with the same chip both pick the same experts, bit for bit. To be sure, each server sends a hash of the expert ids of the layer with its partial (8 more bytes, no extra trip), and a mismatch stops the run with an error that names the layer, for example `the ranks picked different experts in ffn_moe_topk-12`. On two different chips the GPUs can round the router differently; that case is not supported yet.
 - Two servers on one Mac must use different devices (for example `GGML_METAL_DEVICES=2` and `-d MTL0`, `-d MTL1`). On one device both servers share one GPU queue, so each GPU would wait for the other forever; Metal then stops the queue with a GPU timeout error.
 - Over RDMA (Thunderbolt 5) the servers keep the ordered exchange (rank 0 sends first); the same-time exchange is for TCP.

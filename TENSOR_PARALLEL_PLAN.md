@@ -138,9 +138,9 @@ This is the part that decides whether generation speeds up. The goal for one syn
 2. **Do not stop the GPU queue.** `COMM_ALLREDUCE` on the server no longer blocks. It queues:
    - "record `ready[n]`" after the sub-graph that makes the partial;
    - "wait `done[n]`", the add, and right behind them the next `GRAPH_RECOMPUTE`.
-   
+
    So the next sub-graph is encoded and committed while the bytes are on the cable, and the GPU starts it as soon as `done[n]` is set.
-   
+
    A comm thread per rank then:
    - waits for `ready[n]`, spinning on the event value for up to ~200 us before it sleeps;
    - copies the partial out of the shared Metal buffer;

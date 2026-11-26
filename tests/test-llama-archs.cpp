@@ -2536,7 +2536,7 @@ static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, c
                 detail += ", the servers did not connect to each other";
             }
             // with a GPU per server, the GPUs must not stop for the sums
-            if (gpu2 != gpu && log.text.find("pairwise communicator (async)") == std::string::npos) {
+            if (gpu2 != gpu && log.text.find("pairwise communicator (async,") == std::string::npos) {
                 ok = false;
                 detail += ", the servers did not use the async all-reduce";
             }

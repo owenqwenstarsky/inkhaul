@@ -182,8 +182,9 @@ struct allreduce_case {
     int          ids_check = 0; // 0: no check, 1: the ranks send the same expert ids, 2: rank 1 sends one other id
 };
 
-static bool run_case(rpc_pair & pair, const allreduce_case & tc, std::mt19937 & rng) {
-    const bool bf16 = tc.ne >= 32768;
+// wire_bf16: the ranks may send large partials in bf16, false when one of them has no bf16
+static bool run_case(rpc_pair & pair, const allreduce_case & tc, std::mt19937 & rng, bool wire_bf16 = true) {
+    const bool bf16 = wire_bf16 && tc.ne >= 32768;
     const ggml_init_params params = { (size_t) (tc.n_tensors + 3)*ggml_tensor_overhead(), nullptr, true };
     ggml_context_ptr ctx[2];
     ggml_backend_buffer_ptr buf[2];
@@ -269,6 +270,23 @@ static bool run_case(rpc_pair & pair, const allreduce_case & tc, std::mt19937 & 
     const double tol = bf16 ? 2.0*std::ldexp(1.0, -8) : 1e-6;
     const bool ok = max_err <= tol;
     printf("%s: %s (max error %.2e)\n", tc.name, ok ? "OK" : "FAIL", max_err);
+    return ok;
+}
+
+// a GPU without bf16 (the virtual GPU of the CI runners): the ranks agree at init to send large partials in f32
+static bool test_f32_wire(ggml_backend_dev_t gpus[2]) {
+    setenv("GGML_RPC_COMM_TEST_NO_BF16", "1", 1);
+    rpc_pair pair;
+    bool ok = start_pair(gpus, pair);
+    if (ok) {
+        std::mt19937 rng(7);
+        const allreduce_case tc = { "prompt 1M, one rank without bf16", 1 << 20, 2, 5, 1 };
+        ok = run_case(pair, tc, rng, /*wire_bf16 =*/ false);
+    } else {
+        printf("f32 wire: FAIL (no pair of servers)\n");
+    }
+    stop_pair(pair);
+    unsetenv("GGML_RPC_COMM_TEST_NO_BF16");
     return ok;
 }
 
@@ -525,6 +543,7 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t gpus[2];
     get_gpus(gpus);
     ok = test_allreduce(gpus) && ok;
+    ok = test_f32_wire(gpus) && ok;
     ok = test_comm_port(gpus) && ok;
 #ifndef _WIN32
     ok = test_ids_check(argv[0]) && ok;

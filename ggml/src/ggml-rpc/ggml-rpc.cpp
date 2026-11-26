@@ -1799,6 +1799,23 @@ static bool rpc_check_node(const ggml_tensor * node) {
 // Partials of at least this many values go over the wire in bf16, half the bytes. Each rank then
 // rounds its own partial to bf16 too, so both ranks add the same two numbers and get the same bits.
 static constexpr int64_t RPC_COMM_BF16_MIN_NE = 32768;
+
+// true if the backend can round partials to bf16 for the wire and read them back (some GPUs have no bf16)
+// for tests, GGML_RPC_COMM_TEST_NO_BF16=RANK makes that rank answer no
+static bool rpc_comm_backend_bf16(ggml_backend_t backend, uint32_t rank) {
+    const char * env = std::getenv("GGML_RPC_COMM_TEST_NO_BF16");
+    if (env != nullptr && (uint32_t) std::strtoul(env, nullptr, 10) == rank) {
+        return false;
+    }
+    const ggml_init_params params = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    GGML_ASSERT(ctx != nullptr);
+    ggml_tensor * f32  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32,  RPC_COMM_BF16_MIN_NE);
+    ggml_tensor * bf16 = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_BF16, RPC_COMM_BF16_MIN_NE);
+    return ggml_backend_supports_op(backend, ggml_cpy(ctx.get(), f32, bf16)) &&
+           ggml_backend_supports_op(backend, ggml_cpy(ctx.get(), bf16, f32));
+}
+
 // Payloads up to this size fit in the socket buffers, so both ranks can send before they receive.
 static constexpr size_t  RPC_COMM_INLINE_MAX  = 64*1024;
 
@@ -1936,7 +1953,7 @@ private:
     void comm_free_device(uint32_t dev_id);
     struct comm_async;
     static bool comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tensors);
-    static bool comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst, ggml_tensor * t_check);
+    static bool comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst, ggml_tensor * t_check, bool bf16_ok);
     static std::unique_ptr<comm_async> comm_async_init(ggml_backend_t backend, const socket_ptr & peer, uint32_t rank);
     static bool comm_bootstrap_exchange(void * user_data, const void * send_buf, void * recv_buf, size_t size);
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
@@ -2003,6 +2020,7 @@ private:
         std::unique_ptr<comm_async> async;          // null: the blocking pairwise path
         ggml_tensor *           check = nullptr;    // the ids of the current all-reduce, see rpc_msg_comm_allreduce_req
         bool                    test_ids_flip = false;
+        bool                    wire_bf16 = false;  // large partials go over the wire in bf16, agreed by the ranks at init
 
         // The backend's communicator. Null on the pairwise path, which has none.
         void *                              backend_comm_ctx = nullptr;
@@ -2864,14 +2882,24 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     state.pairwise_backend = backends[dev_id];
     state.allreduce_fn     = comm_allreduce_pairwise;
     state.test_ids_flip    = rpc_comm_test_ids_flip(request.rank);
+
+    // both ranks must put the same bytes on the wire: bf16 only if every GPU can convert to and from it
+    const uint8_t self_bf16 = rpc_comm_backend_bf16(backends[dev_id], request.rank);
+    uint8_t all_bf16[2] = { 0, 0 };
+    if (!comm_bootstrap_exchange(&state, &self_bf16, all_bf16, sizeof(self_bf16))) {
+        state.peers.clear();
+        state.allreduce_fn = nullptr;
+        return true;
+    }
+    state.wire_bf16 = all_bf16[0] != 0 && all_bf16[1] != 0;
     // a peer that stops answering (cable pulled, laptop asleep) fails the exchange instead of hanging
     const int timeout_ms = (int) rpc_comm_env_int("GGML_RPC_COMM_TIMEOUT_MS", 30000);
     if (timeout_ms > 0 && !state.peers[0]->set_timeout(timeout_ms)) {
         LOG_WARN("[%s] no timeout on the %s link to the peer\n", __func__, state.peers[0]->transport_name());
     }
     state.async = comm_async_init(backends[dev_id], state.peers[0], request.rank);
-    LOG_INFO("[%s] device %u using pairwise communicator (%s), rank %u\n", __func__, dev_id,
-             state.async != nullptr ? "async" : "blocking", request.rank);
+    LOG_INFO("[%s] device %u using pairwise communicator (%s, large partials in %s), rank %u\n", __func__, dev_id,
+             state.async != nullptr ? "async" : "blocking", state.wire_bf16 ? "bf16" : "f32", request.rank);
     response.ok = 1;
     return true;
 }
@@ -3022,14 +3050,14 @@ std::unique_ptr<rpc_server::comm_async> rpc_server::comm_async_init(ggml_backend
     return ca;
 }
 
-bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst, ggml_tensor * t_check) {
+bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst, ggml_tensor * t_check, bool bf16_ok) {
     if (ca.failed) {
         LOG_ERROR("[%s] an earlier exchange with the peer failed, stopping\n", __func__);
         return false;
     }
     ggml_backend_t backend = ca.backend;
     const int64_t ne         = ggml_nelements(t_dst);
-    const bool    wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= RPC_COMM_BF16_MIN_NE;
+    const bool    wire_bf16  = bf16_ok && t_dst->type == GGML_TYPE_F32 && ne >= RPC_COMM_BF16_MIN_NE;
     const size_t  wire_bytes = wire_bf16 ? (size_t) ne*2 : ggml_nbytes(t_dst);
     // with a check: 8 more bytes for the hash, and the GPU copies the ids to the end of the slot
     const size_t  xfer       = wire_bytes + (t_check != nullptr ? sizeof(uint64_t) : 0);
@@ -3130,7 +3158,7 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
     ggml_backend_t backend = state.pairwise_backend;
     ggml_tensor * t_check = state.check;
     if (state.async != nullptr) {
-        return comm_allreduce_async(*state.async, t_dst, t_check);
+        return comm_allreduce_async(*state.async, t_dst, t_check, state.wire_bf16);
     }
 
     const size_t  nbytes = ggml_nbytes(t_dst);
@@ -3148,7 +3176,7 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
 
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
-    const bool   wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= RPC_COMM_BF16_MIN_NE;
+    const bool   wire_bf16  = state.wire_bf16 && t_dst->type == GGML_TYPE_F32 && ne >= RPC_COMM_BF16_MIN_NE;
     const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
     const size_t need       = wire_bf16 ? 2*nbytes : nbytes;
     if (state.scratch_size < need) {
@@ -3688,8 +3716,8 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
         ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backends[i]->context;
         // since minor version 2 both ranks round their partials the same way, so the sums match bit for bit,
-        // since 3 they compare the expert ids
-        if (rpc_ctx->dispatcher->get_server_minor() < 3) {
+        // since 3 they compare the expert ids, since 4 they agree on bf16 on the wire at init
+        if (rpc_ctx->dispatcher->get_server_minor() < 4) {
             LOG_WARN("%s: the server %s is too old for the comm between servers (protocol %d.%u)\n", __func__,
                      rpc_ctx->endpoint.c_str(), RPC_PROTO_MAJOR_VERSION, rpc_ctx->dispatcher->get_server_minor());
             return nullptr;
