@@ -974,6 +974,31 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     backend->iface.event_wait(backend, event);
 }
 
+bool ggml_backend_event_arm_host(ggml_backend_event_t event) {
+    GGML_ASSERT(event);
+    if (event->device->iface.event_arm_host == NULL || event->device->iface.event_signal_host == NULL) {
+        return false;
+    }
+    event->device->iface.event_arm_host(event->device, event);
+    return true;
+}
+
+void ggml_backend_event_signal_host(ggml_backend_event_t event) {
+    GGML_ASSERT(event);
+    GGML_ASSERT(event->device->iface.event_signal_host != NULL);
+
+    event->device->iface.event_signal_host(event->device, event);
+}
+
+bool ggml_backend_event_query(ggml_backend_event_t event) {
+    GGML_ASSERT(event);
+    if (event->device->iface.event_query == NULL) {
+        ggml_backend_event_synchronize(event);
+        return true;
+    }
+    return event->device->iface.event_query(event->device, event);
+}
+
 static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(backend);
     if (backend->iface.graph_optimize != NULL) {

@@ -384,3 +384,67 @@ Tests (section 8):
   - `ctest -L "main|behavior|rpc"` passes, except 5 tests that already failed on this machine: the Python tests (no numpy, torch, jinja2) and the missing `ggml-vocab-qwen35.gguf`.
 
 Not done: the speed of tensor vs layer vs expert split on the laptops. That needs your approval and your laptops.
+
+## 15. Phase 2 results (2026-11-26)
+
+Done:
+- **Async all-reduce** (5.3.2) in `ggml-rpc.cpp` (`comm_async`), for devices with host events and `buffer_from_host_ptr` (Metal):
+  - Each server keeps 4 slots. A slot has a `ready` event, a `done` event, and page-aligned host memory wrapped as a device buffer.
+  - Per sync the GPU:
+    1. copies the partial into the slot;
+    2. reaches `ready`;
+    3. waits for `done` (armed for the host);
+    4. adds the peer's partial.
+  - A comm thread spins on `ready`, exchanges the slot with the peer, and reaches `done`. It reaches `done` even after a failure, so a GPU never waits forever.
+  - The server thread only waits when all 4 slots are in use.
+- **Same-time exchange** (5.3.1):
+  - Over TCP both ranks send, then receive.
+  - Above 64 KiB a second thread sends while the first receives.
+  - RDMA keeps the ordered exchange, since its thread safety could not be checked here.
+- **The same bits on both ranks** (5.3.4): with bf16 on the wire each rank adds bf16(own) + bf16(peer), on both the async and the blocking path.
+- **Spin receive** (5.3.5): `socket_t::recv_data_spin`. **Timeout** (5.3.7): `socket_t::set_timeout`, `GGML_RPC_COMM_TIMEOUT_MS` (default 30 s).
+  - After a failed exchange the next all-reduce or result read fails on the server, which closes the connection, and the client aborts with its RPC error.
+- **New ggml API** (5.3.3), optional per device and implemented for Metal:
+  - `ggml_backend_event_arm_host`: the next value comes from the host, and a later `event_wait` waits for it.
+  - `ggml_backend_event_signal_host`: the host reaches the oldest armed value.
+  - `ggml_backend_event_query`: whether the event is reached, without waiting.
+  - The plan had only `signal_host`. The arm step is needed because a wait is encoded before the host reaches the value, and `query` is needed for the spin.
+- **Fewer sends from the client** (5.4): one send per small command (it was three), and the dispatcher batches the fire-and-forget commands already queued behind one into the same send.
+  - This replaces the planned `GRAPH_STEPS` command. The client already sends from its own thread, and the async server runs ahead of its GPU, so a protocol command would save little more than this does, which needs no protocol change.
+- RPC protocol 10.2. The client starts the server-to-server comm only when every server is 10.2 or newer, since older servers round differently.
+- `llama-tp-probe gpu`:
+  - `--work W` gives the graph W matrix products of 32 MiB.
+  - It prints the busy-queue turnaround: the host reaches an event the GPU waits for, the GPU runs the graph, and the host spins on the GPU's next event.
+
+Tests:
+- `test-tp-comm` (new, label `rpc`, `GGML_METAL_DEVICES=2`), all OK:
+  - Host events: a graph behind an armed event does not run for 50 ms until the host reaches the event, 3 rounds.
+  - Test 4: two RPC servers on 127.0.0.1, one Metal device each:
+    - 10000 decode-sized all-reduces (2048 values, 8 in flight);
+    - the same tensor reduced 3 times in a row;
+    - 50 prompt-sized ones (1M values, bf16);
+    - 100 at the bf16 threshold.
+    - All results are checked against the host sum and must match bit for bit on both ranks.
+  - Timeout: a child process where rank 1 waits 2 s per exchange and the timeout is 300 ms. It stops with the error in 0.6 s.
+- Test 3 is done at the comm level in `test-tp-comm` (the bf16 cases compare the two ranks bit for bit), not on a model tensor.
+- Test 2 now requires the async path when there are two devices. With one device the test servers use the blocking path: two servers on one Metal device share one queue and would wait for each other.
+- Mutation checks (test 7):
+  - Without the bf16 self-rounding, the bf16 cases fail with "the ranks differ", on both paths.
+  - Without the GPU's wait for `done`, every all-reduce case fails, and the model test fails (NMSE 0.23 to nan).
+
+Measured on this Mac (M5, no cable), `llama-tp-probe gpu`:
+
+| Graph per sync | GPU time (back to back) | Busy-queue turnaround p50 | Graph + host wait p50 (blocking path) |
+|---|---|---|---|
+| tiny add | 41-46 us | 228-273 us | 258-301 us |
+| 1 product (32 MiB) | 353 us | 471 us | 962 us |
+| 2 products (64 MiB) | 707 us | 1540 us (p99 9 ms) | 976 us |
+
+**Finding: waking the GPU from an event costs about 190-230 us on this M5,** measured with the tiny graph, where the difference is cleanest. With larger graphs the numbers are noisy and the difference is only an upper bound, since back-to-back graphs overlap on the GPU.
+- The async path removes the host's wait for the GPU, the encoding of the add, and the round trip of the ping-pong.
+- It cannot remove the GPU's own wake-up. So one sync costs at least ~200 us plus the one-way link time.
+- That is above the break-even of section 3 for generation (Inkling Mini ~120-160 us, Qwen 35B ~90-120 us).
+- **So with Metal events, generation of one stream is unlikely to get faster on these laptops.** Prompt processing (fewer, larger syncs) and the memory of two Macs are still gains.
+- An option this plan does not cover: a GPU kernel that spins on a flag the host writes in shared memory, instead of an event. It could cut the wake-up to a few microseconds. Metal does not document CPU writes as visible to a running kernel, so it is an experiment, for you to decide.
+
+Not done: the measurement on the two laptops (yours to approve).

@@ -20,6 +20,12 @@ struct socket_t {
     // here. No-op on TCP.
     bool flush();
 
+    // receive, spinning without blocking for up to spin_us first (lower latency for small messages)
+    // the RDMA transport receives as usual
+    bool recv_data_spin(void * data, size_t size, int64_t spin_us);
+    // fail a send or a receive that waits longer than timeout_ms (0: wait forever); TCP only
+    bool set_timeout(int timeout_ms);
+
     socket_ptr accept();
 
     void get_caps(uint8_t * local_caps);

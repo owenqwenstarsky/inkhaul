@@ -17,6 +17,9 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -688,6 +691,54 @@ bool socket_t::recv_data(void * data, size_t size) {
 
 bool socket_t::flush() {
     return pimpl->flush();
+}
+
+bool socket_t::recv_data_spin(void * data, size_t size, int64_t spin_us) {
+    if (pimpl->use_rdma) {
+        return pimpl->recv_data(data, size);
+    }
+#ifndef _WIN32
+    // take what arrives while spinning, then block for the rest
+    size_t bytes_recv = 0;
+    const auto t_end = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+    while (bytes_recv < size && spin_us > 0) {
+        const ssize_t n = recv(pimpl->fd, (char *) data + bytes_recv, std::min(size - bytes_recv, MAX_CHUNK_SIZE), MSG_DONTWAIT);
+        if (n > 0) {
+            bytes_recv += (size_t) n;
+            continue;
+        }
+        if (n == 0) {
+            LOG_WARN("recv returned 0 (peer closed?)\n");
+            return false;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            LOG_ERROR("recv failed (bytes_recv=%zu)\n", bytes_recv);
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= t_end) {
+            break;
+        }
+    }
+    return bytes_recv == size || pimpl->recv_data((char *) data + bytes_recv, size - bytes_recv);
+#else
+    (void) spin_us;
+    return pimpl->recv_data(data, size);
+#endif
+}
+
+bool socket_t::set_timeout(int timeout_ms) {
+    if (pimpl->use_rdma) {
+        return false;
+    }
+#ifdef _WIN32
+    const DWORD tv = (DWORD) timeout_ms;
+#else
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#endif
+    return setsockopt(pimpl->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv)) == 0 &&
+           setsockopt(pimpl->fd, SOL_SOCKET, SO_SNDTIMEO, (const char *) &tv, sizeof(tv)) == 0;
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {

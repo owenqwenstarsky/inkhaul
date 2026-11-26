@@ -2397,6 +2397,14 @@ static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, c
         LOG("Tensor RPC: SKIP (%s)\n", gpu == nullptr ? "no GPU" : "no RPC backend");
         return 0;
     }
+    // one GPU per server: with the async all-reduce each GPU waits for the other rank, and two
+    // servers on one Metal device share one queue (GGML_METAL_DEVICES=2 gives two)
+    ggml_backend_dev_t gpu2 = target_backend == nullptr ? get_gpu(nullptr, gpu) : nullptr;
+    if (gpu2 == nullptr) {
+        gpu2 = gpu;
+        setenv("GGML_RPC_COMM_SYNC", "1", 1);
+        LOG("Tensor RPC: one GPU, the servers use the blocking all-reduce\n");
+    }
     auto start_server_fn = (decltype(ggml_backend_rpc_start_server) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
     auto add_server_fn   = (decltype(ggml_backend_rpc_add_server) *)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_add_server");
     GGML_ASSERT(start_server_fn && add_server_fn);
@@ -2407,8 +2415,9 @@ static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, c
     std::vector<ggml_backend_dev_t> rpcs;
     for (int i = 0; i < 2; i++) {
         const std::string endpoint = "127.0.0.1:" + std::to_string(port0 + i);
-        std::thread([start_server_fn, endpoint, gpu]() mutable {
-            start_server_fn(endpoint.c_str(), nullptr, 4, 1, &gpu);
+        ggml_backend_dev_t dev = i == 0 ? gpu : gpu2;
+        std::thread([start_server_fn, endpoint, dev]() mutable {
+            start_server_fn(endpoint.c_str(), nullptr, 4, 1, &dev);
         }).detach();
         ggml_backend_reg_t reg_server = nullptr;
         for (int j = 0; j < 400 && reg_server == nullptr; j++) {
@@ -2479,6 +2488,11 @@ static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, c
             if (log.text.find("pairwise communicator initialized") == std::string::npos) {
                 ok = false;
                 detail += ", the servers did not connect to each other";
+            }
+            // with a GPU per server, the GPUs must not stop for the sums
+            if (gpu2 != gpu && log.text.find("pairwise communicator (async)") == std::string::npos) {
+                ok = false;
+                detail += ", the servers did not use the async all-reduce";
             }
             if (log.text.find("using the fallback") != std::string::npos) {
                 ok = false;

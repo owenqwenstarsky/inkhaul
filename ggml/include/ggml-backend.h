@@ -132,6 +132,17 @@ extern "C" {
     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
 
+    // (optional) events reached from the host, for example by a thread that moves data between devices
+    // an event armed for the host must only be reached by the host, never recorded by a backend
+    // arm:    the next reach of the event comes from the host, a later ggml_backend_event_wait waits for it
+    //         returns false if the device does not support it
+    // signal: the host reaches the oldest armed value, the backends that wait for it go on
+    // query:  whether the event reached its last recorded or armed value, without waiting
+    //         (a device without it waits, then returns true)
+    GGML_API bool                 ggml_backend_event_arm_host(ggml_backend_event_t event);
+    GGML_API void                 ggml_backend_event_signal_host(ggml_backend_event_t event);
+    GGML_API bool                 ggml_backend_event_query(ggml_backend_event_t event);
+
     //
     // Backend device
     //

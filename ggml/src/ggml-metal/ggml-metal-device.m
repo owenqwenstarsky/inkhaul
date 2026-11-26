@@ -1499,6 +1499,28 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
     GGML_UNUSED(dev);
 }
 
+void ggml_metal_device_event_arm_host(ggml_metal_device_t dev, ggml_metal_event_t ev) {
+    // a following encode_wait waits for this value
+    atomic_fetch_add_explicit(&ev->value, 1, memory_order_relaxed);
+
+    GGML_UNUSED(dev);
+}
+
+void ggml_metal_device_event_signal_host(ggml_metal_device_t dev, ggml_metal_event_t ev) {
+    // only the host reaches an armed event, so the values are reached one by one in order
+    id<MTLSharedEvent> event = ev->obj;
+    event.signaledValue = event.signaledValue + 1;
+
+    GGML_UNUSED(dev);
+}
+
+bool ggml_metal_device_event_query(ggml_metal_device_t dev, ggml_metal_event_t ev) {
+    id<MTLSharedEvent> event = ev->obj;
+    return event.signaledValue >= (uint64_t) atomic_load_explicit(&ev->value, memory_order_relaxed);
+
+    GGML_UNUSED(dev);
+}
+
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total     = dev->mtl_device.recommendedMaxWorkingSetSize;

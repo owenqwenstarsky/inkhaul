@@ -290,9 +290,12 @@ static std::vector<size_t> parse_sizes(const std::string & s) {
 struct gpu_result {
     double compute_p50, compute_p99; // graph compute + synchronize, us
     double event_p50,   event_p99;   // event record + host wait after an async compute, us
+    double turn_p50,    turn_p99;    // host reaches an event the GPU waits for -> graph -> host sees the GPU's event, us
+    double gpu_us;                   // GPU time of one graph, from back-to-back runs, us
 };
 
-static bool run_gpu(int iters, gpu_result & res, std::string & dev_name) {
+// n_work: matrix-vector products of 4096 x 4096 (f16, 32 MiB) per graph, to keep the GPU busy like a layer
+static bool run_gpu(int iters, int n_work, gpu_result & res, std::string & dev_name) {
     ggml_backend_load_all();
     ggml_backend_dev_t dev = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -313,17 +316,40 @@ static bool run_gpu(int iters, gpu_result & res, std::string & dev_name) {
         return false;
     }
 
-    ggml_init_params params = { 16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_init_params params = { (16 + 4*(size_t) n_work)*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(params);
     ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
     ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2048);
     ggml_tensor * c = ggml_add(ctx, a, b);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, c);
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4096);
+    for (int i = 0; i < n_work; ++i) {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 4096, 4096);
+        x = ggml_scale(ctx, ggml_mul_mat(ctx, w, x), 1e-3f);
+        ggml_build_forward_expand(gf, x);
+    }
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buf == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_clear(buf, 0);
     std::vector<float> host(2048, 1.0f);
     ggml_backend_tensor_set(a, host.data(), 0, ggml_nbytes(a));
     ggml_backend_tensor_set(b, host.data(), 0, ggml_nbytes(b));
+
+    // warm up, then the GPU time of one graph when the queue never drains
+    for (int it = 0; it < 20; ++it) {
+        ggml_backend_graph_compute(backend, gf);
+    }
+    {
+        const int64_t t0 = now_us();
+        for (int it = 0; it < iters; ++it) {
+            ggml_backend_graph_compute_async(backend, gf);
+        }
+        ggml_backend_synchronize(backend);
+        res.gpu_us = (double) (now_us() - t0) / iters;
+    }
 
     std::vector<double> t;
     for (int it = 0; it < iters; ++it) {
@@ -349,6 +375,55 @@ static bool run_gpu(int iters, gpu_result & res, std::string & dev_name) {
         res.event_p50 = percentile(t, 0.5);
         res.event_p99 = percentile(t, 0.99);
         ggml_backend_event_free(ev);
+    }
+
+    // the GPU side of one sync of the async all-reduce: the queue never drains, the GPU waits at
+    // an event that the host reaches, runs a tiny graph, and reaches an event that the host spins on
+    res.turn_p50 = res.turn_p99 = -1.0;
+    const int n_slots = 4;
+    std::vector<ggml_backend_event_t> done(n_slots), ready(n_slots);
+    bool host_events = true;
+    for (int k = 0; k < n_slots; ++k) {
+        done[k]  = ggml_backend_event_new(dev);
+        ready[k] = ggml_backend_event_new(dev);
+        host_events = host_events && done[k] != nullptr && ready[k] != nullptr;
+    }
+    auto queue_slot = [&](int k) {
+        ggml_backend_event_arm_host(done[k]);
+        ggml_backend_event_wait(backend, done[k]);
+        ggml_backend_graph_compute_async(backend, gf);
+        ggml_backend_event_record(ready[k], backend);
+    };
+    if (host_events && ggml_backend_event_arm_host(done[0])) {
+        ggml_backend_event_signal_host(done[0]); // the probe arm above is reached right away
+        for (int k = 0; k < n_slots; ++k) {
+            queue_slot(k);
+        }
+        t.clear();
+        for (int it = 0; it < iters; ++it) {
+            const int k = it % n_slots;
+            const int64_t t0 = now_us();
+            ggml_backend_event_signal_host(done[k]);
+            while (!ggml_backend_event_query(ready[k])) {
+            }
+            t.push_back((double) (now_us() - t0));
+            queue_slot(k);
+        }
+        // let the queued slots run, so that nothing waits when the backend is freed
+        for (int i = 0; i < n_slots; ++i) {
+            ggml_backend_event_signal_host(done[(iters + i) % n_slots]);
+        }
+        ggml_backend_synchronize(backend);
+        res.turn_p50 = percentile(t, 0.5);
+        res.turn_p99 = percentile(t, 0.99);
+    }
+    for (int k = 0; k < n_slots; ++k) {
+        if (done[k] != nullptr) {
+            ggml_backend_event_free(done[k]);
+        }
+        if (ready[k] != nullptr) {
+            ggml_backend_event_free(ready[k]);
+        }
     }
 
     ggml_backend_tensor_get(c, host.data(), 0, ggml_nbytes(c));
@@ -637,7 +712,7 @@ static void usage(const char * argv0) {
     printf("usage:\n");
     printf("  %s listen  -H ADDR [-p PORT]                         wait for one 'connect' and answer it\n", argv0);
     printf("  %s connect -H ADDR [-p PORT] [-s SIZES] [-n N]        measure the link (sizes like 8K,64K,2M)\n", argv0);
-    printf("  %s gpu [-n N]                                       measure the local GPU sync delay\n", argv0);
+    printf("  %s gpu [-n N] [--work W]                            measure the local GPU sync delay (W: 32 MiB products per graph)\n", argv0);
     printf("  %s budget -m MODEL [--bw GB/s] [--t US,US,...]      bytes per token and the estimate per mode\n", argv0);
     printf("  %s self-test                                        check this tool over 127.0.0.1\n", argv0);
     printf("\nBind 'listen' to the Thunderbolt address only, never to 0.0.0.0.\n");
@@ -655,6 +730,7 @@ int main(int argc, char ** argv) {
     std::string t_str = "50,100,300";
     int port = 50100;
     int iters = 1000;
+    int n_work = 0;
     double bw = 120.0;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -672,6 +748,7 @@ int main(int argc, char ** argv) {
         else if (a == "-m") { model = next(); }
         else if (a == "--bw") { bw = std::stod(next()); }
         else if (a == "--t") { t_str = next(); }
+        else if (a == "--work") { n_work = std::stoi(next()); }
         else { usage(argv[0]); return 1; }
     }
 
@@ -714,13 +791,21 @@ int main(int argc, char ** argv) {
     if (cmd == "gpu") {
         gpu_result r;
         std::string name;
-        if (!run_gpu(iters, r, name)) {
+        if (!run_gpu(iters, n_work, r, name)) {
             fprintf(stderr, "no GPU or the GPU check failed\n");
             return 1;
         }
-        printf("%s: tiny graph compute + wait: p50 %.1f us, p99 %.1f us\n", name.c_str(), r.compute_p50, r.compute_p99);
+        printf("%s: graph of %d matrix products: GPU time %.1f us (back to back)\n", name.c_str(), n_work, r.gpu_us);
+        printf("%s: graph compute + wait: p50 %.1f us, p99 %.1f us\n", name.c_str(), r.compute_p50, r.compute_p99);
         if (r.event_p50 >= 0) {
             printf("%s: async compute + event record + host wait: p50 %.1f us, p99 %.1f us\n", name.c_str(), r.event_p50, r.event_p99);
+        }
+        if (r.turn_p50 >= 0) {
+            printf("%s: busy queue, host reaches an event -> graph -> host sees the GPU event: p50 %.1f us, p99 %.1f us\n",
+                   name.c_str(), r.turn_p50, r.turn_p99);
+            // back-to-back graphs can overlap on the GPU, so the difference is an upper bound; with --work 0 it is close
+            printf("%s: one sync of the async all-reduce costs the GPU at most about %.1f us (turnaround - GPU time), plus the one-way time of the link\n",
+                   name.c_str(), r.turn_p50 - r.gpu_us);
         }
         return 0;
     }

@@ -225,6 +225,11 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+        // (optional) events reached from the host, see ggml_backend_event_arm_host
+        void                 (*event_arm_host)    (ggml_backend_dev_t dev, ggml_backend_event_t event);
+        void                 (*event_signal_host) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+        bool                 (*event_query)       (ggml_backend_dev_t dev, ggml_backend_event_t event);
     };
 
     struct ggml_backend_device {

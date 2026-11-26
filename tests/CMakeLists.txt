@@ -205,6 +205,11 @@ endif()
 # LongHaul over an RPC server on a thread of the test (127.0.0.1 only)
 if (GGML_RPC)
     llama_test(test-llama-archs NAME test-llama-archs-rpc LABEL rpc ARGS --rpc -s 1)
+    # the all-reduce between two RPC servers on threads of the test, and the host events
+    llama_build_and_test(test-tp-comm.cpp LABEL rpc LINK ggml)
+    # one Metal device per server: the async all-reduce needs a queue per rank
+    set_tests_properties(test-tp-comm PROPERTIES TIMEOUT 300 ENVIRONMENT "GGML_METAL_DEVICES=2")
+    set_tests_properties(test-llama-archs-rpc PROPERTIES ENVIRONMENT "GGML_METAL_DEVICES=2")
 endif()
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")

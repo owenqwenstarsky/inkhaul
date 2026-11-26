@@ -343,6 +343,11 @@ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev);
 void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev);
 void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev);
 
+// events reached from the host: arm counts a value to come (a later wait waits for it), signal reaches the oldest armed value
+void ggml_metal_device_event_arm_host   (ggml_metal_device_t dev, ggml_metal_event_t ev);
+void ggml_metal_device_event_signal_host(ggml_metal_device_t dev, ggml_metal_event_t ev);
+bool ggml_metal_device_event_query      (ggml_metal_device_t dev, ggml_metal_event_t ev);
+
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 

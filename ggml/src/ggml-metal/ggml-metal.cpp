@@ -900,6 +900,18 @@ static void ggml_backend_metal_device_event_synchronize(ggml_backend_dev_t dev, 
     ggml_metal_device_event_synchronize(ctx_dev, evt);
 }
 
+static void ggml_backend_metal_device_event_arm_host(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    ggml_metal_device_event_arm_host((ggml_metal_device_t)dev->context, (ggml_metal_event_t)event->context);
+}
+
+static void ggml_backend_metal_device_event_signal_host(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    ggml_metal_device_event_signal_host((ggml_metal_device_t)dev->context, (ggml_metal_event_t)event->context);
+}
+
+static bool ggml_backend_metal_device_event_query(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    return ggml_metal_device_event_query((ggml_metal_device_t)dev->context, (ggml_metal_event_t)event->context);
+}
+
 static ggml_backend_device_i ggml_backend_metal_device_i = {
     /* .get_name             = */ ggml_backend_metal_device_get_name,
     /* .get_description      = */ ggml_backend_metal_device_get_description,
@@ -916,6 +928,9 @@ static ggml_backend_device_i ggml_backend_metal_device_i = {
     /* .event_new            = */ ggml_backend_metal_device_event_new,
     /* .event_free           = */ ggml_backend_metal_device_event_free,
     /* .event_synchronize    = */ ggml_backend_metal_device_event_synchronize,
+    /* .event_arm_host       = */ ggml_backend_metal_device_event_arm_host,
+    /* .event_signal_host    = */ ggml_backend_metal_device_event_signal_host,
+    /* .event_query          = */ ggml_backend_metal_device_event_query,
 };
 
 // backend registry
