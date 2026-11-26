@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "fit.h"
 #include "log.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -2669,6 +2670,166 @@ static int test_tensor_syncs(const std::string & arch_filter, const size_t seed,
     return all_ok ? 0 : 1;
 }
 
+// --fit with -sm tensor: each device is measured with its own share, and only the context size changes
+static int test_tensor_fit(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    std::vector<llm_arch> archs;
+    for (const llm_arch arch : { LLM_ARCH_QWEN35MOE, LLM_ARCH_INKLING2 }) {
+        if (arch_matches(arch_filter, arch)) {
+            archs.push_back(arch);
+        }
+    }
+    if (archs.empty()) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu  = get_gpu(target_backend, nullptr);
+    ggml_backend_dev_t gpu2 = target_backend == nullptr ? get_gpu(nullptr, gpu) : nullptr;
+    if (gpu == nullptr || gpu2 == nullptr) {
+        LOG("Tensor fit: SKIP (needs two GPUs, GGML_METAL_DEVICES=2 gives two)\n");
+        return 0;
+    }
+    constexpr int64_t MiB         = 1024*1024;
+    constexpr uint32_t n_ctx_train = 262144;
+    constexpr uint32_t n_ctx_min   = 4096;
+    const ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
+
+    bool all_ok = true;
+    for (const llm_arch arch : archs) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true, 0, 256);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_CONTEXT_LENGTH).c_str(), n_ctx_train);
+        const std::string path = get_tmp_gguf_path();
+        {
+            llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path.c_str());
+        }
+        const std::vector<std::string> paths = { path };
+
+        std::vector<int64_t> ctx_split; // context memory per device with split attention
+        for (const llama_tp_attn tp_attn : { LLAMA_TP_ATTN_SPLIT, LLAMA_TP_ATTN_MIRROR }) {
+            const char * mode = tp_attn == LLAMA_TP_ATTN_SPLIT ? "split" : "mirror";
+            std::vector<ggml_backend_dev_t> devs_param = { gpu, gpu2, nullptr };
+            llama_model_params mparams = llama_model_default_params();
+            mparams.devices    = devs_param.data();
+            mparams.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            mparams.tp_attn    = tp_attn;
+            mparams.progress_callback = silent_model_load_progress;
+            llama_context_params cparams = llama_context_default_params();
+            cparams.n_seq_max = 1;
+
+            auto measure = [&](uint32_t n_ctx) {
+                llama_context_params cp = cparams;
+                cp.n_ctx = n_ctx;
+                std::vector<ggml_backend_dev_t> devs;
+                uint32_t ngl = 0, nct = 0, nex = 0;
+                common_device_memory_data_vec dmds = common_get_device_memory_data(paths, &mparams, &cp, devs, ngl, nct, nex, log_level);
+                if (devs.size() != 2 || devs[0] != gpu || devs[1] != gpu2) {
+                    throw std::runtime_error("the measurement is not per device");
+                }
+                return dmds;
+            };
+            auto used = [](const common_device_memory_data & d) { return int64_t(d.model + d.context + d.compute); };
+
+            bool ok = true;
+            std::string detail;
+            try {
+                const common_device_memory_data_vec dmd_max = measure(n_ctx_train);
+                const common_device_memory_data_vec dmd_q   = measure(n_ctx_train/4);
+
+                // each device holds only its share of the split weights, less than the whole model (one GPU plus the host)
+                common_device_memory_data_vec dmd_one;
+                {
+                    std::vector<ggml_backend_dev_t> devs_one = { gpu, nullptr };
+                    llama_model_params mp = llama_model_default_params();
+                    mp.devices = devs_one.data();
+                    mp.progress_callback = silent_model_load_progress;
+                    llama_context_params cp = cparams;
+                    cp.n_ctx = n_ctx_train;
+                    std::vector<ggml_backend_dev_t> devs;
+                    uint32_t ngl = 0, nct = 0, nex = 0;
+                    dmd_one = common_get_device_memory_data(paths, &mp, &cp, devs, ngl, nct, nex, log_level);
+                }
+                const size_t model_whole = dmd_one[0].model + dmd_one.back().model;
+                for (size_t j = 0; j < 2; j++) {
+                    if (!(dmd_max[j].model > 0 && dmd_max[j].model < model_whole)) {
+                        throw std::runtime_error(string_format("device %zu holds %zu of %zu model bytes", j, dmd_max[j].model, model_whole));
+                    }
+                }
+                // mirrored attention keeps the whole KV cache on each device, split attention half of it
+                if (tp_attn == LLAMA_TP_ATTN_SPLIT) {
+                    ctx_split = { int64_t(dmd_max[0].context), int64_t(dmd_max[1].context) };
+                } else if (arch == LLM_ARCH_QWEN35MOE) {
+                    for (size_t j = 0; j < 2; j++) {
+                        if (int64_t(dmd_max[j].context) <= ctx_split[j]) {
+                            throw std::runtime_error(string_format("mirror context %zu <= split context %" PRId64, dmd_max[j].context, ctx_split[j]));
+                        }
+                    }
+                }
+
+                // targets that leave room for exactly a quarter of the trained context on each device
+                std::vector<size_t> margins(llama_max_devices(), 0);
+                for (size_t j = 0; j < 2; j++) {
+                    margins[j] = size_t(dmd_q[j].free - used(dmd_q[j]));
+                }
+                std::vector<float> ts(llama_max_devices(), 0.0f);
+                std::vector<llama_model_tensor_buft_override> tbo(llama_max_tensor_buft_overrides());
+                llama_context_params cp = cparams;
+                cp.n_ctx = 0;
+                llama_model_params mp = mparams;
+                const common_params_fit_status status = common_fit_params(paths, &mp, &cp, ts.data(), tbo.data(), margins.data(), n_ctx_min, nullptr, log_level);
+                if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cp.n_ctx > n_ctx_train/4 + 256 || cp.n_ctx < n_ctx_train/4 - n_ctx_train/16) {
+                    throw std::runtime_error(string_format("fit gave status %d and a context of %u, expected about %u", status, cp.n_ctx, n_ctx_train/4));
+                }
+                const uint32_t n_ctx_fit = cp.n_ctx;
+
+                // no room at all: fails, with the context at the minimum
+                for (size_t j = 0; j < 2; j++) {
+                    margins[j] = size_t(dmd_q[j].free);
+                }
+                cp.n_ctx = 0;
+                mp = mparams;
+                const common_params_fit_status status_none = common_fit_params(paths, &mp, &cp, ts.data(), tbo.data(), margins.data(), n_ctx_min, nullptr, log_level);
+                if (status_none != COMMON_PARAMS_FIT_STATUS_FAILURE || cp.n_ctx != n_ctx_min) {
+                    throw std::runtime_error(string_format("without room fit gave status %d and a context of %u", status_none, cp.n_ctx));
+                }
+
+                // the estimate without allocating matches the memory of a loaded model on each device
+                cp = cparams;
+                cp.n_ctx = n_ctx_min;
+                const std::vector<common_memory_breakdown_row> rows_est = common_fit_measure(paths, &mparams, &cp, nullptr, nullptr, log_level);
+                llama_model_ptr model(llama_model_load_from_file(path.c_str(), mparams));
+                llama_context_ptr lctx(model ? llama_init_from_model(model.get(), cp) : nullptr);
+                if (!lctx) {
+                    throw std::runtime_error("failed to load the model");
+                }
+                const std::vector<common_memory_breakdown_row> rows = common_memory_breakdown_rows(lctx.get());
+                double worst = 0.0;
+                for (size_t j = 0; j < 2; j++) {
+                    if (rows[j].kind != common_memory_breakdown_row::DEVICE || rows_est[j].kind != common_memory_breakdown_row::DEVICE) {
+                        throw std::runtime_error("the breakdown has no row per device");
+                    }
+                    const std::pair<size_t, size_t> pairs[3] = {
+                        { rows[j].model, rows_est[j].model }, { rows[j].context, rows_est[j].context }, { rows[j].compute, rows_est[j].compute } };
+                    for (const auto & [real, est] : pairs) {
+                        const double err = std::fabs(double(real) - double(est)) / std::max<double>(double(real), MiB);
+                        worst = std::max(worst, err);
+                    }
+                }
+                if (worst > 0.02) {
+                    throw std::runtime_error(string_format("the estimate is %.1f%% off a loaded model", 100.0*worst));
+                }
+                detail = string_format("context %u of %u for a quarter of the room, model/device %zu/%zu MiB, estimate within %.2f%%",
+                    n_ctx_fit, n_ctx_train, size_t(dmd_max[0].model/MiB), size_t(dmd_max[1].model/MiB), 100.0*worst);
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            LOG("Tensor fit %s %s: %s (%s)\n", llama_arch_name(arch), mode, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+        std::filesystem::remove(path);
+    }
+    return all_ok ? 0 : 1;
+}
+
 // a DSpark draft reads the inputs of some target layers: from host copies, or from a device buffer of the target;
 // with a tensor split target both must work (the draft on its own GPU falls back to the host copies)
 static int test_tensor_layer_inp(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
@@ -3182,6 +3343,7 @@ int main(int argc, char ** argv) {
         ret = test_rope_type(arch_filter, seed, stdev) != 0 ? 1 : ret;
         ret = test_tensor_syncs(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_tensor_layer_inp(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        ret = test_tensor_fit(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_longhaul(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         return test_longhaul_bailingmoe3(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
     } catch (const std::exception & err) {

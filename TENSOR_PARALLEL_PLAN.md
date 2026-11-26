@@ -539,3 +539,15 @@ Tests, all OK:
 - `test-llama-archs` with two devices, "Tensor layer inputs" for `qwen35` and `qwen35moe`: logits and layer inputs of a Meta context match one GPU (NMSE ~1e-17), on the host copy path and the device buffer path.
 
 Not done: the measured gain. It needs the laptops.
+
+## 19. Fixes after the first runs (2026-11-26)
+
+`--fit` with `-sm tensor`:
+- `--fit` threw at once for `-sm tensor`, so the context stayed at the trained size (262144). With `--tp-attn mirror` each Mac then held the whole KV cache of that context and ran out of memory, even with a small model.
+- The memory breakdown now counts a meta buffer per device: each device under its own buffer type, with the size of its slice (`ggml_backend_meta_buft_ctx_size` without allocating, the simple buffer sizes after). A meta compute buffer has its size on every device.
+- `--fit` then measures each Mac and lowers the context until every Mac keeps its target. It cannot move layers, so it fails with the Mac and the missing MiB when even `-fitc` does not fit, or when `-c` is set and too large.
+- Not covered: a draft model on a device that is not one of the split devices (the local GPU next to `--tp-host`) is not added to that Mac's memory.
+
+CI:
+- A C style cast dropped `const` in `log_tensor_split` (GCC `-Wcast-qual`).
+- The virtual GPU of the macOS runners has no bf16, so the server aborted on the copy to bf16 for large partials. The ranks now agree at comm init whether every GPU can convert to and from bf16, and send f32 otherwise. That adds a step to comm init, so the protocol is 10.4 and the client refuses older servers for the comm.

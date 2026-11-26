@@ -220,6 +220,14 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
     return meta_dev_ctx->simple_devs[index];
 }
 
+size_t ggml_backend_meta_dev_n_simple(ggml_backend_dev_t meta_dev) {
+    return ggml_backend_meta_dev_n_devs(meta_dev);
+}
+
+ggml_backend_dev_t ggml_backend_meta_dev_get_simple(ggml_backend_dev_t meta_dev, size_t index) {
+    return ggml_backend_meta_dev_simple_dev(meta_dev, index);
+}
+
 ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
     GGML_ASSERT(n_devs <= GGML_BACKEND_META_MAX_DEVICES);
@@ -2668,4 +2676,49 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
+}
+
+size_t ggml_backend_meta_buft_ctx_size(ggml_backend_buffer_type_t meta_buft, struct ggml_context * ctx, size_t index) {
+    GGML_ASSERT(ggml_backend_buft_is_meta(meta_buft));
+    ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(meta_buft);
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+    const size_t n_devs = dev_ctx->simple_devs.size();
+    GGML_ASSERT(index < n_devs);
+    ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(meta_buft, index);
+    const size_t alignment = ggml_backend_buft_get_alignment(simple_buft);
+
+    size_t size = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr || ggml_nelements(t) == 0) {
+            continue;
+        }
+        // the slice of this device, shaped as in ggml_backend_meta_buffer_init_tensor_impl
+        const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(t, dev_ctx->get_split_state_ud);
+        ggml_tensor slice = *t;
+        slice.buffer = nullptr;
+        slice.data   = nullptr;
+        if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+            const int d = ss.axis;
+            int64_t ne_d = 0;
+            for (uint32_t s = 0; s < ss.n_segments; s++) {
+                ne_d += ss.ne[s*n_devs + index] * ss.nr[s];
+            }
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                if (t->nb[i] > t->nb[d]) {
+                    slice.nb[i] = t->nb[i] * ne_d/t->ne[d];
+                }
+            }
+            slice.ne[d] = ne_d;
+        }
+        if (ggml_nelements(&slice) == 0) {
+            continue;
+        }
+        size += GGML_PAD(ggml_backend_buft_get_alloc_size(simple_buft, &slice), alignment);
+    }
+    return size;
+}
+
+size_t ggml_backend_meta_buffer_simple_size(ggml_backend_buffer_t meta_buf, size_t index) {
+    ggml_backend_buffer_t simple_buf = ggml_backend_meta_buffer_simple_buffer(meta_buf, index);
+    return simple_buf != nullptr ? ggml_backend_buffer_get_size(simple_buf) : 0;
 }

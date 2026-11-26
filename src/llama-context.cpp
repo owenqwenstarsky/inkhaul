@@ -3725,18 +3725,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (model.no_alloc()) {
-        for (size_t i = 0; i < backends.size(); ++i) {
-            ggml_backend_t             backend = backends[i].get();
-            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
-        }
-    } else {
-        for (const auto & backend_ptr : backends) {
-            ggml_backend_t             backend = backend_ptr.get();
-            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
-        }
+    std::map<ggml_backend_buffer_type_t, size_t> compute;
+    for (size_t i = 0; i < backends.size(); ++i) {
+        ggml_backend_t             backend = backends[i].get();
+        ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+        const size_t size = model.no_alloc() ? backend_buf_exp_size[i] : ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        llama_memory_bufs::add_breakdown_size(compute, buft, size);
+    }
+    for (const auto & [buft, size] : compute) {
+        ret[buft].compute += size;
     }
     return ret;
 }

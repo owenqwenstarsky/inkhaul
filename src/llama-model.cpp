@@ -1690,14 +1690,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         if (no_alloc()) {
             GGML_ASSERT(bufs.size() == 1);
-            ggml_backend_buffer_t buf = bufs[0].get();
-            GGML_ASSERT(ggml_backend_buffer_get_base(buf) == nullptr);
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            llama_memory_bufs::add_breakdown(ret, ctx.get(), bufs[0].get(), true);
         } else {
             for (const auto & buf : bufs) {
                 // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-                ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+                llama_memory_bufs::add_breakdown(ret, ctx.get(), buf.get(), false);
             }
         }
     }

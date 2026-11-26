@@ -464,6 +464,15 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // the simple devices of a meta device
+    GGML_API size_t             ggml_backend_meta_dev_n_simple  (ggml_backend_dev_t meta_dev);
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_get_simple(ggml_backend_dev_t meta_dev, size_t index);
+
+    // the bytes that the tensors of ctx take on simple device index when they are allocated in a meta buffer, without allocating them
+    GGML_API size_t ggml_backend_meta_buft_ctx_size(ggml_backend_buffer_type_t meta_buft, struct ggml_context * ctx, size_t index);
+    // the size of the part of a meta buffer that is on simple device index
+    GGML_API size_t ggml_backend_meta_buffer_simple_size(ggml_backend_buffer_t meta_buf, size_t index);
+
     //
     // Utils
     //
