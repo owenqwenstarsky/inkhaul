@@ -226,6 +226,14 @@ uint32_t llama_hparams::kv_source(uint32_t il) const {
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
+bool llama_hparams::is_indexer_full(uint32_t il) const {
+    if (il < n_layer()) {
+        return is_indexer_full_impl[il];
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer: %u)\n", __func__, il, n_layer());
+}
+
 bool llama_hparams::has_rope(uint32_t il) const {
     if (il < n_layer_all) {
         return rope_pattern[il] != 0;

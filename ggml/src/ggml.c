@@ -1118,9 +1118,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 
     "SIGMOID_BACK",
+
+    "ROUND_NVFP4",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,9 +1237,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 
     "sigmoid_back(x)",
+
+    "round_nvfp4(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6713,6 +6717,23 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_round_nvfp4
+
+struct ggml_tensor * ggml_round_nvfp4(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
+    GGML_ASSERT(a->ne[0] % 16 == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+
+    result->op     = GGML_OP_ROUND_NVFP4;
+    result->src[0] = a;
 
     return result;
 }
