@@ -281,6 +281,27 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         }
     }
 
+    // kv_gpu: a device for the KV cache and the attention of the full-attention layers, it gets no layers
+    if (params.kv_gpu >= 0) {
+        if (params.kv_gpu >= (int) model->devices.size()) {
+            LLAMA_LOG_ERROR("%s: invalid value for kv_gpu: %d (available devices: %zu)\n", __func__, params.kv_gpu, model->devices.size());
+            return false;
+        }
+        if (params.split_mode != LLAMA_SPLIT_MODE_LAYER && params.split_mode != LLAMA_SPLIT_MODE_NONE) {
+            LLAMA_LOG_ERROR("%s: kv_gpu needs split_mode = layer or none\n", __func__);
+            return false;
+        }
+        if (params.split_mode == LLAMA_SPLIT_MODE_NONE && params.main_gpu == params.kv_gpu) {
+            LLAMA_LOG_ERROR("%s: kv_gpu must not be the main_gpu, which holds the layers\n", __func__);
+            return false;
+        }
+        model->kv_dev = model->devices[params.kv_gpu].dev;
+    }
+    if (params.tokenize_on_kv_gpu && model->kv_dev == nullptr) {
+        LLAMA_LOG_ERROR("%s: tokenize_on_kv_gpu needs kv_gpu\n", __func__);
+        return false;
+    }
+
     // if using single GPU mode, remove all except the main GPU
     if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !model->devices.empty()) {
         if (params.main_gpu < 0) {
@@ -294,6 +315,23 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             model->devices.clear();
             model->devices.push_back(main_gpu);
         }
+        // the KV device stays, last
+        if (model->kv_dev != nullptr) {
+            model->devices.push_back({false, model->kv_dev});
+        }
+    }
+
+    if (model->kv_dev != nullptr) {
+        size_t n_layer_devs = 0;
+        for (const auto & dev : model->devices) {
+            n_layer_devs += dev.dev != model->kv_dev;
+        }
+        if (n_layer_devs == 0) {
+            LLAMA_LOG_ERROR("%s: kv_gpu needs another device for the layers\n", __func__);
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: the KV cache and the attention of the full-attention layers are on %s, it holds no layers\n",
+                __func__, ggml_backend_dev_name(model->kv_dev));
     }
 
     // the expert split keeps all devices, main_gpu is the device of the layers
@@ -372,6 +410,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             model->log_tensor_split();
+        }
+        // not for a model that only simulates its allocations (e.g. the memory measurements of --fit)
+        if (params.tokenize_on_kv_gpu && !params.no_alloc) {
+            llama_vocab_set_remote(model->vocab, model->kv_dev, fname);
         }
 
         return {0, model_ptr.release()};

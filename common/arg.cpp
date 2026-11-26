@@ -861,6 +861,51 @@ static std::vector<float> common_parse_expert_share(const std::vector<ggml_backe
 
 static void common_params_start_tp_host(common_params & params);
 
+// --kv-remote: resolve the device against the devices of the model, which needs the RPC servers of --rpc
+static void common_params_resolve_kv_remote(common_params & params) {
+    if (params.kv_remote.empty()) {
+        return;
+    }
+    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER && params.split_mode != LLAMA_SPLIT_MODE_NONE) {
+        throw std::invalid_argument("--kv-remote needs --split-mode layer or none (it cannot be combined with -sm tensor, row or expert)");
+    }
+    if (!params.expert_share.empty() || !params.kv_device.empty()) {
+        throw std::invalid_argument("--kv-remote cannot be combined with --expert-share or --kv-device");
+    }
+    if (params.no_kv_offload) {
+        throw std::invalid_argument("--kv-remote puts the KV cache on the remote device, do not give --no-kv-offload");
+    }
+
+    // the devices of the model, given explicitly so that the index below matches them
+    std::vector<ggml_backend_dev_t> devs;
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr) {
+            devs.push_back(dev);
+        }
+    }
+    if (params.devices.empty()) {
+        devs = common_default_devices();
+    }
+    const size_t i = common_find_device(devs, params.kv_remote);
+    if (!common_dev_is_rpc(devs[i])) {
+        throw std::invalid_argument(string_format("--kv-remote needs an RPC device (see --rpc), %s is not one", ggml_backend_dev_name(devs[i])));
+    }
+    if (devs.size() < 2) {
+        throw std::invalid_argument("--kv-remote needs a device for the layers besides the remote one");
+    }
+    if (devs.size() > llama_max_devices()) {
+        throw std::invalid_argument(string_format("%zu devices, at most %zu are supported", devs.size(), llama_max_devices()));
+    }
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && params.main_gpu == (int32_t) i) {
+        throw std::invalid_argument("--kv-remote: the main GPU (--main-gpu) holds the layers, it cannot be the remote device");
+    }
+    params.devices = devs;
+    params.devices.push_back(nullptr);
+    params.kv_gpu = (int32_t) i;
+    LOG_INF("--kv-remote: the KV cache and the attention of the full-attention layers on %s, which also tokenizes; the layers on the other devices\n",
+        ggml_backend_dev_name(devs[i]));
+}
+
 // resolve -es, -kvd and -lhcd against the devices of the model, which needs the RPC servers of --rpc
 static void common_params_resolve_expert_split(common_params & params) {
     const bool split_expert = !params.expert_share.empty() || params.split_mode == LLAMA_SPLIT_MODE_EXPERT;
@@ -1082,6 +1127,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // after the mmproj default, so that a device list set here does not move the mmproj to an RPC server
     common_params_resolve_expert_split(params);
+    common_params_resolve_kv_remote(params);
 
     if (params.tp_attn != LLAMA_TP_ATTN_SPLIT && params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
         throw std::invalid_argument("--tp-attn applies only to --split-mode tensor");
@@ -3005,6 +3051,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.expert_share = value;
         }
     ).set_env("LLAMA_ARG_EXPERT_SHARE"));
+    add_opt(common_arg(
+        {"--kv-remote"}, "DEV",
+        "use the RPC device DEV only for the KV cache and the tokenizer: it holds the KV cache of the full-attention layers\n"
+        "and runs their attention, and llama_tokenize runs on it; the weights and the rest of the model stay on the other devices\n"
+        "(DEV as --list-devices prints it, or the address of the server; the server needs --model-dir with a copy of the model file)",
+        [](common_params & params, const std::string & value) {
+            params.kv_remote = value;
+        }
+    ).set_env("LLAMA_ARG_KV_REMOTE"));
     add_opt(common_arg(
         {"-kvd", "--kv-device"}, "DEV",
         "LongHaul expert split: the device of the layers and the KV cache (default: the local GPU)",

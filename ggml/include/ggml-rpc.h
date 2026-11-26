@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    10
-#define RPC_PROTO_MINOR_VERSION    4
+#define RPC_PROTO_MINOR_VERSION    5
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
@@ -55,6 +55,22 @@ struct ggml_backend_rpc_file_read {
 
 // client: the server reads the file ranges into the tensors, in order with the other commands to the server
 GGML_BACKEND_API void ggml_backend_rpc_dev_set_tensors_from_file(ggml_backend_dev_t dev, const struct ggml_backend_rpc_file_read * reads, size_t n);
+
+// server: tokenizes text with the vocabulary of the model file at path, as llama_tokenize does
+// returns the number of tokens, minus the number needed if n_tokens_max is too small, INT32_MIN on error
+typedef int32_t (*ggml_backend_rpc_tokenize_t)(const char * path, const char * text, size_t text_len,
+        int32_t * tokens, int32_t n_tokens_max, bool add_special, bool parse_special);
+
+// server: the tokenizer of the program that serves (ggml does not know the vocabulary), call before ggml_backend_rpc_start_server
+GGML_BACKEND_API void ggml_backend_rpc_server_set_tokenizer(ggml_backend_rpc_tokenize_t fn);
+
+// client: true if the server of dev can tokenize with its copies of the model files
+GGML_BACKEND_API bool ggml_backend_rpc_dev_can_tokenize(ggml_backend_dev_t dev);
+
+// client: tokenizes text on the server with its copy of a model file, named by size and fingerprint (ggml_backend_rpc_file_fingerprint)
+// returns as llama_tokenize, INT32_MIN if the server has no such file
+GGML_BACKEND_API int32_t ggml_backend_rpc_dev_tokenize(ggml_backend_dev_t dev, uint64_t file_size, uint64_t file_fingerprint,
+        const char * text, size_t text_len, int32_t * tokens, int32_t n_tokens_max, bool add_special, bool parse_special);
 
 #ifdef  __cplusplus
 }

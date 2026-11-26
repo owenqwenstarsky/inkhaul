@@ -118,7 +118,49 @@ llama-bench -m M --rpc 10.0.0.2:50052 -lhc 16G -sm layer,expert -ts 40/60,50/50,
 
 ### The tokenizer
 
-The tokenizer is not split. It runs once per prompt on the CPU of the main laptop at millions of tokens per second (a 100k-token prompt takes tens of milliseconds), and the token ids are needed there. A round trip to the remote laptop takes longer than that. To check on your own prompts: `time llama-tokenize -m MODEL -f prompt.txt --show-count`. The prompt processing (the model work on the prompt) is split, as above.
+The tokenizer is not split. It runs once per prompt on the CPU of the main laptop at millions of tokens per second (a 100k-token prompt takes tens of milliseconds), and the token ids are needed there. A round trip to the remote laptop takes longer than that. To check on your own prompts: `time llama-tokenize -m MODEL -f prompt.txt --show-count`. The prompt processing (the model work on the prompt) is split, as above. Only `--kv-remote` (below) moves the tokenizer to the remote laptop.
+
+## KV cache on the remote
+
+With `--kv-remote DEV` the remote laptop does no model work. It only holds the KV cache, runs the attention over it, and tokenizes the prompts. The main laptop keeps every weight and runs everything else: the matmuls, the experts (LongHaul or in memory), the norms, the recurrent and convolution state, the output and the sampling. Use it when the context does not fit next to the weights and the LongHaul cache on the main laptop.
+
+```sh
+# on the remote laptop: --model-dir is required, it must hold the same GGUF file
+ggml-rpc-server -H 10.0.0.2 -p 50052 --model-dir ~/models
+
+# on the main laptop
+llama-cli -m ~/models/Inkling-2-Mini-AD-Q4_K.gguf --rpc 10.0.0.2:50052 --kv-remote 10.0.0.2:50052 -lhc 16G
+```
+
+`DEV` is read like `-kvd`: a device name (`RPC0`), a unique prefix of one, or the address of an RPC server of `--rpc`. The env variable is `LLAMA_ARG_KV_REMOTE`.
+
+- **Which caches move:** the KV cache of the full-attention layers. The caches of the sliding-window layers are small (they hold at most the window), so they stay on the main laptop with their attention. The recurrent and convolution state also stays there.
+- **What runs on the remote:** for each full-attention layer, the copy of the new K and V into the cache and the attention over it (`Q*K`, the soft max, `*V`, or the flash-attention op). For Inkling 2 also the relative-position bias, which is as large as the attention scores, so the remote builds it from small inputs and holds the small `attn_rel_bias` weight of those layers. No other weight is on the remote.
+- **The layers:** the remote device gets no layers. The other devices split the layers as usual (`-ts` counts them only). `-lhc` and `-lhcd` apply to the devices with layers, so the whole LongHaul cache is on the main laptop.
+- **The tokenizer:** `llama_tokenize` sends the text to the server, which loads the vocabulary of its copy of the file (found by size and fingerprint, as for the experts) and returns the token ids. The load fails if the server was started without `--model-dir`, has no copy of the file, or tokenizes a test text differently. Turning token ids back into text (once per generated token), the chat template and the grammar stay on the main laptop.
+- **`--fit`:** the layers cannot move, so only the context is lowered, until every device keeps its free memory target, as with `-sm tensor`.
+- **Keep awake:** each GPU waits for the other at every full-attention layer, and an Apple GPU that waits more than about 50 us goes to sleep and starts again 100-200 us late. So before each graph both GPUs are kept awake for 100 ms. `LLAMA_KV_REMOTE_KEEP_AWAKE_MS` sets the time, 0 turns it off.
+
+Limits:
+
+- Only with `-sm layer` (the default) or `-sm none`. Not with `-sm tensor`, `-sm row`, `-es` or `-kvd`, and not with `-nkvo`.
+- `DEV` must be an RPC device, and another device must hold the layers.
+- Pipeline parallelism stays off.
+- A draft model (`-md`) does not use the remote: without `-devd` it goes on the devices with layers, with its own cache.
+- Both laptops must run a build of this commit: an older server has no tokenizer (protocol 10.5), and the load fails.
+
+Costs (estimates, not measured; measure on your own laptops):
+
+- **Generation:** one round trip per full-attention layer pass. Each costs a GPU sync, the link and a GPU launch on the remote, about 200-400 us with both GPUs kept awake. The sliding-window passes add nothing. This is slower than one laptop, so use it for the context, not for speed.
+- **Prompt processing:** Q, K and V of a 512-token batch are a few MB per full-attention layer, and the attention output comes back. The link speed matters here.
+- **Per graph:** the masks and the KV row indices (and for Inkling 2 the relative positions) are sent once per graph, not per layer. They grow with the context.
+- **Tokenizing:** one round trip per call, queued behind a graph that is running.
+
+To compare with and without it:
+
+```sh
+llama-bench -m M --rpc 10.0.0.2:50052 -lhc 16G -kvr none,RPC0 -d 0,32768
+```
 
 ## Sizing for Inkling 2 Mini
 

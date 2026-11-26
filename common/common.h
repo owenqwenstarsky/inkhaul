@@ -603,6 +603,11 @@ struct common_params {
     std::string kv_device;              // -kvd
     std::string longhaul_cache_devices; // -lhcd
 
+    // --kv-remote DEV: the RPC device that holds the KV cache and runs the attention of the full-attention layers, and tokenizes;
+    // resolved after parsing to kv_gpu, an index into devices
+    std::string kv_remote;
+    int32_t     kv_gpu = -1;
+
     // --tp-host ADDR[:PORT]: with -sm tensor, rank 0 runs in this process as an RPC server for the local GPU,
     // started after parsing, and the devices become that server and then the --rpc servers
     std::string tp_host;

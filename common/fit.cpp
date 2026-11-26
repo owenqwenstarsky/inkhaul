@@ -461,7 +461,9 @@ static void common_params_fit_impl(
     }
 
     // -sm tensor: every device holds its share of every layer, so only the context size can change
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+    // --kv-remote (kv_gpu): the layers stay on their devices and the KV device holds none, the same applies
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR || mparams->kv_gpu >= 0) {
+        const char * mode = mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR ? "-sm tensor" : "--kv-remote";
         // the memory that the device with the largest deficit still misses at a measurement
         auto worst_deficit = [&](const dmds_t & dmds, size_t & id_worst) {
             int64_t worst = INT64_MIN;
@@ -478,9 +480,9 @@ static void common_params_fit_impl(
         if (!n_ctx_auto || n_ctx_max <= n_ctx_min_total) {
             const int64_t deficit = worst_deficit(dmds_full, id_worst);
             throw common_params_fit_exception(string_format(
-                "with -sm tensor only the context size can change, %s needs %" PRId64 " MiB more at a context size of %" PRIu32
+                "with %s only the context size can change, %s needs %" PRId64 " MiB more at a context size of %" PRIu32
                 "; lower -c, change -ts or quantize the KV cache (-ctk, -ctv)",
-                ggml_backend_dev_name(devs[id_worst]), deficit/MiB, cparams->n_ctx));
+                mode, ggml_backend_dev_name(devs[id_worst]), deficit/MiB, cparams->n_ctx));
         }
 
         cparams->n_ctx = n_ctx_min_total;
@@ -489,9 +491,9 @@ static void common_params_fit_impl(
         const int64_t deficit_min = worst_deficit(dmds_min_ctx, id_worst);
         if (deficit_min > 0) {
             throw common_params_fit_exception(string_format(
-                "with -sm tensor the model does not fit even at a context size of %" PRIu32 ", %s needs %" PRId64 " MiB more"
+                "with %s the model does not fit even at a context size of %" PRIu32 ", %s needs %" PRId64 " MiB more"
                 "; change -ts or add a device",
-                cparams->n_ctx, ggml_backend_dev_name(devs[id_worst]), deficit_min/MiB));
+                mode, cparams->n_ctx, ggml_backend_dev_name(devs[id_worst]), deficit_min/MiB));
         }
 
         // the memory of each device grows linearly with the context, each device allows the context at which it reaches its target
@@ -508,8 +510,8 @@ static void common_params_fit_impl(
         // keep it divisible by the number of streams, see step 2
         const uint32_t align = 256 * n_streams;
         cparams->n_ctx = std::max((uint32_t) n_ctx - (uint32_t) n_ctx % align, n_ctx_min_total);
-        LOG_INF("%s: -sm tensor: context size reduced from %" PRIu32 " to %" PRIu32 " to fit the free memory of every device\n",
-            __func__, n_ctx_max, cparams->n_ctx);
+        LOG_INF("%s: %s: context size reduced from %" PRIu32 " to %" PRIu32 " to fit the free memory of every device\n",
+            __func__, mode, n_ctx_max, cparams->n_ctx);
         return;
     }
 

@@ -1,6 +1,7 @@
 set(TARGET ggml-rpc-server)
 add_executable(${TARGET} rpc-server.cpp)
-target_link_libraries(${TARGET} PRIVATE ggml)
+# llama: the tokenizer of the clients started with --kv-remote
+target_link_libraries(${TARGET} PRIVATE ggml llama)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)

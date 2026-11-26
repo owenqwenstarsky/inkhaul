@@ -519,6 +519,7 @@ struct llm_graph_params {
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
+    ggml_backend_t backend_kv; // kv_gpu: where the attention over the KV cache of the full-attention layers runs, nullptr if not used
 
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
@@ -773,6 +774,7 @@ struct llm_graph_context {
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+    ggml_backend_t backend_kv;  // see llm_graph_params
 
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
@@ -948,6 +950,10 @@ struct llm_graph_context {
     //
     // attention
     //
+
+    // kv_gpu: run t on the KV device if the KV cache of layer il is there (see llama_model::kv_remote)
+    // for the nodes between the KV cache and the attention output, so that only small tensors cross to the KV device
+    void pin_kv(ggml_tensor * t, int il) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

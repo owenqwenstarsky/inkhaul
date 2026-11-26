@@ -1,6 +1,8 @@
 #include "llama-vocab.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-rpc.h"
 #include "gguf.h"
 #include "llama-impl.h"
 #include "llama-model-loader.h"
@@ -19,6 +21,7 @@
 #include <forward_list>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <string_view>
@@ -2078,6 +2081,117 @@ std::vector<llama_token> llama_vocab::tokenize(
     return pimpl->tokenize(raw_text, add_special, parse_special);
 }
 
+void llama_vocab::set_remote_tokenize(remote_tokenize_t fn) {
+    remote_tokenize = std::move(fn);
+}
+
+int32_t llama_vocab::tokenize_api(
+                  const char * text,
+                     int32_t   text_len,
+                 llama_token * tokens,
+                     int32_t   n_tokens_max,
+                        bool   add_special,
+                        bool   parse_special) const {
+    if (!remote_tokenize) {
+        return tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+    }
+    if (text_len < 0 || n_tokens_max < 0) {
+        return std::numeric_limits<int32_t>::min();
+    }
+    const int32_t n = remote_tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+    if (n == std::numeric_limits<int32_t>::min()) {
+        LLAMA_LOG_ERROR("%s: the remote tokenizer failed\n", __func__);
+    }
+    return n;
+}
+
+// the tokenizer of an RPC server: the vocabulary of each model file is loaded once, on the first request for it
+static int32_t llama_rpc_server_tokenize(const char * path, const char * text, size_t text_len,
+        int32_t * tokens, int32_t n_tokens_max, bool add_special, bool parse_special) {
+    static std::mutex mutex;
+    static std::map<std::string, std::unique_ptr<llama_model, decltype(&llama_model_free)>> models;
+    if (text_len > (size_t) std::numeric_limits<int32_t>::max()) {
+        return std::numeric_limits<int32_t>::min();
+    }
+    const llama_vocab * vocab = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = models.find(path);
+        if (it == models.end()) {
+            llama_model_params mparams = llama_model_default_params();
+            mparams.vocab_only = true;
+            llama_model * model = llama_model_load_from_file(path, mparams);
+            if (model == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to load the vocabulary of %s\n", __func__, path);
+                return std::numeric_limits<int32_t>::min();
+            }
+            it = models.emplace(path, std::unique_ptr<llama_model, decltype(&llama_model_free)>(model, llama_model_free)).first;
+        }
+        vocab = llama_model_get_vocab(it->second.get());
+    }
+    return vocab->tokenize(text, (int32_t) text_len, tokens, n_tokens_max, add_special, parse_special);
+}
+
+bool llama_rpc_server_enable_tokenizer(void) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    auto set_fn = reg ? (decltype(ggml_backend_rpc_server_set_tokenizer) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_server_set_tokenizer") : nullptr;
+    if (set_fn == nullptr) {
+        return false;
+    }
+    set_fn(llama_rpc_server_tokenize);
+    return true;
+}
+
+void llama_vocab_set_remote(llama_vocab & vocab, ggml_backend_dev_t dev, const std::string & path) {
+    if (path.empty()) {
+        throw std::runtime_error("the remote tokenizer needs a model loaded from a file path");
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr || std::string(ggml_backend_reg_name(reg)) != "RPC") {
+        throw std::runtime_error(format("the remote tokenizer needs an RPC device, %s is not one", ggml_backend_dev_name(dev)));
+    }
+    auto can_fn  = (decltype(ggml_backend_rpc_dev_can_tokenize) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_can_tokenize");
+    auto open_fn = (decltype(ggml_backend_rpc_dev_open_file) *)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_open_file");
+    auto tok_fn  = (decltype(ggml_backend_rpc_dev_tokenize) *)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_tokenize");
+    auto fp_fn   = (decltype(ggml_backend_rpc_file_fingerprint) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_file_fingerprint");
+    if (can_fn == nullptr || open_fn == nullptr || tok_fn == nullptr || fp_fn == nullptr) {
+        throw std::runtime_error("the RPC backend has no remote tokenizer");
+    }
+    const std::string name = path.substr(path.find_last_of("/\\") + 1);
+    if (!can_fn(dev)) {
+        throw std::runtime_error(format("the RPC server of %s cannot tokenize: start ggml-rpc-server of this build with --model-dir DIR, "
+            "DIR holding a copy of %s", ggml_backend_dev_name(dev), name.c_str()));
+    }
+    uint64_t size        = 0;
+    uint64_t fingerprint = 0;
+    if (open_fn(dev, path.c_str()) < 0 || !fp_fn(path.c_str(), &size, &fingerprint)) {
+        throw std::runtime_error(format("the RPC server of %s has no copy of %s in its --model-dir, so it cannot tokenize",
+            ggml_backend_dev_name(dev), name.c_str()));
+    }
+    llama_vocab::remote_tokenize_t fn = [dev, size, fingerprint, tok_fn](const char * text, int32_t text_len, llama_token * tokens, int32_t n_tokens_max,
+            bool add_special, bool parse_special) {
+        return tok_fn(dev, size, fingerprint, text, (size_t) text_len, tokens, n_tokens_max, add_special, parse_special);
+    };
+
+    // the server must tokenize like this host, special tokens included
+    std::string probe = "Hello world, 123 tokens! \xc3\xa9t\xc3\xa9 \xe4\xbd\xa0\xe5\xa5\xbd\n\tend";
+    for (const llama_token t : { vocab.token_bos(), vocab.token_eos() }) {
+        if (t != LLAMA_TOKEN_NULL) {
+            probe += vocab.token_get_text(t);
+        }
+    }
+    const std::vector<llama_token> ref = vocab.tokenize(probe, true, true);
+    std::vector<llama_token> got(ref.size() + 8);
+    const int32_t n = fn(probe.data(), (int32_t) probe.size(), got.data(), (int32_t) got.size(), true, true);
+    if (n < 0 || (size_t) n != ref.size() || !std::equal(ref.begin(), ref.end(), got.begin())) {
+        throw std::runtime_error(format("the RPC server of %s tokenizes differently from this host (%d tokens, expected %zu)",
+            ggml_backend_dev_name(dev), n, ref.size()));
+    }
+
+    vocab.set_remote_tokenize(std::move(fn));
+    LLAMA_LOG_INFO("%s: llama_tokenize runs on the RPC server of %s\n", __func__, ggml_backend_dev_name(dev));
+}
+
 const std::string & llama_vocab::token_to_piece(llama_token token) const {
     return pimpl->token_to_piece(token);
 }
@@ -2232,7 +2346,7 @@ int32_t llama_tokenize(
                      int32_t   n_tokens_max,
                         bool   add_special,
                         bool   parse_special) {
-    return vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+    return vocab->tokenize_api(text, text_len, tokens, n_tokens_max, add_special, parse_special);
 }
 
 int32_t llama_token_to_piece(

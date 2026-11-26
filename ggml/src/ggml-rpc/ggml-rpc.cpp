@@ -93,6 +93,8 @@ enum rpc_cmd {
     RPC_CMD_COMM_FREE,
     RPC_CMD_FILE_OPEN,
     RPC_CMD_SET_TENSORS_FROM_FILE,
+    RPC_CMD_TOKENIZE,
+    RPC_CMD_KEEP_AWAKE,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -126,9 +128,19 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
         case RPC_CMD_FILE_OPEN:         return "FILE_OPEN";
         case RPC_CMD_SET_TENSORS_FROM_FILE: return "SET_TENSORS_FROM_FILE";
+        case RPC_CMD_TOKENIZE:          return "TOKENIZE";
+        case RPC_CMD_KEEP_AWAKE:        return "KEEP_AWAKE";
         case RPC_CMD_NONE:              return "NONE";
         default:                        return "UNKNOWN";
     }
+}
+
+// a tokenizer makes about one token per byte of text at most, plus the special tokens it adds: the client asks for that many
+// tokens first, and the server allows a few times more, which bounds the response it allocates
+const uint64_t RPC_TOKENIZE_SLACK = 64;
+
+static uint64_t rpc_tokenize_max(uint64_t text_len) {
+    return 4*text_len + RPC_TOKENIZE_SLACK;
 }
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
@@ -146,6 +158,7 @@ struct rpc_msg_hello_req {
 enum rpc_dispatcher_flags : uint8_t {
     RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH = 1 << 0, // client should try SET_TENSOR_HASH before sending tensor data
     RPC_DISPATCHER_FLAGS_FILE_READ        = 1 << 1, // server can read tensor data from its model files (FILE_OPEN)
+    RPC_DISPATCHER_FLAGS_TOKENIZE         = 1 << 2, // server can tokenize with the vocabulary of its model files (TOKENIZE)
 };
 
 struct rpc_msg_hello_rsp {
@@ -311,6 +324,23 @@ struct rpc_msg_file_open_rsp {
     int32_t file_id; // -1 if the server has no such file
 };
 
+// TOKENIZE header, followed by the text
+// the file is named by its size and fingerprint, not by a FILE_OPEN id: the client may tokenize on a new connection
+// response: | int32_t n | int32_t tokens[n_tokens_max] |, n as llama_tokenize returns it, INT32_MIN on error
+struct rpc_msg_tokenize_req {
+    uint64_t file_size;
+    uint64_t file_fingerprint;
+    int32_t  n_tokens_max;  // at most rpc_tokenize_max(text_len)
+    uint8_t  add_special;
+    uint8_t  parse_special;
+    uint64_t text_len;
+};
+
+struct rpc_msg_keep_awake_req {
+    uint32_t device;
+    int64_t  us;
+};
+
 // SET_TENSORS_FROM_FILE: a uint32_t count, then the records
 struct rpc_msg_file_read {
     rpc_tensor tensor;
@@ -354,6 +384,7 @@ RPC_MSG_TYPES(RPC_CMD_COMM_INIT,         rpc_msg_comm_init_req,         rpc_msg_
 RPC_MSG_TYPES(RPC_CMD_COMM_ALLREDUCE,    rpc_msg_comm_allreduce_req,    void);
 RPC_MSG_TYPES(RPC_CMD_COMM_FREE,         rpc_msg_comm_free_req,         void);
 RPC_MSG_TYPES(RPC_CMD_FILE_OPEN,         rpc_msg_file_open_req,         rpc_msg_file_open_rsp);
+RPC_MSG_TYPES(RPC_CMD_KEEP_AWAKE,        rpc_msg_keep_awake_req,        void);
 
 #undef RPC_MSG_TYPES
 
@@ -549,6 +580,16 @@ static rpc_file_index & rpc_server_files() {
     return index;
 }
 
+// set by the program that serves, before ggml_backend_rpc_start_server
+static std::atomic<ggml_backend_rpc_tokenize_t> & rpc_server_tokenizer_fn() {
+    static std::atomic<ggml_backend_rpc_tokenize_t> fn = nullptr;
+    return fn;
+}
+
+static ggml_backend_rpc_tokenize_t rpc_server_tokenizer() {
+    return rpc_server_tokenizer_fn().load();
+}
+
 // builds a variable-size request; the buffer must not change once queued
 struct rpc_writer {
     std::shared_ptr<std::vector<uint8_t>> buf = std::make_shared<std::vector<uint8_t>>();
@@ -702,8 +743,9 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+static bool send_rpc_cmd_payload(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, const void * payload, size_t payload_size,
+                                 void * output, size_t output_size) {
+    if (!send_rpc_cmd_payload(sock, cmd, input, input_size, payload, payload_size)) {
         return false;
     }
     uint64_t out_size;
@@ -717,6 +759,10 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
         return false;
     }
     return true;
+}
+
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    return send_rpc_cmd_payload(sock, cmd, input, input_size, nullptr, 0, output, output_size);
 }
 
 // RPC client-side implementation
@@ -864,6 +910,7 @@ public:
     bool get_send_tensor_hash() const { return flags & RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH; }
     uint32_t get_server_minor() const { return server_minor; }
     bool get_file_read() const { return flags & RPC_DISPATCHER_FLAGS_FILE_READ; }
+    bool get_tokenize() const { return (flags & RPC_DISPATCHER_FLAGS_TOKENIZE) && server_minor >= 5; }
 
     ~rpc_dispatcher();
 
@@ -1035,7 +1082,8 @@ void rpc_dispatcher::work() {
             const bool trace = rpc_log_debug_level() >= 3;
             const auto t0 = std::chrono::steady_clock::now();
             if (msg_ptr->output) {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
+                bool status = send_rpc_cmd_payload(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->payload, msg_ptr->payload_size,
+                                                   msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
             } else if (rpc_cmd_batchable(msg_ptr->cmd, msg_ptr->output, msg_ptr->payload_size, msg_ptr->input_size)) {
                 // the fire-and-forget commands already queued behind this one go out in the same send,
@@ -1930,6 +1978,8 @@ public:
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool file_open(const rpc_msg_file_open_req & request, rpc_msg_file_open_rsp & response);
     bool set_tensors_from_file(const std::vector<uint8_t> & input);
+    bool tokenize(const std::vector<uint8_t> & input, std::vector<uint8_t> & response);
+    bool keep_awake(const rpc_msg_keep_awake_req & request);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -2059,6 +2109,9 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.flags = cache_dir ? RPC_DISPATCHER_FLAGS_SEND_TENSOR_HASH : 0;
     if (!rpc_server_files().files.empty()) {
         response.flags |= RPC_DISPATCHER_FLAGS_FILE_READ;
+        if (rpc_server_tokenizer() != nullptr) {
+            response.flags |= RPC_DISPATCHER_FLAGS_TOKENIZE;
+        }
     }
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
@@ -2353,6 +2406,52 @@ bool rpc_server::file_open(const rpc_msg_file_open_req & request, rpc_msg_file_o
     }
     LOG_INFO("[%s] no file matches client file '%s' (size %" PRIu64 ", fingerprint %016" PRIx64 ")\n",
              __func__, name.c_str(), request.size, request.fingerprint);
+    return true;
+}
+
+bool rpc_server::tokenize(const std::vector<uint8_t> & input, std::vector<uint8_t> & response) {
+    rpc_reader reader(input);
+    rpc_msg_tokenize_req request;
+    if (!reader.read(request) || request.text_len != input.size() - sizeof(request)) {
+        LOG_ERROR("[%s] invalid request\n", __func__);
+        return false;
+    }
+    if (request.n_tokens_max < 0 || (uint64_t) request.n_tokens_max > rpc_tokenize_max(request.text_len)) {
+        LOG_ERROR("[%s] invalid n_tokens_max %d for %" PRIu64 " bytes of text\n", __func__, request.n_tokens_max, request.text_len);
+        return false;
+    }
+    response.assign(sizeof(int32_t)*(1 + (size_t) request.n_tokens_max), 0);
+    int32_t n = INT32_MIN;
+    const rpc_file * file = nullptr;
+    for (const auto & f : rpc_server_files().files) {
+        if (f->size == request.file_size && f->fingerprint == request.file_fingerprint) {
+            file = f.get();
+            break;
+        }
+    }
+    ggml_backend_rpc_tokenize_t fn = rpc_server_tokenizer();
+    if (fn == nullptr || file == nullptr) {
+        LOG_ERROR("[%s] no tokenizer for the file of fingerprint %016" PRIx64 "\n", __func__, request.file_fingerprint);
+    } else {
+        const char * text = (const char *) input.data() + sizeof(request);
+        n = fn(file->path.c_str(), text, (size_t) request.text_len, (int32_t *) (response.data() + sizeof(int32_t)),
+               request.n_tokens_max, request.add_special != 0, request.parse_special != 0);
+    }
+    memcpy(response.data(), &n, sizeof(n));
+    return true;
+}
+
+bool rpc_server::keep_awake(const rpc_msg_keep_awake_req & request) {
+    if (request.device >= backends.size()) {
+        LOG_ERROR("[%s] invalid device %u\n", __func__, request.device);
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[request.device]);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto fn = reg ? (ggml_backend_dev_keep_awake_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_keep_awake") : nullptr;
+    if (fn != nullptr && request.us > 0) {
+        fn(dev, std::min<int64_t>(request.us, 1000000));
+    }
     return true;
 }
 
@@ -3437,6 +3536,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 case RPC_CMD_SET_TENSOR_2D:     ok = recv_msg(sock, input) && server.set_tensor_2d(input); break;
                 case RPC_CMD_SET_TENSORS_FROM_FILE: ok = recv_msg(sock, input) && server.set_tensors_from_file(input); break;
                 case RPC_CMD_FILE_OPEN:         ok = rpc_serve<RPC_CMD_FILE_OPEN>        (sock, server, &rpc_server::file_open);         break;
+                case RPC_CMD_TOKENIZE: {
+                    std::vector<uint8_t> response;
+                    ok = recv_msg(sock, input) && server.tokenize(input, response) && rpc_send_rsp(sock, response);
+                    break;
+                }
+                case RPC_CMD_KEEP_AWAKE:        ok = rpc_serve<RPC_CMD_KEEP_AWAKE>       (sock, server, &rpc_server::keep_awake);        break;
                 case RPC_CMD_GRAPH_COMPUTE:     ok = recv_msg(sock, input) && server.graph_compute(input); break;
                 case RPC_CMD_ALLOC_BUFFER:      ok = rpc_serve<RPC_CMD_ALLOC_BUFFER>     (sock, server, &rpc_server::alloc_buffer);      break;
                 case RPC_CMD_GET_ALIGNMENT:     ok = rpc_serve<RPC_CMD_GET_ALIGNMENT>    (sock, server, &rpc_server::get_alignment);     break;
@@ -3935,6 +4040,65 @@ void ggml_backend_rpc_dev_set_tensors_from_file(ggml_backend_dev_t dev, const st
     dispatcher->send_async(RPC_CMD_SET_TENSORS_FROM_FILE, writer.data(), writer.size());
 }
 
+void ggml_backend_rpc_server_set_tokenizer(ggml_backend_rpc_tokenize_t fn) {
+    rpc_server_tokenizer_fn().store(fn);
+}
+
+bool ggml_backend_rpc_dev_can_tokenize(ggml_backend_dev_t dev) {
+    auto dispatcher = rpc_dev_dispatcher(dev);
+    return dispatcher != nullptr && dispatcher->get_tokenize();
+}
+
+int32_t ggml_backend_rpc_dev_tokenize(ggml_backend_dev_t dev, uint64_t file_size, uint64_t file_fingerprint, const char * text, size_t text_len,
+        int32_t * tokens, int32_t n_tokens_max, bool add_special, bool parse_special) {
+    auto dispatcher = rpc_dev_dispatcher(dev);
+    if (dispatcher == nullptr || !dispatcher->get_tokenize() || n_tokens_max < 0) {
+        return INT32_MIN;
+    }
+    // the response holds n_cap tokens, so do not ask for more than the text is likely to make
+    int32_t n_cap = (int32_t) std::min<uint64_t>((uint64_t) n_tokens_max, (uint64_t) text_len + RPC_TOKENIZE_SLACK);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        rpc_msg_tokenize_req request = {};
+        request.file_size        = file_size;
+        request.file_fingerprint = file_fingerprint;
+        request.n_tokens_max  = n_cap;
+        request.add_special   = add_special ? 1 : 0;
+        request.parse_special = parse_special ? 1 : 0;
+        request.text_len      = text_len;
+        auto input = std::make_shared<rpc_msg_tokenize_req>(request);
+        std::vector<uint8_t> response(sizeof(int32_t)*(1 + (size_t) n_cap));
+        dispatcher->send(RPC_CMD_TOKENIZE, input, sizeof(request), text, text_len, response.data(), response.size());
+        int32_t n;
+        memcpy(&n, response.data(), sizeof(n));
+        if (n == INT32_MIN) {
+            return n;
+        }
+        if (n >= 0) {
+            memcpy(tokens, response.data() + sizeof(int32_t), sizeof(int32_t)*(size_t) n);
+            return n;
+        }
+        // the cap above was too small but the caller's buffer is not: ask again with the size the server named
+        if (-(int64_t) n > n_tokens_max || n_cap == n_tokens_max) {
+            return n;
+        }
+        if ((uint64_t) -(int64_t) n > rpc_tokenize_max(text_len)) {
+            return INT32_MIN;
+        }
+        n_cap = -n;
+    }
+    return INT32_MIN;
+}
+
+// keeps the GPU of the server awake, the same entry point as a local device has (ggml_backend_dev_keep_awake_t)
+static void ggml_backend_rpc_dev_keep_awake(ggml_backend_dev_t dev, int64_t us) {
+    auto dispatcher = rpc_dev_dispatcher(dev);
+    if (dispatcher == nullptr || dispatcher->get_server_minor() < 5) {
+        return;
+    }
+    const ggml_backend_rpc_device_context * ctx = (const ggml_backend_rpc_device_context *) dev->context;
+    dispatcher->call_async<RPC_CMD_KEEP_AWAKE>({ ctx->device, us });
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
@@ -3950,6 +4114,21 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_set_tensors_from_file") == 0) {
         return (void *)ggml_backend_rpc_dev_set_tensors_from_file;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_file_fingerprint") == 0) {
+        return (void *)ggml_backend_rpc_file_fingerprint;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_server_set_tokenizer") == 0) {
+        return (void *)ggml_backend_rpc_server_set_tokenizer;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_dev_can_tokenize") == 0) {
+        return (void *)ggml_backend_rpc_dev_can_tokenize;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_dev_tokenize") == 0) {
+        return (void *)ggml_backend_rpc_dev_tokenize;
+    }
+    if (std::strcmp(name, "ggml_backend_dev_keep_awake") == 0) {
+        return (void *)ggml_backend_rpc_dev_keep_awake;
     }
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_rpc_comm_init;

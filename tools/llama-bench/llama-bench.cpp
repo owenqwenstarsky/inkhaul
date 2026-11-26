@@ -372,6 +372,7 @@ struct cmd_params {
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
     std::vector<llama_tp_attn>       tp_attn;
+    std::vector<std::string>         kv_remote;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
@@ -421,6 +422,7 @@ static const cmd_params cmd_params_defaults = {
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
     /* tp_attn              */ { LLAMA_TP_ATTN_SPLIT },
+    /* kv_remote            */ { "none" },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
@@ -502,6 +504,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
     printf("  -tpa, --tp-attn <split|mirror>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.tp_attn, tp_attn_str), ",").c_str());
+    printf("  -kvr, --kv-remote <none|DEV>                      (default: %s)\n", join(cmd_params_defaults.kv_remote, ",").c_str());
+    printf("                                                    the KV cache and attention of the full-attention layers on the RPC device DEV\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
@@ -914,6 +918,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.tp_attn.insert(params.tp_attn.end(), modes.begin(), modes.end());
+            } else if (arg == "-kvr" || arg == "--kv-remote") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.kv_remote.insert(params.kv_remote.end(), p.begin(), p.end());
             } else if (arg == "-mg" || arg == "--main-gpu") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1243,6 +1254,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.tp_attn.empty()) {
         params.tp_attn = cmd_params_defaults.tp_attn;
     }
+    if (params.kv_remote.empty()) {
+        params.kv_remote = cmd_params_defaults.kv_remote;
+    }
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
     }
@@ -1316,6 +1330,8 @@ struct cmd_params_instance {
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
     llama_tp_attn      tp_attn;
+    std::string        kv_remote; // "none" or a device name
+    int                kv_gpu;    // kv_remote as an index into devices, -1 for none
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
@@ -1340,6 +1356,8 @@ struct cmd_params_instance {
         mparams.load_mode     = load_mode;
         mparams.lazy_mode     = lazy_mode;
         mparams.tp_attn       = tp_attn;
+        mparams.kv_gpu        = kv_gpu;
+        mparams.tokenize_on_kv_gpu = kv_gpu >= 0;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
@@ -1388,7 +1406,7 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               load_mode == other.load_mode && lazy_mode == other.lazy_mode && tp_attn == other.tp_attn &&
+               load_mode == other.load_mode && lazy_mode == other.lazy_mode && tp_attn == other.tp_attn && kv_gpu == other.kv_gpu &&
                devices == other.devices && no_host == other.no_host && repack == other.repack &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1413,6 +1431,51 @@ struct cmd_params_instance {
     }
 };
 
+// -kvr: the devices of the model in the order the library uses (the RPC devices first), and the index of the remote one
+// false (with an error) if the device is not an RPC device of the run
+static bool resolve_kv_remote(cmd_params_instance & inst) {
+    if (inst.kv_remote == "none") {
+        return true;
+    }
+    std::vector<ggml_backend_dev_t> devs;
+    for (ggml_backend_dev_t dev : inst.devices) {
+        if (dev != nullptr) {
+            devs.push_back(dev);
+        }
+    }
+    if (devs.empty()) {
+        std::vector<ggml_backend_dev_t> gpus;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(dev);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            const bool is_rpc = std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev))) == "RPC";
+            if (is_rpc) {
+                devs.push_back(dev);
+            } else {
+                gpus.push_back(dev);
+            }
+        }
+        devs.insert(devs.end(), gpus.begin(), gpus.end());
+    }
+    for (size_t i = 0; i < devs.size(); ++i) {
+        if (inst.kv_remote == ggml_backend_dev_name(devs[i]) || inst.kv_remote == ggml_backend_dev_description(devs[i])) {
+            if (std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devs[i]))) != "RPC") {
+                fprintf(stderr, "error: -kvr %s is not an RPC device\n", inst.kv_remote.c_str());
+                return false;
+            }
+            inst.devices = devs;
+            inst.devices.push_back(nullptr);
+            inst.kv_gpu  = (int) i;
+            return true;
+        }
+    }
+    fprintf(stderr, "error: -kvr %s is not a device of the run (see --list-devices)\n", inst.kv_remote.c_str());
+    return false;
+}
+
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
 
@@ -1427,6 +1490,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & lm : params.load_mode)
     for (const auto & lzm : params.lazy_mode)
     for (const auto & tpa : params.tp_attn)
+    for (const auto & kvr : params.kv_remote)
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
@@ -1472,6 +1536,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
                 /* .tp_attn               = */ tpa,
+                /* .kv_remote             = */ kvr,
+                /* .kv_gpu                = */ -1,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1485,6 +1551,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
+            if (!resolve_kv_remote(instance)) {
+                continue;
+            }
             instances.push_back(instance);
         }
 
@@ -1513,6 +1582,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
                 /* .tp_attn               = */ tpa,
+                /* .kv_remote             = */ kvr,
+                /* .kv_gpu                = */ -1,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1526,6 +1597,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
+            if (!resolve_kv_remote(instance)) {
+                continue;
+            }
             instances.push_back(instance);
         }
 
@@ -1554,6 +1628,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
                 /* .tp_attn               = */ tpa,
+                /* .kv_remote             = */ kvr,
+                /* .kv_gpu                = */ -1,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1567,6 +1643,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
+            if (!resolve_kv_remote(instance)) {
+                continue;
+            }
             instances.push_back(instance);
         }
     }
@@ -1599,6 +1678,7 @@ struct test {
     llama_load_mode          load_mode;
     llama_lazy_mode          lazy_mode;
     llama_tp_attn            tp_attn;
+    std::string              kv_remote;
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
@@ -1642,6 +1722,7 @@ struct test {
         load_mode      = inst.load_mode;
         lazy_mode      = inst.lazy_mode;
         tp_attn        = inst.tp_attn;
+        kv_remote      = inst.kv_remote;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
@@ -1711,7 +1792,7 @@ struct test {
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",     "tp_attn",
-            "embeddings",
+            "kv_remote",      "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
@@ -1809,6 +1890,7 @@ struct test {
                                             llama_load_mode_name(load_mode),
                                             lazy_mode_str(lazy_mode),
                                             tp_attn_str(tp_attn),
+                                            kv_remote,
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
@@ -2140,6 +2222,9 @@ struct markdown_printer : public printer {
         }
         if (params.tp_attn.size() > 1 || params.tp_attn != cmd_params_defaults.tp_attn) {
             fields.emplace_back("tp_attn");
+        }
+        if (params.kv_remote.size() > 1 || params.kv_remote != cmd_params_defaults.kv_remote) {
+            fields.emplace_back("kv_remote");
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");

@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
+#include "llama.h"
 #ifdef _WIN32
 #  define NOMINMAX
 #  include <windows.h>
@@ -94,7 +95,8 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
-    fprintf(stderr, "  --model-dir DIR                  read LongHaul experts from the .gguf files in DIR instead of receiving them\n");
+    fprintf(stderr, "  --model-dir DIR                  read LongHaul experts from the .gguf files in DIR instead of receiving them,\n");
+    fprintf(stderr, "                                   and tokenize for clients started with --kv-remote\n");
     fprintf(stderr, "  --io-threads N                   number of concurrent reads from the model files (default: %d)\n", params.n_io_threads);
     fprintf(stderr, "\n");
 }
@@ -273,6 +275,10 @@ int main(int argc, char * argv[]) {
         }
         if (set_model_dir_fn(params.model_dir.c_str(), params.n_io_threads) == 0) {
             fprintf(stderr, "warning: no .gguf file in %s, the client sends the LongHaul experts\n", params.model_dir.c_str());
+        }
+        // clients started with --kv-remote tokenize here, with the vocabulary of these files
+        if (!llama_rpc_server_enable_tokenizer()) {
+            fprintf(stderr, "warning: the clients cannot tokenize on this server\n");
         }
     }
 

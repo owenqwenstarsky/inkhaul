@@ -345,6 +345,31 @@ llama_context::llama_context(
             }
         }
 
+        // kv_gpu: the backend that runs the attention over the KV cache of the full-attention layers
+        if (model.kv_dev != nullptr) {
+            if (!cparams.offload_kqv) {
+                throw std::runtime_error("the KV device of the model (kv_gpu) needs offload_kqv");
+            }
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == model.kv_dev) {
+                    backend_kv = backend.get();
+                }
+            }
+            GGML_ASSERT(backend_kv != nullptr);
+
+            // each GPU waits for the other at every full-attention layer, and an Apple GPU that waits more than
+            // about 50 us sleeps and starts again 100-200 us late, so keep the GPUs awake while graphs come
+            const char * env = getenv("LLAMA_KV_REMOTE_KEEP_AWAKE_MS");
+            keep_awake_us = (env != nullptr ? (int64_t) atoll(env) : 100)*1000;
+            for (const auto & dev : model.devices) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
+                auto fn = reg ? (ggml_backend_dev_keep_awake_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_keep_awake") : nullptr;
+                if (fn != nullptr && keep_awake_us > 0) {
+                    keep_awake_fns.emplace_back(dev.dev, fn);
+                }
+            }
+        }
+
         // add CPU backend
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (backend_cpu == nullptr) {
@@ -428,7 +453,8 @@ llama_context::llama_context(
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            !model.has_longhaul(); // not supported by the LongHaul cache
+            !model.has_longhaul() && // not supported by the LongHaul cache
+            model.kv_dev == nullptr; // the KV device holds no layers, so there is no pipeline to fill
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -543,9 +569,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
-            // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
+            // TODO: make this descriptor-specific; model.dev_kv() preserves the current behavior,
             // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            // the attention runs where the KV cache is, which is not the device of the layer with kv_gpu
+            ggml_backend_dev_t device_layer = model.dev_kv(node.il);
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -2659,6 +2686,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
+        /*.backend_kv  =*/ backend_kv,
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.moe_cache   =*/ moe_cache.get(),
@@ -2715,6 +2743,10 @@ ggml_status llama_context::graph_compute(
     copy_experts.reset();
     if (moe_cache) {
         moe_cache->begin_graph();
+    }
+
+    for (const auto & [dev, fn] : keep_awake_fns) {
+        fn(dev, keep_awake_us);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);

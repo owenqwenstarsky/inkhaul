@@ -1703,6 +1703,24 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
+    // --kv-remote is for the target model: without -devd, the draft model goes on the devices of the layers of the target
+    if (has_draft && params.kv_gpu >= 0) {
+        if (params_spec.devices.empty()) {
+            result.devices.clear();
+            for (size_t i = 0; i < params.devices.size(); ++i) {
+                if ((int32_t) i != params.kv_gpu) {
+                    result.devices.push_back(params.devices[i]);
+                }
+            }
+            // the indices of the devices moved down past the remote one
+            if (result.main_gpu > params.kv_gpu) {
+                result.main_gpu--;
+            }
+            std::fill(std::begin(result.tensor_split), std::end(result.tensor_split), 0.0f);
+        }
+        result.kv_gpu = -1;
+    }
+
     // the expert split is for the target model (it needs LongHaul, and the shares and cache sizes are for its experts):
     // without -devd, the draft model goes whole on the device of the KV cache of the target
     if (has_draft && result.split_mode == LLAMA_SPLIT_MODE_EXPERT) {

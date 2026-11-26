@@ -1114,6 +1114,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
     }
 
+    // kv_gpu: the KV device gets no layers, the other devices share them evenly if no split is left
+    if (kv_dev != nullptr) {
+        bool any = false;
+        for (size_t i = 0; i < n_devices(); ++i) {
+            if (devices[i].dev == kv_dev) {
+                splits[i] = 0.0f;
+            }
+            any = any || splits[i] > 0.0f;
+        }
+        for (size_t i = 0; i < n_devices() && !any; ++i) {
+            splits[i] = devices[i].dev == kv_dev ? 0.0f : 1.0f;
+        }
+    }
+
     // sum and normalize the splits to get the split points
     float split_sum = 0.0f;
     for (size_t i = 0; i < n_devices(); ++i) {
@@ -1583,6 +1597,11 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     if (tn.bid != -1) {
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
+
+        // kv_gpu: the weights that only the attention over the KV cache reads go with the KV cache
+        if (tn.tensor == LLM_TENSOR_ATTN_REL_BIAS && (size_t) tn.bid < pimpl->dev_layer.size() && kv_remote(tn.bid)) {
+            buft_list_layer = &pimpl->gpu_buft_list.at(kv_dev);
+        }
     }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
@@ -1844,6 +1863,15 @@ ggml_backend_dev_t llama_model::dev_layer(int il) const {
 
 ggml_backend_dev_t llama_model::dev_output() const {
     return pimpl->dev_output.dev;
+}
+
+bool llama_model::kv_remote(int il) const {
+    // the sliding-window caches stay small whatever the context, they stay with their layers
+    return kv_dev != nullptr && !hparams.is_swa(il);
+}
+
+ggml_backend_dev_t llama_model::dev_kv(int il) const {
+    return kv_remote(il) ? kv_dev : dev_layer(il);
 }
 
 template<typename F>
@@ -2148,6 +2176,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.tp_attn                     =*/ LLAMA_TP_ATTN_SPLIT,
         /*.main_gpu                    =*/ 0,
+        /*.kv_gpu                      =*/ -1,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -2157,6 +2186,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.tokenize_on_kv_gpu          =*/ false,
     };
 
     return result;

@@ -350,6 +350,10 @@ extern "C" {
         // with LLAMA_SPLIT_MODE_EXPERT: the device of every layer and of the KV cache (an index into the devices of the model)
         int32_t main_gpu;
 
+        // the device that holds the KV cache of the full-attention layers and runs their attention, and holds no layers
+        // (an index into the devices of the model), -1: the KV cache of each layer is on the device of the layer
+        int32_t kv_gpu;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         // with LLAMA_SPLIT_MODE_EXPERT: the share of the experts of each MoE layer that each device computes
         const float * tensor_split;
@@ -371,6 +375,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool tokenize_on_kv_gpu; // llama_tokenize runs on the RPC server of kv_gpu, with its copy of the model file
     };
 
     struct llama_sampler_seq_config {
@@ -1246,6 +1251,11 @@ extern "C" {
     //
     // The API is thread-safe.
     //
+
+    /// @details For a program that runs ggml_backend_rpc_start_server: clients may run llama_tokenize on it
+    ///          (llama_model_params.tokenize_on_kv_gpu), with the vocabulary of its model files (ggml_backend_rpc_server_set_model_dir).
+    ///          Call before the server starts. Returns false if there is no RPC backend.
+    LLAMA_API bool llama_rpc_server_enable_tokenizer(void);
 
     /// @details Convert the provided text into tokens.
     /// @param tokens The tokens pointer must be large enough to hold the resulting tokens.

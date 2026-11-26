@@ -1105,6 +1105,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     rope_type        (hparams.rope_type),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    backend_kv       (params.backend_kv),
     loras            (params.loras),
     mctx             (params.mctx),
     moe_cache        (params.moe_cache),
@@ -2296,6 +2297,12 @@ ggml_tensor * llm_graph_context::build_inp_moe_ids(int64_t n_used, int64_t n_row
 
 
 
+void llm_graph_context::pin_kv(ggml_tensor * t, int il) const {
+    if (backend_kv != nullptr && il >= 0 && model.kv_remote(il)) {
+        ggml_backend_sched_set_tensor_backend(sched, t, backend_kv);
+    }
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2322,6 +2329,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
+    // kv_gpu: the nodes from the KV cache to the attention output run on the KV device, before the MLA weights
+    auto pin = [&](ggml_tensor * t) {
+        pin_kv(t, il);
+        return t;
+    };
+
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
@@ -2335,11 +2348,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
         if (k->type == GGML_TYPE_F32) {
-            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+            k = pin(ggml_cast(ctx0, k, GGML_TYPE_F16));
         }
 
         if (v->type == GGML_TYPE_F32) {
-            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            v = pin(ggml_cast(ctx0, v, GGML_TYPE_F16));
         }
 
         if (kv_rows) {
@@ -2347,6 +2360,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         } else {
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f);
         }
+        pin(cur);
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -2373,27 +2387,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        ggml_tensor * kq = pin(ggml_mul_mat(ctx0, k, q));
         cb(kq, "kq", il);
 
         ggml_prec_set_acc(kq, GGML_PREC_BF16);
 
         if (kq_b) {
-            kq = ggml_add(ctx0, kq, kq_b);
+            kq = pin(ggml_add(ctx0, kq, kq_b));
             cb(kq, "kq_plus_kq_b", il);
         }
 
-        kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, 0.0f);
+        kq = pin(ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, 0.0f));
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
 
         if (!v_trans) {
             // note: avoid this branch
-            v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+            v = pin(ggml_cont(ctx0, ggml_transpose(ctx0, v)));
             cb(v, "v_cont", il);
         }
 
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        ggml_tensor * kqv = pin(ggml_mul_mat(ctx0, v, kq));
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
@@ -2406,6 +2420,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        if (!v_mla) {
+            pin(cur);
+        }
 
         if (!cparams.offload_kqv) {
             // all nodes between the KV store and the attention output are run on the CPU

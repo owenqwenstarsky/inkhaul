@@ -299,6 +299,9 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    // kv_gpu: the device of the KV cache and the attention of the full-attention layers, it holds no layers; nullptr if not used
+    ggml_backend_dev_t kv_dev = nullptr;
+
     // for the meta device of LLAMA_SPLIT_MODE_TENSOR
     struct llama_meta_device_get_split_state_userdata get_split_state_ud = {};
 
@@ -353,6 +356,11 @@ struct llama_model {
 
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
+
+    // true if the KV cache and the attention of layer il are on kv_dev
+    bool kv_remote(int il) const;
+    // the device of the KV cache of layer il
+    ggml_backend_dev_t dev_kv(int il) const;
 
     bool has_tensor_overrides() const;
 

@@ -200,7 +200,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
-    LOG("  --rpc                    Check LongHaul and -sm tensor over RPC servers on threads of this process (127.0.0.1)\n");
+    LOG("  --rpc                    Check LongHaul, -sm tensor and --kv-remote over RPC servers on threads of this process (127.0.0.1)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2393,6 +2393,410 @@ static int test_longhaul_rpc(const std::string & arch_filter, const size_t seed,
     return all_ok ? 0 : 1;
 }
 
+// --kv-remote: an RPC server on a thread of this process (127.0.0.1 only) holds the KV cache of the full-attention layers,
+// runs their attention and tokenizes; the weights stay on the local GPU. The logits must match the local GPU, the server must hold
+// only K and V caches and no weights but the attention-only ones, and llama_tokenize must give the tokens of the local tokenizer
+static int test_kv_remote_rpc(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    ggml_backend_dev_t gpu = get_gpu(target_backend, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    if (gpu == nullptr || reg == nullptr) {
+        LOG("KV remote RPC: SKIP (%s)\n", gpu == nullptr ? "no GPU" : "no RPC backend");
+        return 0;
+    }
+    // the server on a second GPU if there is one, as on a second laptop
+    ggml_backend_dev_t gpu2 = get_gpu(nullptr, gpu);
+    if (gpu2 == nullptr) {
+        gpu2 = gpu;
+    }
+    auto start_server_fn  = (decltype(ggml_backend_rpc_start_server) *)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    auto set_model_dir_fn = (decltype(ggml_backend_rpc_server_set_model_dir) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_server_set_model_dir");
+    auto add_server_fn    = (decltype(ggml_backend_rpc_add_server) *)           ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_add_server");
+    GGML_ASSERT(start_server_fn && set_model_dir_fn && add_server_fn);
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    const longhaul_variant base = { "", false, false, false };
+
+    std::random_device rd;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("test-llama-archs-kvr-" + std::to_string(rd()));
+    const std::filesystem::path dir_client = dir / "client";
+    const std::filesystem::path dir_server = dir / "server";
+    std::filesystem::create_directories(dir_client);
+    std::filesystem::create_directories(dir_server);
+
+    // per arch a file with an exact copy on the server; the Inkling 2 files keep their experts on disk (LongHaul)
+    struct kvr_file {
+        llm_arch    arch;
+        std::string path;
+        bool        longhaul;
+    };
+    std::vector<kvr_file> files;
+    const std::pair<llm_arch, bool> archs[] = {
+        { LLM_ARCH_INKLING2, true }, { LLM_ARCH_INKLING2_LOOP, true }, { LLM_ARCH_QWEN35, false }, { LLM_ARCH_QWEN35MOE, true }, { LLM_ARCH_BAILINGMOE3, true },
+    };
+    for (const auto & am : archs) {
+        if (!arch_matches(arch_filter, am.first)) {
+            continue;
+        }
+        const bool longhaul = am.first == LLM_ARCH_INKLING2 || am.first == LLM_ARCH_INKLING2_LOOP;
+        const std::string name = std::string(llama_arch_name(am.first)) + ".gguf";
+        const std::string path = (dir_client / name).string();
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(am.first, am.second, 0);
+        if (longhaul) {
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(am.first, LLM_KV_EXPERT_COUNT).c_str(), 16);
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(am.first, LLM_KV_EXPERT_USED_COUNT).c_str(), 2);
+        }
+        const std::string path_saved = longhaul ? get_tmp_gguf_path() : path;
+        {
+            llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path_saved.c_str());
+        }
+        if (longhaul) {
+            const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(am.first, LLM_KV_BLOCK_COUNT).c_str()));
+            write_longhaul_variant(path_saved, path, am.first, base, n_layer);
+            std::filesystem::remove(path_saved);
+        }
+        std::filesystem::copy_file(path, dir_server / name);
+        files.push_back({ am.first, path, longhaul });
+    }
+    if (files.empty()) {
+        std::filesystem::remove_all(dir);
+        return 0;
+    }
+    // a client file that differs from every server file in one byte (in a block of the fingerprint): the server has no copy
+    // of it, so it cannot tokenize for it and the load fails
+    const std::string path_changed = (dir_client / "changed.gguf").string();
+    {
+        std::filesystem::copy_file(files[0].path, path_changed);
+        std::fstream f(path_changed, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekg(-1, std::ios::end);
+        const char c = (char) (f.get() ^ 0xff);
+        f.seekp(-1, std::ios::end);
+        f.put(c);
+    }
+
+    GGML_ASSERT(set_model_dir_fn(dir_server.string().c_str(), 2) == files.size());
+    if (!llama_rpc_server_enable_tokenizer()) {
+        LOG("KV remote RPC: FAIL (no server tokenizer)\n");
+        std::filesystem::remove_all(dir);
+        return 1;
+    }
+    const std::string endpoint = "127.0.0.1:" + std::to_string(40000 + rd() % 20000);
+    std::thread([start_server_fn, endpoint, gpu2]() mutable {
+        start_server_fn(endpoint.c_str(), nullptr, 4, 1, &gpu2);
+    }).detach();
+    ggml_backend_reg_t reg_server = nullptr;
+    for (int i = 0; i < 400 && reg_server == nullptr; i++) {
+        reg_server = add_server_fn(endpoint.c_str());
+        if (reg_server == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    if (reg_server == nullptr) {
+        LOG("KV remote RPC: FAIL (the RPC server on %s did not start)\n", endpoint.c_str());
+        std::filesystem::remove_all(dir);
+        return 1;
+    }
+    ggml_backend_dev_t rpc = ggml_backend_reg_dev_get(reg_server, 0);
+
+    // the device of each attention node (soft max or flash attention) and of each Inkling 2 bias (kq_b), counted by the eval callback
+    struct attn_count {
+        ggml_backend_dev_t rpc;
+        size_t attn_remote = 0;
+        size_t attn_local  = 0;
+        size_t kq_b_remote = 0;
+        size_t kq_b_local  = 0;
+    };
+    attn_count counts = { rpc };
+    auto count_cb = [](struct ggml_tensor * t, bool ask, void * user_data) {
+        if (!ask) {
+            return true;
+        }
+        attn_count * c = (attn_count *) user_data;
+        const ggml_tensor * base = t->view_src ? t->view_src : t;
+        const bool remote = base->buffer && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(base->buffer)) == c->rpc;
+        const std::string name = t->name;
+        if (t->op == GGML_OP_FLASH_ATTN_EXT || (t->op == GGML_OP_SOFT_MAX && name.rfind("kq_soft_max", 0) == 0)) {
+            (remote ? c->attn_remote : c->attn_local)++;
+        }
+        if (name.rfind("kq_b-", 0) == 0) {
+            (remote ? c->kq_b_remote : c->kq_b_local)++;
+        }
+        // false: no sync after the node, the counts need none
+        return false;
+    };
+
+    // the KV cache on the RPC device (the first of the devices), the layers on the GPU
+    auto load = [&](const std::string & path, bool kv_remote, size_t cache_size) {
+        llama_model_params mparams = llama_model_default_params();
+        mparams.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs = kv_remote ? std::vector<ggml_backend_dev_t>{ rpc, gpu, nullptr } : std::vector<ggml_backend_dev_t>{ gpu, nullptr };
+        mparams.devices = devs.data();
+        if (kv_remote) {
+            mparams.kv_gpu             = 0;
+            mparams.tokenize_on_kv_gpu = true;
+        }
+        llama_model_ptr model(llama_model_load_from_file(path.c_str(), mparams));
+        if (!model) {
+            throw std::runtime_error("failed to load the model");
+        }
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx           = 0;
+        cparams.n_threads       = 4;
+        cparams.n_threads_batch = 4;
+        cparams.n_ubatch        = 64;
+        cparams.longhaul_cache_size = cache_size;
+        cparams.swa_full = false; // as the tools have it
+        if (kv_remote) {
+            cparams.cb_eval           = count_cb;
+            cparams.cb_eval_user_data = &counts;
+        }
+        llama_context_ptr lctx(llama_init_from_model(model.get(), cparams));
+        if (!lctx) {
+            throw std::runtime_error("failed to create the context");
+        }
+        return std::make_pair(std::move(model), std::move(lctx));
+    };
+    auto dev_of = [](const ggml_tensor * t) -> ggml_backend_dev_t {
+        const ggml_tensor * base = t->view_src ? t->view_src : t;
+        return base->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(base->buffer)) : nullptr;
+    };
+
+    bool all_ok = true;
+    for (const kvr_file & kf : files) {
+        const std::string label = std::string(llama_arch_name(kf.arch)) + (kf.longhaul ? " (LongHaul)" : "");
+        bool ok = true;
+        std::string detail;
+        try {
+            // the reference: everything on the local GPU, the experts in the mapped file
+            std::vector<float> ref_batch;
+            std::vector<float> ref_steps;
+            std::vector<llama_token> ref_tok;
+            const std::string text = "Hello tok_5 world, 0123456789 tok_17 \xc3\xa9t\xc3\xa9";
+            {
+                auto mc = load(kf.path, false, 0);
+                ref_batch = get_logits(mc.first.get(), mc.second.get(), tokens);
+                ref_steps = get_logits_steps(mc.first.get(), mc.second.get(), tokens, 20);
+                ref_tok.resize(256);
+                const int32_t n = llama_tokenize(llama_model_get_vocab(mc.first.get()), text.data(), (int32_t) text.size(), ref_tok.data(), (int32_t) ref_tok.size(), true, true);
+                GGML_ASSERT(n > 1);
+                ref_tok.resize(n);
+            }
+
+            counts = { rpc };
+            auto mc = load(kf.path, true, kf.longhaul ? 512ull*1024*1024 : 0);
+            const std::vector<float> got_batch = get_logits(mc.first.get(), mc.second.get(), tokens);
+            const double nmse_batch = nmse(ref_batch, got_batch);
+            const std::vector<float> got_steps = get_logits_steps(mc.first.get(), mc.second.get(), tokens, 20);
+            const double nmse_steps = nmse(ref_steps, got_steps);
+            char buf[96];
+            snprintf(buf, sizeof(buf), "NMSE %.2e batch, %.2e steps", nmse_batch, nmse_steps);
+            detail = buf;
+            // the same GPU kernels on the same data, only the device of the attention differs
+            ok = nmse_batch <= 1e-6 && nmse_steps <= 1e-6;
+
+            // the server holds K and V caches only, and the GPU the rest of the memory
+            size_t n_remote = 0;
+            size_t n_local  = 0;
+            size_t k_remote = 0; // K caches, one per attention layer
+            size_t k_local  = 0;
+            for (const ggml_tensor * t : llama_memory_get_tensors(llama_get_memory(mc.second.get()))) {
+                const ggml_tensor * base = t->view_src ? t->view_src : t;
+                const std::string name = base->name;
+                const bool is_k = name.rfind("cache_", 0) == 0 && name.find("k_l") != std::string::npos;
+                if (dev_of(t) == rpc) {
+                    n_remote++;
+                    k_remote += is_k;
+                    if (name.rfind("cache_", 0) != 0 || (!is_k && name.find("v_l") == std::string::npos)) {
+                        ok = false;
+                        detail += ", " + name + " is on the server";
+                    }
+                } else {
+                    n_local++;
+                    k_local += is_k;
+                }
+            }
+
+            // every graph runs each attention layer once: the attention of a layer runs where its K cache is
+            if (counts.attn_remote == 0 || counts.attn_remote*(k_remote + k_local) != (counts.attn_remote + counts.attn_local)*k_remote) {
+                ok = false;
+                detail += ", " + std::to_string(counts.attn_remote) + " attention nodes on the server and " + std::to_string(counts.attn_local) +
+                    " local for " + std::to_string(k_remote) + " remote and " + std::to_string(k_local) + " local K caches";
+            }
+            // the Inkling 2 bias is n_kv x n_tokens x n_head, it is built where the attention runs
+            if (counts.kq_b_remote != (kf.arch == LLM_ARCH_INKLING2 || kf.arch == LLM_ARCH_INKLING2_LOOP ? counts.attn_remote : 0) ||
+                    counts.kq_b_local != (kf.arch == LLM_ARCH_INKLING2 || kf.arch == LLM_ARCH_INKLING2_LOOP ? counts.attn_local : 0)) {
+                ok = false;
+                detail += ", " + std::to_string(counts.kq_b_remote) + " Inkling 2 biases on the server and " + std::to_string(counts.kq_b_local) + " local";
+            }
+            if (n_remote == 0) {
+                ok = false;
+                detail += ", no KV cache on the server";
+            }
+            detail += ", " + std::to_string(n_remote) + " cache tensors on the server, " + std::to_string(n_local) + " local";
+
+            // no weights on the server but the relative-position bias of the Inkling 2 attention, which is small
+            size_t model_rpc = 0;
+            size_t model_gpu = 0;
+            for (const auto & [buft, mb] : llama_get_memory_breakdown(mc.second.get())) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                (dev == rpc ? model_rpc : model_gpu) += mb.model;
+            }
+            const bool inkling = kf.arch == LLM_ARCH_INKLING2 || kf.arch == LLM_ARCH_INKLING2_LOOP;
+            if (inkling ? model_rpc*20 > model_gpu : model_rpc != 0) {
+                ok = false;
+                detail += ", " + std::to_string(model_rpc) + " bytes of weights on the server";
+            }
+
+            // llama_tokenize runs on the server and gives the local tokens, also when the buffer is too small
+            const llama_vocab * vocab = llama_model_get_vocab(mc.first.get());
+            std::vector<llama_token> got_tok(256);
+            const int32_t n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), got_tok.data(), (int32_t) got_tok.size(), true, true);
+            got_tok.resize(std::max(0, n));
+            const int32_t n_small = llama_tokenize(vocab, text.data(), (int32_t) text.size(), got_tok.data(), 1, true, true);
+            if (got_tok != ref_tok || n_small != -(int32_t) ref_tok.size()) {
+                ok = false;
+                detail += ", the remote tokens differ";
+            }
+        } catch (const std::exception & err) {
+            ok = false;
+            detail = err.what();
+        }
+        LOG("KV remote RPC %s: %s (%s)\n", label.c_str(), ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    }
+
+    // a server whose copy of the file differs cannot tokenize for it: the load fails
+    {
+        ggml_log_callback log_cb;
+        void * log_ud;
+        llama_log_get(&log_cb, &log_ud);
+        llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+        bool failed = false;
+        try {
+            load(path_changed, true, 512ull*1024*1024);
+        } catch (const std::exception &) {
+            failed = true;
+        }
+        llama_log_set(log_cb, log_ud);
+        LOG("KV remote RPC, changed server copy: %s\n", failed ? "OK (the load failed)" : "FAIL (the load did not fail)");
+        all_ok = all_ok && failed;
+    }
+
+    // --fit with the KV cache on the server: the layers cannot move, so only the context changes; the context memory grows on the
+    // server and stays the same on the GPU (recurrent state and sliding-window caches), the fit finds the context of the targets
+    for (const llm_arch arch : { LLM_ARCH_INKLING2, LLM_ARCH_QWEN35 }) {
+        if (!arch_matches(arch_filter, arch)) {
+            continue;
+        }
+        constexpr uint32_t n_ctx_train = 262144;
+        constexpr uint32_t n_ctx_min   = 4096;
+        const ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, arch == LLM_ARCH_INKLING2, 0);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_CONTEXT_LENGTH).c_str(), n_ctx_train);
+        const std::string path = (dir_client / (std::string("fit-") + llama_arch_name(arch) + ".gguf")).string();
+        {
+            llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path.c_str());
+        }
+        const std::vector<std::string> paths = { path };
+        std::vector<ggml_backend_dev_t> devs_param = { rpc, gpu, nullptr };
+        llama_model_params mparams = llama_model_default_params();
+        mparams.devices = devs_param.data();
+        mparams.kv_gpu  = 0;
+        mparams.progress_callback = silent_model_load_progress;
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_seq_max = 1;
+        cparams.swa_full  = false; // as the tools have it: the sliding-window caches stay small
+        auto measure = [&](uint32_t n_ctx) {
+            llama_context_params cp = cparams;
+            cp.n_ctx = n_ctx;
+            std::vector<ggml_backend_dev_t> devs;
+            uint32_t ngl = 0, nct = 0, nex = 0;
+            common_device_memory_data_vec dmds = common_get_device_memory_data(paths, &mparams, &cp, devs, ngl, nct, nex, log_level);
+            if (devs.size() != 2 || devs[0] != rpc || devs[1] != gpu) {
+                throw std::runtime_error("the measurement is not per device");
+            }
+            return dmds;
+        };
+        bool ok = true;
+        std::string detail;
+        try {
+            const common_device_memory_data_vec dmd_max = measure(n_ctx_train);
+            const common_device_memory_data_vec dmd_q   = measure(n_ctx_train/4);
+            if (dmd_max[0].model != 0 && arch != LLM_ARCH_INKLING2) {
+                throw std::runtime_error(string_format("%zu model bytes on the server", dmd_max[0].model));
+            }
+            if (!(dmd_max[0].context > dmd_q[0].context) || dmd_max[1].context != dmd_q[1].context) {
+                throw std::runtime_error(string_format("context on the server %zu -> %zu, on the GPU %zu -> %zu bytes",
+                    dmd_q[0].context, dmd_max[0].context, dmd_q[1].context, dmd_max[1].context));
+            }
+            // targets that leave room for exactly a quarter of the trained context
+            std::vector<size_t> margins(llama_max_devices(), 0);
+            for (size_t j = 0; j < 2; j++) {
+                margins[j] = size_t(int64_t(dmd_q[j].free) - int64_t(dmd_q[j].model + dmd_q[j].context + dmd_q[j].compute));
+            }
+            std::vector<float> ts(llama_max_devices(), 0.0f);
+            std::vector<llama_model_tensor_buft_override> tbo(llama_max_tensor_buft_overrides());
+            llama_context_params cp = cparams;
+            cp.n_ctx = 0;
+            llama_model_params mp = mparams;
+            const common_params_fit_status status = common_fit_params(paths, &mp, &cp, ts.data(), tbo.data(), margins.data(), n_ctx_min, nullptr, log_level);
+            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cp.n_ctx > n_ctx_train/4 + 256 || cp.n_ctx < n_ctx_train/4 - n_ctx_train/16) {
+                throw std::runtime_error(string_format("fit gave status %d and a context of %u, expected about %u", status, cp.n_ctx, n_ctx_train/4));
+            }
+            if (mp.kv_gpu != 0 || mp.n_gpu_layers != mparams.n_gpu_layers || std::any_of(ts.begin(), ts.end(), [](float x) { return x != 0.0f; }) || tbo[0].pattern != nullptr) {
+                throw std::runtime_error("fit moved layers or weights");
+            }
+            detail = string_format("context %u of %u for a quarter of the room, KV on the server %zu MiB at the full context",
+                cp.n_ctx, n_ctx_train, size_t(dmd_max[0].context/(1024*1024)));
+        } catch (const std::exception & err) {
+            ok = false;
+            detail = err.what();
+        }
+        LOG("KV remote RPC fit %s: %s (%s)\n", llama_arch_name(arch), ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    }
+
+    // --kv-remote as the tools read it: the device of the remote by its address, and the conflicts
+    {
+        auto parse = [&](std::vector<std::string> args, common_params & params) {
+            args.insert(args.begin(), { "test", "-m", "unused.gguf", "--rpc", endpoint });
+            std::vector<char *> argv;
+            for (std::string & a : args) {
+                argv.push_back(a.data());
+            }
+            ggml_log_callback log_cb;
+            void * log_ud;
+            llama_log_get(&log_cb, &log_ud);
+            llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+            const bool res = common_params_parse((int) argv.size(), argv.data(), params, LLAMA_EXAMPLE_COMMON);
+            llama_log_set(log_cb, log_ud);
+            return res;
+        };
+        common_params params;
+        bool ok = parse({ "--kv-remote", endpoint }, params) && params.kv_gpu >= 0 &&
+            (size_t) params.kv_gpu < params.devices.size() && params.devices[params.kv_gpu] == rpc;
+        const llama_model_params mparams = common_model_params_to_llama(params);
+        ok = ok && mparams.kv_gpu == params.kv_gpu && mparams.tokenize_on_kv_gpu;
+        for (const auto & bad : std::vector<std::vector<std::string>>{
+                { "--kv-remote", endpoint, "-sm", "tensor" },
+                { "--kv-remote", endpoint, "-nkvo" },
+                { "--kv-remote", ggml_backend_dev_name(gpu) },
+            }) {
+            common_params params_bad;
+            if (parse(bad, params_bad)) {
+                ok = false;
+                LOG("KV remote RPC arguments: accepted %s %s\n", bad[0].c_str(), bad.back().c_str());
+            }
+        }
+        LOG("KV remote RPC arguments: %s\n", ok ? "OK" : "FAIL");
+        all_ok = all_ok && ok;
+    }
+
+    std::filesystem::remove_all(dir);
+    return all_ok ? 0 : 1;
+}
+
 // tensor parallelism over two RPC servers on threads of this process (127.0.0.1)
 // the all-reduce runs between the two servers, the logits must match the local GPU
 static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend, const char * argv0) {
@@ -3336,8 +3740,9 @@ int main(int argc, char ** argv) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
         }
         if (rpc) {
-            const int ret = test_longhaul_rpc(arch_filter, seed, stdev, target_backend);
-            return test_tensor_rpc(arch_filter, seed, stdev, target_backend, argv[0]) != 0 ? 1 : ret;
+            int ret = test_longhaul_rpc(arch_filter, seed, stdev, target_backend);
+            ret = test_tensor_rpc(arch_filter, seed, stdev, target_backend, argv[0]) != 0 ? 1 : ret;
+            return test_kv_remote_rpc(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         }
         int ret = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
         ret = test_rope_type(arch_filter, seed, stdev) != 0 ? 1 : ret;
