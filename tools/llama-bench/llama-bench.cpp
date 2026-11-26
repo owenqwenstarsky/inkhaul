@@ -265,6 +265,8 @@ static const char * split_mode_str(llama_split_mode mode) {
             return "layer";
         case LLAMA_SPLIT_MODE_ROW:
             return "row";
+        case LLAMA_SPLIT_MODE_EXPERT:
+            return "expert";
         default:
             GGML_ABORT("invalid split mode");
     }
@@ -344,6 +346,7 @@ struct cmd_params {
     std::vector<int>                 n_batch;
     std::vector<int>                 n_ubatch;
     std::vector<int>                 lh_cache; // LongHaul cache in MiB
+    std::vector<size_t>              lh_cache_dev; // LongHaul cache per device in bytes (0 = from lh_cache), the same for all tests
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
     std::vector<int>                 n_threads;
@@ -391,6 +394,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_batch              */ { 2048 },
     /* n_ubatch             */ { 512 },
     /* lh_cache             */ { 512 },
+    /* lh_cache_dev         */ {},
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { common_cpu_get_num_math() },
@@ -466,6 +470,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -lhc, --longhaul-cache <size>                     LongHaul expert cache, e.g. 512M,1G (default: %sM)\n", join(cmd_params_defaults.lh_cache, ",").c_str());
+    printf("  -lhcd, --longhaul-cache-device <s0/s1/...>        LongHaul expert cache per device in the order of the devices, 0 = from -lhc, e.g. 12G/4G\n");
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -474,7 +479,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  -sm, --split-mode <none|layer|row>                (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+    printf("  -sm, --split-mode <none|layer|row|expert>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
@@ -649,6 +654,23 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     }
                     params.lh_cache.push_back((int) (bytes/(1024*1024)));
                 }
+            } else if (arg == "-lhcd" || arg == "--longhaul-cache-device") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const auto sizes = string_split<std::string>(argv[i], '/');
+                if (sizes.size() > llama_max_devices()) {
+                    invalid_param = true;
+                    break;
+                }
+                params.lh_cache_dev.assign(llama_max_devices(), 0);
+                for (size_t j = 0; j < sizes.size(); ++j) {
+                    params.lh_cache_dev[j] = sizes[j] == "0" ? 0 : string_parse_mem_size(sizes[j]);
+                    if (sizes[j] != "0" && params.lh_cache_dev[j] == 0) {
+                        throw std::invalid_argument("invalid LongHaul cache size: " + sizes[j]);
+                    }
+                }
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -780,6 +802,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_SPLIT_MODE_LAYER;
                     } else if (m == "row") {
                         mode = LLAMA_SPLIT_MODE_ROW;
+                    } else if (m == "expert") {
+                        mode = LLAMA_SPLIT_MODE_EXPERT;
                     } else {
                         invalid_param = true;
                         break;
@@ -1234,6 +1258,7 @@ struct cmd_params_instance {
     int                n_batch;
     int                n_ubatch;
     int                lh_cache;
+    std::vector<size_t> lh_cache_dev;
     ggml_type          type_k;
     ggml_type          type_v;
     int                n_threads;
@@ -1328,6 +1353,7 @@ struct cmd_params_instance {
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
         cparams.longhaul_cache_size = (size_t) lh_cache*1024*1024;
+        cparams.longhaul_cache_sizes = lh_cache_dev.empty() ? nullptr : lh_cache_dev.data();
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
@@ -1385,6 +1411,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
                 /* .lh_cache              = */ lhc,
+                /* .lh_cache_dev          = */ params.lh_cache_dev,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1424,6 +1451,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
                 /* .lh_cache              = */ lhc,
+                /* .lh_cache_dev          = */ params.lh_cache_dev,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1463,6 +1491,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
                 /* .lh_cache              = */ lhc,
+                /* .lh_cache_dev          = */ params.lh_cache_dev,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,

@@ -38,7 +38,7 @@ If there are no accelerators, it exposes a single `CPU` device.
 
 ## This fork: several Macs over Thunderbolt
 
-This fork uses RPC to run one LongHaul model over several Macs connected with Thunderbolt cables. Each Mac holds some of the layers and caches the experts of those layers in its own memory. See [docs/longhaul.md](../../docs/longhaul.md#several-laptops) for how the layers and the cache are split.
+This fork uses RPC to run one LongHaul model over several Macs connected with Thunderbolt cables. Each Mac holds some of the layers and caches the experts of those layers in its own memory. See [docs/longhaul.md](../../docs/longhaul.md#several-laptops) for how the layers and the cache are split. With `-es` (for example `-es 60`, the remote computes about 60% of the experts) all Macs work on every MoE layer at the same time instead of in turns, see [Expert split](../../docs/longhaul.md#expert-split).
 
 1. Build the same commit on every Mac. RPC is built by default on macOS. The server rejects other protocol versions, and both ends must have the same kernels.
 2. Connect the Macs with Thunderbolt cables. On each Mac open System Settings -> Network -> Thunderbolt Bridge -> Details -> TCP/IP, set "Configure IPv4" to "Manually" and give each Mac its own address in one subnet, for example `10.0.0.1` for the main Mac and `10.0.0.2`, `10.0.0.3`, ... for the others, with the subnet mask `255.255.255.0`.
@@ -53,6 +53,9 @@ This fork uses RPC to run one LongHaul model over several Macs connected with Th
 
    ```sh
    llama-cli -m ~/models/Inkling-2-Mini-AD-Q4_K.gguf --rpc 10.0.0.2:50052 -lhc 16G
+
+   # or: the remote computes about 60% of the experts of every layer, at the same time as the main Mac
+   llama-cli -m ~/models/Inkling-2-Mini-AD-Q4_K.gguf --rpc 10.0.0.2:50052 -es 60 -lhc 16G
    ```
 
 Notes:

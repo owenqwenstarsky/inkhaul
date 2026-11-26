@@ -303,6 +303,9 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED generate-models)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+llama_build_and_test(test-arg-expert-split.cpp  LABEL behavior)
+# two Metal devices on one Mac, so that the split checks run (other backends ignore it)
+set_tests_properties(test-arg-expert-split PROPERTIES ENVIRONMENT "GGML_METAL_DEVICES=2")
 llama_build_and_test(test-quantize-target.cpp  LABEL "main behavior backend"  LINK llama  ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-quantize-target PROPERTIES FIXTURES_REQUIRED generate-models)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)

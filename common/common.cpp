@@ -1769,7 +1769,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    cparams.longhaul_cache_size = params.longhaul_cache_size;
+    cparams.longhaul_cache_size  = params.longhaul_cache_size;
+    cparams.longhaul_cache_sizes = params.longhaul_cache_sizes.empty() ? nullptr : params.longhaul_cache_sizes.data();
 
     return cparams;
 }

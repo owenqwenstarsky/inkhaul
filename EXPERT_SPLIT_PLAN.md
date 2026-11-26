@@ -1,6 +1,6 @@
 # Plan: expert split over several laptops
 
-Status: phase 1 implemented (not committed), phases 2-5 open. Builds on THUNDERBOLT_PLAN.md (commit e9e55df).
+Status: phases 1 and 2 committed, phases 3-5 open. Builds on THUNDERBOLT_PLAN.md (commit e9e55df).
 
 ## 1. Goal
 
@@ -253,3 +253,23 @@ Changes from the plan:
 - `test-expert-share` has the label `behavior`, like the other tests of internal functions.
 - The router bias of the inkling2 and bailingmoe3 test models is a ramp, so every token selects the same top experts and the measured shares are 50/50 whatever the target. The qwen35moe models route freely: 30/70 by count measured 26/74, which is what phase 3 is for.
 - The exit stats keep the device names, because the backends are freed before the cache logs its stats.
+
+## 11. Phase 2 results (2026-11-25)
+
+Done:
+- `common`: `-es/--expert-share`, `-kvd/--kv-device`, `-lhcd/--longhaul-cache-device` (env `LLAMA_ARG_EXPERT_SHARE`, `LLAMA_ARG_KV_DEVICE`, `LLAMA_ARG_LONGHAUL_CACHE_DEVICE`) and `-sm expert`. They are resolved after all arguments are read (`common_params_resolve_expert_split` in `common/arg.cpp`), so the order of `--rpc`, `-dev` and `-es` does not matter. Without `-dev`, the resolver builds the device list as `llama_prepare_model_devices` would (RPC first, then GPUs, then iGPUs if there is no GPU) and sets it in `params.devices`, so that the indices of the shares, of `main_gpu` and of the cache sizes match the model. The mmproj default device is set before this, so it does not move to an RPC server.
+- A draft model leaves the expert split: layer split, no `tensor_split`, no cache sizes per device, and without `-devd` it goes on the KV device (`common_base_params_to_speculative`).
+- `llama-bench`: `-sm expert`, and `-lhcd s0/s1/...` in device order (0 = from `-lhc`).
+- Docs: `docs/longhaul.md` (options table, "Expert split" section with the layer vs expert trade-off, the tokenizer and the stats line), `docs/multi-gpu.md`, `tools/rpc/README.md`, `README.md`.
+
+Tests:
+- `test-arg-expert-split` (new, label `behavior`, run by CTest with `GGML_METAL_DEVICES=2`): the three forms of `-es`, `-kvd`, `-lhcd`, the env vars, the order of `-dev`, the draft, and 20 invalid inputs. OK. With one device it runs only the checks that need one device.
+- `test-expert-share`: OK. The library did not change in this phase.
+
+Changes from the plan:
+- `llama-bench -lhcd` takes one value for all tests, not a list: its sizes are per device, so a list of lists would be hard to read. Compare sizes with separate runs.
+- A single number (`-es 60`) needs both RPC and local devices; on one Mac with two GPUs the devices must be named (`MTL0=60,MTL1=40`).
+- The RPC servers must run on Metal: a CUDA server would not skip the experts of the other devices, and the client cannot see the backend of a server. The docs say so.
+
+Not done: the measurement of layer split vs expert split on the two laptops. That needs your laptops and is not an in-memory test. The commands are in `docs/longhaul.md` ("Layer split or expert split").
+

@@ -595,6 +595,12 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     size_t longhaul_cache_size = 512ull*1024*1024; // LongHaul: cache size in bytes for the experts kept on disk
+    std::vector<size_t> longhaul_cache_sizes;      // LongHaul: cache size per device (llama_max_devices() entries, 0 = from longhaul_cache_size), empty if none set
+
+    // LongHaul expert split, as given on the command line, resolved to split_mode, tensor_split, main_gpu and devices after parsing
+    std::string expert_share;           // -es
+    std::string kv_device;              // -kvd
+    std::string longhaul_cache_devices; // -lhcd
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

@@ -2,13 +2,18 @@
 
 LongHaul runs Inkling 2, Qwen 3.5 / 3.6 MoE (`qwen35moe`) and Ling-3.2-air (`bailingmoe3`) MoE models on a Mac or an NVIDIA GPU with less memory than the model needs. The MoE experts stay in the GGUF file on disk. A fixed-size cache in GPU memory (unified memory on a Mac, VRAM with CUDA) keeps the experts that were used recently and often. Everything else (attention, router, norms, embeddings, output) is loaded as usual.
 
-LongHaul is always on for models with experts on disk. Only the cache size can be set:
+LongHaul is always on for models with experts on disk. These options control it:
 
 | Argument | |
 |---|---|
-| `-lhc, --longhaul-cache SIZE` | cache size: a number in MiB, or with a K, M or G suffix, e.g. `512M`, `1G`, `2G` (default: `512M`) |
+| `-lhc, --longhaul-cache SIZE` | cache size: a number in MiB, or with a K, M or G suffix, e.g. `512M`, `1G`, `2G` (default: `512M`). With several devices, the total of the devices that `-lhcd` does not name. |
+| `-lhcd, --longhaul-cache-device DEV=SIZE,...` | cache size of a device, e.g. `RPC0=12G,MTL0=4G` |
+| `-es, --expert-share SHARE` | split the experts of every MoE layer over the devices, see [Expert split](#expert-split) |
+| `-kvd, --kv-device DEV` | with `-es`: the device of the layers and the KV cache (default: the local GPU) |
 
-`llama-bench` takes the same option as a list (`-lhc 512M,1G,2G`) to compare sizes.
+`DEV` is a device name as `--list-devices` prints it (`MTL0`, `RPC0`, ...), a unique prefix of it, or the address of an RPC server (`10.0.0.2:50052`). The same options can be set with the env vars `LLAMA_ARG_LONGHAUL_CACHE`, `LLAMA_ARG_LONGHAUL_CACHE_DEVICE`, `LLAMA_ARG_EXPERT_SHARE` and `LLAMA_ARG_KV_DEVICE`.
+
+`llama-bench` takes `-lhc` as a list (`-lhc 512M,1G,2G`) to compare sizes. It also takes `-sm expert` with `-ts` and `-mg` in place of `-es` and `-kvd`, and `-lhcd 12G/4G` (sizes in the order of the devices, 0 = from `-lhc`).
 
 ## How it works
 
@@ -33,7 +38,7 @@ On a discrete GPU the expert cache, the resident weights and the KV cache are in
 The layers of one model can run on several Macs connected with Thunderbolt cables. The main laptop runs `llama-cli` or `llama-server` with `--rpc`. Each other laptop runs `ggml-rpc-server` (see [tools/rpc](../tools/rpc/README.md#this-fork-several-macs-over-thunderbolt) for the cable and network setup). All laptops must run a build of the same commit.
 
 - Each device (the GPU of a laptop) holds a contiguous slice of the layers and caches the experts of those layers in its own memory, so the memory of all laptops caches experts.
-- `-lhc` is the total for all devices. It is split across the devices like the layers: by `-ts` if given, otherwise by free memory. There is no per-device size.
+- `-lhc` is the total for all devices. It is split across the devices like the layers: by `-ts` if given, otherwise by free memory. `-lhcd RPC0=12G` gives a device its own size, and `-lhc` is then the total of the other devices.
 - The RPC devices come first and the main laptop's GPU last, so the output layer and sampling run on the main laptop.
 - In `inkling2_loop` models `-ngl` and `-ts` count the layers that hold weights (25 for Mini: 24 layers and the output), not the 49 layer passes. Each pass of the loop core runs on the device that holds its layer, so a token crosses the link several times (6 times for Mini on two laptops with an even split).
 - Pipeline parallelism stays off: the cache needs the experts that a layer selects before the layer runs.
@@ -61,6 +66,59 @@ llama-cli -m ~/models/Inkling-2-Mini-AD-Q4_K.gguf --rpc 10.0.0.2:50052 -lhc 16G
 With an even split, the remote laptop (first) holds layers 0-11 and the main laptop holds layers 12-23 and the output. A token runs the prefix 0-5 and the core 6-11 on the remote laptop, the core 12-17 on the main laptop, then passes 2 and 3 go remote, main, remote, main, then the suffix 18-23 runs on the main laptop. Each laptop runs 24 of the 48 layer passes.
 
 The experts of Mini Q4_K are about 15.5 GB, so `-lhc 16G` split over two laptops (about 8 GiB each) holds every expert: after the first reads no expert is read from disk, and the round trips on the link set the speed. With a smaller cache each laptop reads about half of the misses. These numbers are computed from the model card, not measured: measure the speed of your own link and SSDs.
+
+## Expert split
+
+With `-es` the laptops do not take turns on the layers. Every MoE layer runs on all of them at the same time, each laptop on its own part of the experts:
+
+```sh
+# the remote laptop computes about 60% of the routed experts, the main laptop 40%
+llama-cli -m ~/models/Inkling-2-Mini-AD-Q4_K.gguf --rpc 10.0.0.2:50052 -es 60 -lhc 16G
+```
+
+- The layers (attention, router, norms, shared experts, dense FFN layers) and the KV cache are on one device, the main laptop's GPU by default. The output layer is on the last device, which is the main laptop's GPU.
+- The routed experts of every MoE layer are split over the devices: each device owns a fixed set of experts of each layer, about its share of them, spread over the expert ids. A device caches and reads only the experts it owns, so the caches of all laptops add up with no copies.
+- For each MoE layer, each device computes the selected experts that it owns for all tokens of the batch, and the main laptop adds the results. The remote laptop reads its misses from its own SSD (with `--model-dir`) while the main laptop reads its own misses and computes. This applies to generation and to prompt processing.
+- The share counts experts, not work. Routing is not even, so the share of the selected experts that a device computes can differ from its target. The exit log shows both (see [Reading the stats](#reading-the-stats)).
+- The share is of the routed experts only. The attention, the router and the shared experts run on the device of the KV cache. For Inkling 2 Mini the routed experts are about two thirds of the weights that a token reads (1.9 GB of experts against about 1 GB resident); for Qwen 3.5 / 3.6 and Ling-3.2-air they are a smaller part, about a third to a half (estimates from the sizes below, not measured).
+
+The forms of `-es`:
+
+| `-es` | |
+|---|---|
+| `60` | the RPC devices together get 60% (split evenly if there are several), the local GPU 40% |
+| `RPC0=60,MTL0=40` | per device; the devices not named split the rest evenly (`RPC0=60` alone is the same as `60` with one server) |
+| `60,40` | per device, in the order of the devices (the RPC devices come first, or the order of `-dev`) |
+
+The shares must not add up to more than 100%, and to exactly 100% when every device has one. A share of 0 is allowed: that device then computes no experts. `-es` cannot be given with `-ts` or `-sm`, since all of them set the split. The startup log prints the result, e.g. `expert split: RPC0 60.0%, MTL0 40.0%, layers and KV cache on MTL0`.
+
+Cache sizes: `-lhc` is split over the devices by share, so with `-es 60 -lhc 10G` the remote gets 6 GiB and the main laptop 4 GiB. A device caches only its own experts, so it needs less memory to hold all of them: for Mini at 60/40, about 9.3 GB on the remote and 6.2 GB on the main laptop hold every expert. To give a device more or less memory than its share, name it with `-lhcd`, e.g. `-es 50 -lhcd RPC0=12G,MTL0=4G`.
+
+`-kvd RPC0` puts the layers and the KV cache on the remote laptop instead, for a context that does not fit in the main laptop's memory. This is slower: the main laptop's part of each MoE layer then needs the activations from the remote, which costs about two round trips per MoE layer pass instead of one.
+
+Limits:
+
+- Only for models with experts on disk (LongHaul), with all layers on the GPUs (the default `-ngl`) and no `-ot`.
+- Only Metal and RPC devices, and the RPC servers must run on Macs. CUDA does not skip the experts that another device owns, so it is not supported, also not behind an RPC server (which this host cannot detect: the output would be wrong).
+- A draft model (`-md`) does not use the expert split. Without `-devd`, it goes on the device of the KV cache.
+
+### Layer split or expert split
+
+Neither always wins, so measure both on your laptops:
+
+- The expert split wins when the expert reads or the expert compute set the speed: both SSDs and both GPUs work at the same time instead of in turns.
+- The layer split can win when every expert hits and the link latency sets the speed. For Inkling 2 Mini the expert split costs about one round trip per MoE layer pass (48 per token), the layer split with an even split about 24 (one per remote MoE layer pass) plus 6 hops.
+- The share applies on average. One token can select most of its 8 experts on one laptop, and each layer waits for the slower laptop, so find the best share by measuring, not from the GPU speeds.
+
+To compare, run `llama-bench` with the layer split and with a sweep of the expert share. The RPC device comes first, so the first number of `-ts` is the remote's share:
+
+```sh
+llama-bench -m M --rpc 10.0.0.2:50052 -lhc 16G -sm layer,expert -ts 40/60,50/50,60/40
+```
+
+### The tokenizer
+
+The tokenizer is not split. It runs once per prompt on the CPU of the main laptop at millions of tokens per second (a 100k-token prompt takes tens of milliseconds), and the token ids are needed there. A round trip to the remote laptop takes longer than that. To check on your own prompts: `time llama-tokenize -m MODEL -f prompt.txt --show-count`. The prompt processing (the model work on the prompt) is split, as above.
 
 ## Sizing for Inkling 2 Mini
 
@@ -137,8 +195,16 @@ llama_moe_cache: ubatch <= 8: hits = ..., misses = ..., hit rate = ...%, read = 
 
 `read` counts all misses, `local` the ones this host read from its own file (all of them without RPC servers that read for themselves). The time and speed are for the local reads only. If the read time is most of the run time, a larger cache helps. To compare I/O thread counts, run `llama-bench` with `LLAMA_LONGHAUL_IO_THREADS` set to 1, 2, 4 and 8 and compare the MiB/s.
 
+With the expert split it also logs one line per device:
+
+```
+llama_moe_cache: RPC0: share target 60.0%, measured 57.2%, 77 of 128 experts per layer, hits = ..., misses = ..., hit rate = ...%, read = ... MiB (by the server)
+```
+
+`measured` is the share of the selected experts that the device computed. It differs from the target when the routing prefers the experts of one device.
+
 `LLAMA_MOE_CACHE_TRACE=<file>` writes the selected experts of each lookup to a file, to replay the routing offline with other cache sizes.
 
 ## Tests
 
-`LLAMA_LONGHAUL_RESIDENT=1` with a cache size of 0 keeps the experts in the mapped file without a RAM bound. It exists for tests that compare against the old behavior. `test-llama-archs` checks LongHaul against the same file with its experts in the mapped file, or against the model in memory, for caches from 2 slots to all experts. For `qwen35moe` it also checks files with separate gate and up experts, with two expert groups, and with an MTP block. For `bailingmoe3` it checks files with several expert layouts, split files and a file with an MTP layer. With `GGML_METAL_DEVICES=2` (two emulated Metal devices) it also checks every LongHaul arch with its layers split over the two devices. `test-llama-archs --rpc` (CTest label `rpc`) starts an RPC server on a thread of the test, on `127.0.0.1` only, and checks the experts read by the server and the experts sent from the client against the local GPU.
+`LLAMA_LONGHAUL_RESIDENT=1` with a cache size of 0 keeps the experts in the mapped file without a RAM bound. It exists for tests that compare against the old behavior. `test-llama-archs` checks LongHaul against the same file with its experts in the mapped file, or against the model in memory, for caches from 2 slots to all experts. For `qwen35moe` it also checks files with separate gate and up experts, with two expert groups, and with an MTP block. For `bailingmoe3` it checks files with several expert layouts, split files and a file with an MTP layer. With `GGML_METAL_DEVICES=2` (two emulated Metal devices) it also checks every LongHaul arch with its layers split over the two devices, and with the expert split at several shares, with the KV cache on either device and with cache sizes per device. `test-expert-share` checks the expert ownership, and `test-arg-expert-split` checks how `-es`, `-kvd` and `-lhcd` are read. `test-llama-archs --rpc` (CTest label `rpc`) starts an RPC server on a thread of the test, on `127.0.0.1` only, and checks the experts read by the server and the experts sent from the client against the local GPU.

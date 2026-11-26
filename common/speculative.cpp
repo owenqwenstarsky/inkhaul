@@ -1703,6 +1703,19 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
+    // the expert split is for the target model (it needs LongHaul, and the shares and cache sizes are for its experts):
+    // without -devd, the draft model goes whole on the device of the KV cache of the target
+    if (has_draft && result.split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+        const size_t n_devs = std::count_if(params.devices.begin(), params.devices.end(), [](ggml_backend_dev_t d) { return d != nullptr; });
+        if (params_spec.devices.empty() && params.main_gpu >= 0 && (size_t) params.main_gpu < n_devs) {
+            result.devices = { params.devices[params.main_gpu], nullptr };
+        }
+        result.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        result.main_gpu   = 0;
+        std::fill(std::begin(result.tensor_split), std::end(result.tensor_split), 0.0f);
+        result.longhaul_cache_sizes.clear();
+    }
+
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
