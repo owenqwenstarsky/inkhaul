@@ -236,6 +236,9 @@ extern "C" {
 
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // optional ("ggml_backend_comm_allreduce_tensor_check"): as above, and the ranks compare checks[i], one I32 tensor per rank
+    // that must hold the same values on every rank (the expert ids of the layer); a mismatch fails the computation
+    typedef bool   (*ggml_backend_comm_allreduce_tensor_check_t)(void * comm_ctx, struct ggml_tensor ** tensors, struct ggml_tensor ** checks);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

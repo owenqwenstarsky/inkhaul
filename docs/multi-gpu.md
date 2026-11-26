@@ -38,6 +38,8 @@ Set with `--split-mode` / `-sm`.
 | `-sm` | `--split-mode` | `none` \| `layer` \| `row` \| `expert` \| `tensor` | `layer` | See modes above. |
 | `-ts` | `--tensor-split` | comma-separated proportions, e.g. `3,1` | mode-dependent | How much of the model goes to each GPU. If omitted, `layer`/`row` use automatic splitting proportional to memory. With `3,1` on two GPUs, GPU 0 gets 75 %, GPU 1 gets 25 %. The values follow the order in `--device`. |
 | `-mg` | `--main-gpu` | integer device index | `0` | The single GPU used in `--split-mode none`. |
+| | `--tp-attn` | `split` \| `mirror` | `split` | `--split-mode tensor` only: split attention over the GPUs (two syncs per layer), or compute it on every GPU (one sync per layer). See [tensor-parallel.md](tensor-parallel.md). |
+| | `--tp-host` | `ADDR[:PORT]` | - | `--split-mode tensor` only: run the RPC server of the local GPU in this process as rank 0, in front of the `--rpc` servers. |
 | `-ngl` | `--n-gpu-layers` / `--gpu-layers` | integer \| `auto` \| `all` | `auto` | Maximum number of layers to keep in VRAM. Use `999` or `all` to push everything possible to the GPUs. |
 | `-dev` | `--device` | comma-separated device names, or `none` | auto | Restrict which devices llama.cpp may use. See `--list-devices` for names. |
 | | `--list-devices` | - | - | Print the available devices and their memory. Run this first to learn the names you'd pass to `--device`. |

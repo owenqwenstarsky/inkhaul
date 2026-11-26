@@ -1,8 +1,9 @@
 // checks the all-reduce between two RPC servers on threads of this process (127.0.0.1 only)
 // and the events that the host reaches (ggml_backend_event_arm_host)
 //
-//   test-tp-comm                  all checks
-//   test-tp-comm --timeout-child  (internal) a peer that stops answering, run in a child process
+//   test-tp-comm                        all checks
+//   test-tp-comm --timeout-child        (internal) a peer that stops answering, run in a child process
+//   test-tp-comm --ids-child same|differ (internal) the all-reduce with the expert ids check, run in a child process
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -112,6 +114,7 @@ struct rpc_pair {
     ggml_backend_comm_init_t             comm_init   = nullptr;
     ggml_backend_comm_free_t             comm_free   = nullptr;
     ggml_backend_comm_allreduce_tensor_t allreduce   = nullptr;
+    ggml_backend_comm_allreduce_tensor_check_t allreduce_check = nullptr;
 };
 
 // two servers on ports p and p+1 of 127.0.0.1, one per GPU, and one backend on each
@@ -125,7 +128,8 @@ static bool start_pair(ggml_backend_dev_t gpus[2], rpc_pair & pair) {
     pair.comm_init = (ggml_backend_comm_init_t)             ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init");
     pair.comm_free = (ggml_backend_comm_free_t)             ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free");
     pair.allreduce = (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
-    GGML_ASSERT(start_server_fn && add_server_fn && pair.comm_init && pair.comm_free && pair.allreduce);
+    pair.allreduce_check = (ggml_backend_comm_allreduce_tensor_check_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor_check");
+    GGML_ASSERT(start_server_fn && add_server_fn && pair.comm_init && pair.comm_free && pair.allreduce && pair.allreduce_check);
 
     std::random_device rd;
     const int port0 = 40000 + (int) (rd() % 18000);
@@ -175,14 +179,19 @@ struct allreduce_case {
     int          n_tensors;
     int          n_rounds;
     int          n_repeat;  // all-reduces of the same tensor in a row: the result doubles each time
+    int          ids_check = 0; // 0: no check, 1: the ranks send the same expert ids, 2: rank 1 sends one other id
 };
 
 static bool run_case(rpc_pair & pair, const allreduce_case & tc, std::mt19937 & rng) {
     const bool bf16 = tc.ne >= 32768;
-    const ggml_init_params params = { (size_t) (tc.n_tensors + 1)*ggml_tensor_overhead(), nullptr, true };
+    const ggml_init_params params = { (size_t) (tc.n_tensors + 3)*ggml_tensor_overhead(), nullptr, true };
     ggml_context_ptr ctx[2];
     ggml_backend_buffer_ptr buf[2];
     std::vector<ggml_tensor *> t[2];
+    // the expert ids: 4 of 16 for 8 tokens, a strided view like the top-k of the argsort in the model
+    const int n_expert = 16, n_used = 4, n_tok = 8;
+    ggml_tensor * ids_base[2] = { nullptr, nullptr };
+    ggml_tensor * ids[2]      = { nullptr, nullptr };
     for (int r = 0; r < 2; r++) {
         ctx[r].reset(ggml_init(params));
         for (int j = 0; j < tc.n_tensors; j++) {
@@ -190,8 +199,26 @@ static bool run_case(rpc_pair & pair, const allreduce_case & tc, std::mt19937 & 
             x->flags |= GGML_TENSOR_FLAG_COMPUTE;
             t[r].push_back(x);
         }
+        if (tc.ids_check != 0) {
+            ids_base[r] = ggml_new_tensor_2d(ctx[r].get(), GGML_TYPE_I32, n_expert, n_tok);
+        }
         buf[r].reset(ggml_backend_alloc_ctx_tensors(ctx[r].get(), pair.backends[r]));
         GGML_ASSERT(buf[r] != nullptr);
+        if (tc.ids_check != 0) {
+            std::vector<int32_t> v(n_expert*n_tok);
+            for (size_t i = 0; i < v.size(); i++) {
+                v[i] = (int32_t) (i % n_expert);
+            }
+            // one selected id differs on rank 1; the values after the first n_used of a row are not compared
+            if (tc.ids_check == 2 && r == 1) {
+                v[3*n_expert + 2] = 15;
+            }
+            v[5*n_expert + n_used] = 100 + r;
+            ggml_backend_tensor_set(ids_base[r], v.data(), 0, v.size()*sizeof(int32_t));
+            ids[r] = ggml_view_2d(ctx[r].get(), ids_base[r], n_used, n_tok, ids_base[r]->nb[1], 0);
+            ids[r]->buffer = ids_base[r]->buffer;
+            ggml_set_name(ids[r], "test_ids-7");
+        }
     }
 
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -216,7 +243,8 @@ static bool run_case(rpc_pair & pair, const allreduce_case & tc, std::mt19937 & 
         for (int j = 0; j < tc.n_tensors; j++) {
             for (int k = 0; k < tc.n_repeat; k++) {
                 ggml_tensor * pair_t[2] = { t[0][j], t[1][j] };
-                if (!pair.allreduce(pair.comm, pair_t)) {
+                const bool accepted = tc.ids_check != 0 ? pair.allreduce_check(pair.comm, pair_t, ids) : pair.allreduce(pair.comm, pair_t);
+                if (!accepted) {
                     printf("%s: FAIL (the all-reduce refused the tensors)\n", tc.name);
                     return false;
                 }
@@ -261,6 +289,9 @@ static bool test_allreduce(ggml_backend_dev_t gpus[2]) {
         { "prompt 1M, bf16",           1 << 20, 2,   25, 1 },
         // the smallest bf16 payload
         { "bf16 threshold 32768",      32768,   4,   25, 1 },
+        // with the hash of the same expert ids after the partial
+        { "decode 2048, ids check",    2048,    4,  100, 1, 1 },
+        { "prompt 1M, ids check",      1 << 20, 1,    5, 1, 1 },
     };
     bool ok = true;
     const auto t0 = std::chrono::steady_clock::now();
@@ -270,6 +301,108 @@ static bool test_allreduce(ggml_backend_dev_t gpus[2]) {
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     printf("allreduce: %s (%.1f s)\n", ok ? "OK" : "FAIL", s);
     stop_pair(pair);
+    return ok;
+}
+
+// child: the all-reduce with the ids check; "differ" must stop the run with the error, "same" must pass
+static int ids_child(const char * mode) {
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpus[2];
+    get_gpus(gpus);
+    if (gpus[0] == nullptr) {
+        return 0;
+    }
+    rpc_pair pair;
+    if (!start_pair(gpus, pair)) {
+        return 2;
+    }
+    const bool differ = strcmp(mode, "differ") == 0;
+    const allreduce_case tc = { "ids check", 2048, 2, 3, 1, differ ? 2 : 1 };
+    std::mt19937 rng(3);
+    const bool ok = run_case(pair, tc, rng);
+    if (differ) {
+        // not reached: reading the result fails on the server and the client aborts
+        printf("different ids did not stop the run\n");
+        return 3;
+    }
+    stop_pair(pair);
+    return ok ? 0 : 4;
+}
+
+// the servers log from their own threads
+struct log_capture {
+    std::mutex        mutex;
+    std::string       text;
+    ggml_log_callback cb_old = nullptr;
+    void *            ud_old = nullptr;
+
+    void start() {
+        ggml_log_get(&cb_old, &ud_old);
+        ggml_log_set([](ggml_log_level level, const char * t, void * ud) {
+            log_capture * lc = (log_capture *) ud;
+            {
+                std::lock_guard<std::mutex> lock(lc->mutex);
+                lc->text.append(t);
+            }
+            if (lc->cb_old != nullptr) {
+                lc->cb_old(level, t, lc->ud_old);
+            }
+        }, this);
+    }
+    void stop() {
+        ggml_log_set(cb_old, ud_old);
+    }
+    bool has(const std::string & s) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return text.find(s) != std::string::npos;
+    }
+};
+
+// GGML_RPC_COMM_PORT moves the port that rank 0 listens on for the other ranks
+static bool test_comm_port(ggml_backend_dev_t gpus[2]) {
+    std::random_device rd;
+    // the servers use 40000-58000 and +1000 for the default comm port
+    const int port = 30000 + (int) (rd() % 9000);
+    const std::string port_str = std::to_string(port);
+    bool ok = true;
+    std::string detail;
+
+    log_capture log;
+    log.start();
+    setenv("GGML_RPC_COMM_PORT", port_str.c_str(), 1);
+    {
+        rpc_pair pair;
+        if (!start_pair(gpus, pair)) {
+            ok = false;
+            detail = "the servers did not connect on the given port";
+        } else {
+            if (!log.has("port " + port_str + ")")) {
+                ok = false;
+                detail = "the comm did not use the given port";
+            }
+            std::mt19937 rng(7);
+            const allreduce_case tc = { "comm port", 2048, 2, 10, 1 };
+            ok = run_case(pair, tc, rng) && ok;
+        }
+        stop_pair(pair);
+    }
+    // a bad value must stop the comm with a message, not fall back to another port
+    setenv("GGML_RPC_COMM_PORT", "70000", 1);
+    {
+        rpc_pair pair;
+        if (start_pair(gpus, pair)) {
+            ok = false;
+            detail = "an invalid port was accepted";
+        } else if (!log.has("invalid GGML_RPC_COMM_PORT")) {
+            ok = false;
+            detail = "no message for an invalid port";
+        }
+        stop_pair(pair);
+    }
+    unsetenv("GGML_RPC_COMM_PORT");
+    log.stop();
+
+    printf("comm port: %s%s%s\n", ok ? "OK" : "FAIL", detail.empty() ? "" : " - ", detail.c_str());
     return ok;
 }
 
@@ -295,6 +428,54 @@ static int timeout_child() {
 }
 
 #ifndef _WIN32
+static bool run_child(const std::string & cmd, std::string & out, int & status) {
+    FILE * p = popen(cmd.c_str(), "r");
+    if (p == nullptr) {
+        return false;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), p) != nullptr) {
+        out += line;
+    }
+    status = pclose(p);
+    return true;
+}
+
+// the ranks compare the expert ids at each all-reduce, on the async and on the blocking path
+static bool test_ids_check(const char * argv0) {
+    struct child_case {
+        const char * name;
+        const char * env;
+        const char * mode;
+        bool         must_fail;
+    };
+    const child_case cases[] = {
+        { "different ids, async",    "",                      "differ", true  },
+        { "different ids, blocking", "GGML_RPC_COMM_SYNC=1 ", "differ", true  },
+        { "same ids, blocking",      "GGML_RPC_COMM_SYNC=1 ", "same",   false },
+    };
+    bool all_ok = true;
+    for (const child_case & cc : cases) {
+        const std::string cmd = std::string(cc.env) + "GGML_RPC_COMM_TIMEOUT_MS=5000 '" + argv0 + "' --ids-child " + cc.mode + " 2>&1";
+        std::string out;
+        int status = 0;
+        bool ok = run_child(cmd, out, status);
+        const bool message = out.find("picked different experts in test_ids-7") != std::string::npos;
+        if (cc.must_fail) {
+            ok = ok && status != 0 && message;
+        } else {
+            ok = ok && status == 0 && !message;
+        }
+        printf("ids check, %s: %s (child status %d%s)\n", cc.name, ok ? "OK" : "FAIL", status,
+               cc.must_fail && !message ? ", no mismatch message" : "");
+        if (!ok) {
+            printf("%s\n", out.c_str());
+        }
+        all_ok = all_ok && ok;
+    }
+    return all_ok;
+}
+
 static bool test_timeout(const char * argv0) {
     // rank 1 waits 2 s before each exchange, rank 0 gives up after 300 ms
     const std::string cmd = std::string("GGML_RPC_COMM_TIMEOUT_MS=300 GGML_RPC_COMM_TEST_DELAY=1:2000 '") + argv0 + "' --timeout-child 2>&1";
@@ -326,6 +507,9 @@ int main(int argc, char ** argv) {
     if (argc > 1 && strcmp(argv[1], "--timeout-child") == 0) {
         return timeout_child();
     }
+    if (argc > 2 && strcmp(argv[1], "--ids-child") == 0) {
+        return ids_child(argv[2]);
+    }
     ggml_backend_load_all();
     ggml_backend_dev_t gpu = get_gpu();
     if (gpu == nullptr) {
@@ -336,7 +520,9 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t gpus[2];
     get_gpus(gpus);
     ok = test_allreduce(gpus) && ok;
+    ok = test_comm_port(gpus) && ok;
 #ifndef _WIN32
+    ok = test_ids_check(argv[0]) && ok;
     ok = test_timeout(argv[0]) && ok;
 #endif
     printf("test-tp-comm: %s\n", ok ? "OK" : "FAIL");

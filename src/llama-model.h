@@ -328,6 +328,7 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    llama_tp_attn    tp_attn() const;
     bool no_alloc() const;
 
     // LongHaul: expert tensors kept on disk (TENSOR_LONGHAUL), read by the expert cache
@@ -346,6 +347,9 @@ struct llama_model {
     uint64_t n_elements() const;
 
     void print_info() const;
+
+    // with LLAMA_SPLIT_MODE_TENSOR: the share of each device per tensor class, after rounding
+    void log_tensor_split() const;
 
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;

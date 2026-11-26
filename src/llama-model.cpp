@@ -177,53 +177,60 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {axis, tensor_axis_0, il, rotation};
     };
 
+    // with --tp-attn mirror every device holds and computes all of the attention, so the layer has one sync
+    const bool attn_mirror = ud->model->tp_attn() == LLAMA_TP_ATTN_MIRROR;
+    auto get_attn_config = [&](
+                const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
+        return attn_mirror ? get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED) : get_tensor_config_impl(axis, suffix, suffix_fallback);
+    };
+
     auto get_tensor_config = [&]() -> tensor_config {
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_q_bias) || std::regex_match(tensor_name, pattern_kv_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_qkv_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_qkv_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_qk_norm)) {
-            return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            return get_attn_config(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_kv_cache)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_0);
         }
         if (std::regex_match(tensor_name, pattern_attn_out_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
         // linear attention (gated delta net)
         if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache) ||
                 std::regex_match(tensor_name, pattern_spk_cache) || std::regex_match(tensor_name, pattern_spv_cache) ||
                 std::regex_match(tensor_name, pattern_spgb_cache)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            return get_attn_config(GGML_BACKEND_SPLIT_AXIS_0);
         }
 
         // FFN, the routed experts split along the FFN dimension so that each device computes a slice of every selected expert
@@ -234,13 +241,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
         }
+        // shared experts split like the routed ones: the meta backend sums both partials in one all-reduce
+        if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) || std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+        }
 
         // output, split by vocab rows
         if (std::regex_match(tensor_name, pattern_output_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
 
-        // everything else, including the router and the shared experts
+        // everything else, including the router and the norms
         return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
     };
 
@@ -1621,6 +1635,10 @@ uint32_t llama_model::n_gpu_layers() const {
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
 }
 
+llama_tp_attn llama_model::tp_attn() const {
+    return params.tp_attn;
+}
+
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }
@@ -1857,6 +1875,80 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+void llama_model::log_tensor_split() const {
+    const size_t n_devices = get_split_state_ud.n_devices;
+    if (n_devices == 0) {
+        return;
+    }
+
+    // sums the slices of one tensor class over all layers, as the rounding moves between the devices per layer
+    // n_first: the size of the split dimension in the first layer, step: the FFN rounding of that tensor type
+    auto get_share = [&](const std::vector<std::string> & names, const bool per_layer, int64_t & n_first, int64_t & step) -> std::string {
+        std::vector<int64_t> ne(n_devices, 0);
+        bool found    = false;
+        bool mirrored = false;
+        n_first = 0;
+        step    = 0;
+        const uint32_t n_iter = per_layer ? hparams.n_layer() : 1;
+        for (uint32_t il = 0; il < n_iter; il++) {
+            for (const std::string & name : names) {
+                const std::string full = per_layer ? format("blk.%u.%s", il, name.c_str()) : name;
+                const ggml_tensor * t = get_tensor(full.c_str());
+                if (t == nullptr) {
+                    continue;
+                }
+                const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(t, (void *) &get_split_state_ud);
+                found = true;
+                if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+                    mirrored = true;
+                    break;
+                }
+                if (n_first == 0) {
+                    n_first = t->ne[ss.axis];
+                    step    = std::lcm((int64_t) ggml_blck_size(t->type), (int64_t) 128);
+                }
+                for (size_t j = 0; j < n_devices; j++) {
+                    for (size_t is = 0; is < ss.n_segments; is++) {
+                        ne[j] += ss.ne[is*n_devices + j] * ss.nr[is];
+                    }
+                }
+                break;
+            }
+        }
+        if (!found) {
+            return "";
+        }
+        if (mirrored) {
+            return "mirrored";
+        }
+        int64_t total = 0;
+        for (const int64_t x : ne) {
+            total += x;
+        }
+        std::string ret;
+        for (size_t j = 0; j < n_devices; j++) {
+            ret += format("%s%.0f", j == 0 ? "" : "/", total == 0 ? 0.0 : 100.0*ne[j]/total);
+        }
+        return ret;
+    };
+
+    std::string msg;
+    auto add = [&](const char * label, const std::string & share, const std::string & extra = "") {
+        if (!share.empty()) {
+            msg += format("%s%s %s%s", msg.empty() ? "" : ", ", label, share.c_str(), extra.c_str());
+        }
+    };
+    int64_t n = 0;
+    int64_t step = 0;
+    const std::string experts = get_share({ "ffn_down_exps.weight", "ffn_down.weight" }, true, n, step);
+    add("experts", experts, experts == "mirrored" ? "" : format(" (n_ff %lld, step %lld)", (long long) n, (long long) step));
+    const std::string shexp = get_share({ "ffn_down_shexp.weight" }, true, n, step);
+    add("shared experts", shexp, shexp == "mirrored" ? "" : format(" (n_ff %lld, step %lld)", (long long) n, (long long) step));
+    add("attention", get_share({ "attn_output.weight", "ssm_out.weight" }, true, n, step));
+    add("output", get_share({ "output.weight" }, false, n, step));
+    LLAMA_LOG_INFO("%s: tensor split: %s\n", __func__, msg.c_str());
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2017,6 +2109,19 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->build_layer_inp_dev();
 
+    // with -sm tensor the servers compare the expert ids at the next all-reduce, after the whole sub-graph,
+    // so their memory must not be reused before that; outputs are never reused
+    if (split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        ggml_cgraph * gf = llm->res->get_gf();
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op == GGML_OP_MUL_MAT_ID) {
+                ggml_tensor * ids = node->src[2];
+                ggml_set_output(ids->view_src != nullptr ? ids->view_src : ids);
+            }
+        }
+    }
+
     llm->res->set_outputs(params);
 
     return llm->res->get_gf();
@@ -2035,6 +2140,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.tp_attn                     =*/ LLAMA_TP_ATTN_SPLIT,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

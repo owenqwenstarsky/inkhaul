@@ -1890,6 +1890,7 @@ struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
         int           offset      = 0; // Node offset vs. original graph
+        ggml_tensor * check       = nullptr; // the expert ids of the last MUL_MAT_ID, compared between the ranks at the all-reduce
 
         std::vector<ggml_cgraph *> cgraphs_aux;
     };
@@ -1918,6 +1919,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_allreduce_tensor_check_t comm_allreduce_check = nullptr; // optional
     bool                                 comm_warned    = false; // the fallback was logged once
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
@@ -1950,6 +1952,9 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            comm_allreduce_check = (ggml_backend_comm_allreduce_tensor_check_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor_check");
         }
     }
 
@@ -2346,6 +2351,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             GGML_ASSERT(i_start == cgraph->n_nodes);
         }
 
+        if (n_subgraphs != backend_ctx->n_subgraphs) {
+            // each sub-graph but the last ends in an all-reduce
+            GGML_LOG_DEBUG("%s: %d nodes in %zu sub-graphs, %zu all-reduces\n", __func__, cgraph->n_nodes, n_subgraphs, n_subgraphs - 1);
+        }
         backend_ctx->uid         = cgraph->uid;
         backend_ctx->n_subgraphs = n_subgraphs;
 
@@ -2395,6 +2404,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
                 cgraph_ij->n_nodes = i_node_stop - i_node_start;
+                // ranks that pick different experts would sum wrong partials without noticing, so the comm compares the ids;
+                // the graph keeps them as outputs until the end, see llama_model::build_graph
+                bcj.cgraphs[i_graph].check = nullptr;
+                for (size_t i_node = i_node_stop; i_node > i_node_start; i_node--) {
+                    if (cgraph->nodes[i_node - 1]->op == GGML_OP_MUL_MAT_ID) {
+                        bcj.cgraphs[i_graph].check = bcj.nodes[i_node - 1]->src[2];
+                        break;
+                    }
+                }
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
                     ggml_tensor * node_ij = bcj.nodes[i_node];
@@ -2575,7 +2593,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                if (backend_ctx->comm_allreduce_check != nullptr && backend_ctx->backend_configs[0].cgraphs[i].check != nullptr) {
+                    std::vector<ggml_tensor *> checks;
+                    checks.reserve(n_backends);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        checks.push_back(backend_ctx->backend_configs[j].cgraphs[i].check);
+                    }
+                    backend_allreduce_success = backend_ctx->comm_allreduce_check(backend_ctx->comm_ctx, nodes.data(), checks.data());
+                } else {
+                    backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                }
             }
 
             if (!backend_allreduce_success) {

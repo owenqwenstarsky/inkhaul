@@ -14,6 +14,7 @@
 #include "preset.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -858,6 +859,8 @@ static std::vector<float> common_parse_expert_share(const std::vector<ggml_backe
     return res;
 }
 
+static void common_params_start_tp_host(common_params & params);
+
 // resolve -es, -kvd and -lhcd against the devices of the model, which needs the RPC servers of --rpc
 static void common_params_resolve_expert_split(common_params & params) {
     const bool split_expert = !params.expert_share.empty() || params.split_mode == LLAMA_SPLIT_MODE_EXPERT;
@@ -1079,6 +1082,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // after the mmproj default, so that a device list set here does not move the mmproj to an RPC server
     common_params_resolve_expert_split(params);
+
+    if (params.tp_attn != LLAMA_TP_ATTN_SPLIT && params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::invalid_argument("--tp-attn applies only to --split-mode tensor");
+    }
+    common_params_start_tp_host(params);
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -1346,6 +1354,99 @@ void common_print_available_devices() {
         ggml_backend_dev_memory(dev, &free, &total);
         printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / MiB, free / MiB);
     }
+}
+
+// --tp-host: run rank 0 of the tensor split as an RPC server thread on the local GPU, in front of the --rpc servers
+static void common_params_start_tp_host(common_params & params) {
+    if (params.tp_host.empty()) {
+        return;
+    }
+    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::invalid_argument("--tp-host applies only to --split-mode tensor");
+    }
+    if (!params.devices.empty()) {
+        throw std::invalid_argument("--tp-host sets the devices, do not give --device");
+    }
+    std::string host = params.tp_host;
+    int port = 50052;
+    const size_t colon = host.rfind(':');
+    if (colon != std::string::npos) {
+        const std::string port_str = host.substr(colon + 1);
+        char * end = nullptr;
+        const long v = std::strtol(port_str.c_str(), &end, 10);
+        if (port_str.empty() || *end != '\0' || v <= 0 || v > 65535) {
+            throw std::invalid_argument("--tp-host: invalid port '" + port_str + "'");
+        }
+        port = (int) v;
+        host = host.substr(0, colon);
+    }
+    if (host.empty()) {
+        throw std::invalid_argument("--tp-host: give the address the other laptops reach this one on, e.g. 10.0.0.1");
+    }
+    if (host == "127.0.0.1" || host == "localhost") {
+        LOG_WRN("%s: --tp-host %s cannot be reached from another machine, use it only with servers on this machine\n", __func__, host.c_str());
+    }
+
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("--tp-host: failed to find RPC backend");
+    }
+    // the other ranks, from --rpc
+    std::vector<ggml_backend_dev_t> remotes;
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        if (ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) == std::string("RPC")) {
+            remotes.push_back(dev);
+        } else if (gpu == nullptr) {
+            gpu = dev;
+        }
+    }
+    if (gpu == nullptr) {
+        throw std::invalid_argument("--tp-host: no local GPU to serve");
+    }
+    if (remotes.empty()) {
+        throw std::invalid_argument("--tp-host: give the other laptops with --rpc");
+    }
+
+    typedef void (*start_server_t)(const char * endpoint, const char * cache_dir, size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+    typedef ggml_backend_reg_t (*add_server_t)(const char * endpoint);
+    auto start_server_fn = (start_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+    auto add_server_fn   = (add_server_t)   ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    if (!start_server_fn || !add_server_fn) {
+        throw std::invalid_argument("--tp-host: failed to find the RPC server functions");
+    }
+    const std::string endpoint = host + ":" + std::to_string(port);
+    LOG_INF("%s: rank 0 on %s (%s), the comm port is %d unless GGML_RPC_COMM_PORT is set\n", __func__,
+            endpoint.c_str(), ggml_backend_dev_description(gpu), port + 1000);
+    // the server runs until the process exits
+    std::thread([start_server_fn, endpoint, gpu]() mutable {
+        start_server_fn(endpoint.c_str(), nullptr, 1, 1, &gpu);
+    }).detach();
+    ggml_backend_reg_t reg = nullptr;
+    for (int i = 0; i < 400 && reg == nullptr; i++) {
+        reg = add_server_fn(endpoint.c_str());
+        if (reg == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    if (reg == nullptr) {
+        throw std::invalid_argument("--tp-host: the RPC server on " + endpoint + " did not start (is the address of this machine and the port free?)");
+    }
+    ggml_backend_register(reg);
+
+    // rank 0 first: it listens for the comm of the other ranks
+    params.devices.clear();
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        params.devices.push_back(ggml_backend_reg_dev_get(reg, i));
+    }
+    params.devices.insert(params.devices.end(), remotes.begin(), remotes.end());
+    params.devices.push_back(nullptr);
 }
 
 static void add_rpc_devices(const std::string & servers) {
@@ -2968,6 +3069,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
+    add_opt(common_arg(
+        {"--tp-attn"}, "{split,mirror}",
+        "attention with --split-mode tensor, one of:\n"
+        "- split (default): heads, KV cache and recurrent state split over the GPUs, two syncs per layer\n"
+        "- mirror: every GPU holds and computes all of the attention, one sync per layer;\n"
+        "  faster when a sync costs more than about 100 us, for example between laptops",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "split")  { params.tp_attn = LLAMA_TP_ATTN_SPLIT;  }
+            else if (value == "mirror") { params.tp_attn = LLAMA_TP_ATTN_MIRROR; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_TP_ATTN"));
+    add_opt(common_arg(
+        {"--tp-host"}, "ADDR[:PORT]",
+        "with --split-mode tensor, run rank 0 in this process as an RPC server for the local GPU on ADDR:PORT\n"
+        "(default port 50052), the address the --rpc servers reach this machine on, e.g. 10.0.0.1;\n"
+        "the devices become this server and then the --rpc servers",
+        [](common_params & params, const std::string & value) {
+            if (!llama_supports_rpc()) {
+                throw std::invalid_argument("RPC not supported in this build");
+            }
+            params.tp_host = value;
+        }
+    ).set_env("LLAMA_ARG_TP_HOST"));
     add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",

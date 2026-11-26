@@ -287,6 +287,7 @@ struct rpc_msg_comm_init_rsp {
 struct rpc_msg_comm_allreduce_req {
     uint32_t   device;
     rpc_tensor tensor;
+    rpc_tensor check; // id 0: none, else I32 values (the expert ids) that must be the same on all ranks
 };
 
 struct rpc_msg_comm_free_req {
@@ -403,6 +404,18 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
         hash *= fnv_prime;
     }
     return hash;
+}
+
+// the hash of the expert ids that the ranks compare, see rpc_msg_comm_allreduce_req::check;
+// GGML_RPC_COMM_TEST_IDS_FLIP=RANK changes it on that rank, for the test of the guard
+static uint64_t rpc_comm_ids_hash(const void * ids, size_t n_bytes, bool flip) {
+    const uint64_t hash = fnv_hash((const uint8_t *) ids, n_bytes);
+    return flip ? hash ^ 1 : hash;
+}
+
+static bool rpc_comm_test_ids_flip(uint32_t rank) {
+    const char * env = std::getenv("GGML_RPC_COMM_TEST_IDS_FLIP");
+    return env != nullptr && (uint32_t) std::strtoul(env, nullptr, 10) == rank;
 }
 
 // a model file the server reads tensor data from, see RPC_CMD_FILE_OPEN
@@ -1923,7 +1936,7 @@ private:
     void comm_free_device(uint32_t dev_id);
     struct comm_async;
     static bool comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tensors);
-    static bool comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst);
+    static bool comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst, ggml_tensor * t_check);
     static std::unique_ptr<comm_async> comm_async_init(ggml_backend_t backend, const socket_ptr & peer, uint32_t rank);
     static bool comm_bootstrap_exchange(void * user_data, const void * send_buf, void * recv_buf, size_t size);
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
@@ -1944,7 +1957,11 @@ private:
             size_t                size       = 0;       // bytes of host
             ggml_backend_buffer_t buf        = nullptr; // host as a device buffer
             ggml_context_ptr      ctx;                  // the tensors and graphs of the current job
-            size_t                wire_bytes = 0;
+            size_t                wire_bytes = 0;       // the partial
+            size_t                xfer       = 0;       // bytes exchanged: the partial, then the hash of the ids if checked
+            size_t                ids_offs   = 0;       // the copy of the expert ids in host, 0: no check
+            size_t                ids_bytes  = 0;
+            std::string           check_name;           // for the error of a mismatch
             bool                  busy       = false;   // the comm thread has the slot
         };
 
@@ -1953,6 +1970,7 @@ private:
         uint32_t                rank    = 0;
         int64_t                 spin_us = 0;
         int64_t                 test_delay_ms = 0; // for the timeout test: wait this long before each exchange
+        bool                    test_ids_flip = false;
         slot                    slots[N_SLOTS];
         int                     next    = 0;
         ggml_backend_buffer_ptr scratch;           // the peer's partial in f32, with bf16 on the wire
@@ -1983,6 +2001,8 @@ private:
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
         std::unique_ptr<comm_async> async;          // null: the blocking pairwise path
+        ggml_tensor *           check = nullptr;    // the ids of the current all-reduce, see rpc_msg_comm_allreduce_req
+        bool                    test_ids_flip = false;
 
         // The backend's communicator. Null on the pairwise path, which has none.
         void *                              backend_comm_ctx = nullptr;
@@ -2843,6 +2863,7 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     }
     state.pairwise_backend = backends[dev_id];
     state.allreduce_fn     = comm_allreduce_pairwise;
+    state.test_ids_flip    = rpc_comm_test_ids_flip(request.rank);
     // a peer that stops answering (cable pulled, laptop asleep) fails the exchange instead of hanging
     const int timeout_ms = (int) rpc_comm_env_int("GGML_RPC_COMM_TIMEOUT_MS", 30000);
     if (timeout_ms > 0 && !state.peers[0]->set_timeout(timeout_ms)) {
@@ -2936,8 +2957,18 @@ void rpc_server::comm_async::work() {
         }
         if (!failed) {
             char * host = (char *) s.host;
-            if (!rpc_comm_exchange(peer, rank, host, host + s.wire_bytes, s.wire_bytes, spin_us)) {
+            // the hash of the ids goes after the partial, so the check costs no extra trip
+            uint64_t hash = 0;
+            if (s.ids_offs != 0) {
+                hash = rpc_comm_ids_hash(host + s.ids_offs, s.ids_bytes, test_ids_flip);
+                memcpy(host + s.wire_bytes, &hash, sizeof(hash));
+            }
+            if (!rpc_comm_exchange(peer, rank, host, host + s.xfer, s.xfer, spin_us)) {
                 LOG_ERROR("[%s] the exchange with the peer failed or timed out (GGML_RPC_COMM_TIMEOUT_MS)\n", __func__);
+                failed = true;
+            } else if (s.ids_offs != 0 && memcmp(host + s.xfer + s.wire_bytes, &hash, sizeof(hash)) != 0) {
+                LOG_ERROR("[%s] the ranks picked different experts in %s (the router output differs between the GPUs), stopping\n",
+                          __func__, s.check_name.c_str());
                 failed = true;
             }
         }
@@ -2973,6 +3004,7 @@ std::unique_ptr<rpc_server::comm_async> rpc_server::comm_async_init(ggml_backend
             ca->test_delay_ms = std::strtoll(strchr(delay, ':') + 1, nullptr, 10);
         }
     }
+    ca->test_ids_flip = rpc_comm_test_ids_flip(rank);
     for (comm_async::slot & s : ca->slots) {
         s.ready = ggml_backend_event_new(dev);
         s.done  = ggml_backend_event_new(dev);
@@ -2990,7 +3022,7 @@ std::unique_ptr<rpc_server::comm_async> rpc_server::comm_async_init(ggml_backend
     return ca;
 }
 
-bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst) {
+bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst, ggml_tensor * t_check) {
     if (ca.failed) {
         LOG_ERROR("[%s] an earlier exchange with the peer failed, stopping\n", __func__);
         return false;
@@ -2999,6 +3031,10 @@ bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst) {
     const int64_t ne         = ggml_nelements(t_dst);
     const bool    wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= RPC_COMM_BF16_MIN_NE;
     const size_t  wire_bytes = wire_bf16 ? (size_t) ne*2 : ggml_nbytes(t_dst);
+    // with a check: 8 more bytes for the hash, and the GPU copies the ids to the end of the slot
+    const size_t  xfer       = wire_bytes + (t_check != nullptr ? sizeof(uint64_t) : 0);
+    const size_t  ids_offs   = t_check != nullptr ? (2*xfer + 63) / 64 * 64 : 0;
+    const size_t  ids_bytes  = t_check != nullptr ? (size_t) ggml_nelements(t_check)*sizeof(int32_t) : 0;
 
     // the next slot, once the comm thread is done with it
     const int k = ca.next;
@@ -3011,7 +3047,7 @@ bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst) {
 
     // grow the slot; the GPU may still read the old memory, so wait for it first
     const size_t page = 16384;
-    const size_t need = (2*wire_bytes + page - 1) / page * page;
+    const size_t need = ((t_check != nullptr ? ids_offs + ids_bytes : 2*xfer) + page - 1) / page * page;
     if (s.size < need) {
         ggml_backend_synchronize(backend);
         if (s.buf != nullptr) {
@@ -3040,7 +3076,7 @@ bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst) {
     }
 
     const ggml_init_params params = {
-        /*.mem_size   =*/ 8*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(4, false),
+        /*.mem_size   =*/ 12*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(4, false),
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
@@ -3055,11 +3091,18 @@ bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst) {
     };
     const ggml_type wire_type = wire_bf16 ? GGML_TYPE_BF16 : t_dst->type;
     ggml_tensor * t_send = new_tensor(wire_type, s.buf, s.host);
-    ggml_tensor * t_recv = new_tensor(wire_type, s.buf, (char *) s.host + wire_bytes);
+    ggml_tensor * t_recv = new_tensor(wire_type, s.buf, (char *) s.host + xfer);
     ggml_tensor * t_peer = wire_bf16 ? new_tensor(t_dst->type, ca.scratch.get(), ggml_backend_buffer_get_base(ca.scratch.get())) : nullptr;
 
-    // the partial out, ready; then wait for done and add the peer's partial
-    rpc_comm_compute(ctx, backend, { rpc_comm_cpy_node(ctx, t_dst, t_send) });
+    // the partial (and the ids) out, ready; then wait for done and add the peer's partial
+    if (t_check != nullptr) {
+        ggml_tensor * t_ids = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, t_check->ne[0], t_check->ne[1], t_check->ne[2], t_check->ne[3]);
+        t_ids->buffer = s.buf;
+        t_ids->data   = (char *) s.host + ids_offs;
+        rpc_comm_compute(ctx, backend, { rpc_comm_cpy_node(ctx, t_dst, t_send), rpc_comm_cpy_node(ctx, t_check, t_ids) });
+    } else {
+        rpc_comm_compute(ctx, backend, { rpc_comm_cpy_node(ctx, t_dst, t_send) });
+    }
     ggml_backend_event_record(s.ready, backend);
     GGML_ASSERT(ggml_backend_event_arm_host(s.done));
     ggml_backend_event_wait(backend, s.done);
@@ -3068,6 +3111,10 @@ bool rpc_server::comm_allreduce_async(comm_async & ca, ggml_tensor * t_dst) {
     {
         std::lock_guard<std::mutex> lock(ca.mutex);
         s.wire_bytes = wire_bytes;
+        s.xfer       = xfer;
+        s.ids_offs   = ids_offs;
+        s.ids_bytes  = ids_bytes;
+        s.check_name = t_check != nullptr ? t_check->name : "";
         s.busy       = true;
         ca.jobs.push_back(k);
     }
@@ -3081,8 +3128,9 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
     comm_state & state = *(comm_state *) comm_ctx_v;
     ggml_tensor * t_dst = tensors[0];
     ggml_backend_t backend = state.pairwise_backend;
+    ggml_tensor * t_check = state.check;
     if (state.async != nullptr) {
-        return comm_allreduce_async(*state.async, t_dst);
+        return comm_allreduce_async(*state.async, t_dst, t_check);
     }
 
     const size_t  nbytes = ggml_nbytes(t_dst);
@@ -3108,8 +3156,10 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
         state.scratch_size = need;
     }
     char * scratch_base = (char *) ggml_backend_buffer_get_base(state.scratch.get());
-    state.send_buf.resize(wire_bytes);
-    state.recv_buf.resize(wire_bytes);
+    // with a check, the hash of the ids goes after the partial
+    const size_t xfer = wire_bytes + (t_check != nullptr ? sizeof(uint64_t) : 0);
+    state.send_buf.resize(xfer);
+    state.recv_buf.resize(xfer);
 
     auto new_scratch_tensor = [&](ggml_type type, size_t offset) {
         ggml_tensor * t = ggml_new_tensor_4d(ctx, type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
@@ -3132,8 +3182,35 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
         ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
     }
 
-    if (!rpc_comm_exchange(state.peers[0], state.rank, state.send_buf.data(), state.recv_buf.data(), wire_bytes, 0)) {
+    uint64_t hash = 0;
+    if (t_check != nullptr) {
+        // the ids as contiguous values, the same bytes that the async path hashes
+        std::vector<uint8_t> span(ggml_nbytes(t_check));
+        ggml_backend_tensor_get(t_check, span.data(), 0, span.size());
+        std::vector<int32_t> ids;
+        ids.reserve(ggml_nelements(t_check));
+        for (int64_t i3 = 0; i3 < t_check->ne[3]; i3++) {
+            for (int64_t i2 = 0; i2 < t_check->ne[2]; i2++) {
+                for (int64_t i1 = 0; i1 < t_check->ne[1]; i1++) {
+                    for (int64_t i0 = 0; i0 < t_check->ne[0]; i0++) {
+                        int32_t v;
+                        memcpy(&v, span.data() + i0*t_check->nb[0] + i1*t_check->nb[1] + i2*t_check->nb[2] + i3*t_check->nb[3], sizeof(v));
+                        ids.push_back(v);
+                    }
+                }
+            }
+        }
+        hash = rpc_comm_ids_hash(ids.data(), ids.size()*sizeof(int32_t), state.test_ids_flip);
+        memcpy(state.send_buf.data() + wire_bytes, &hash, sizeof(hash));
+    }
+
+    if (!rpc_comm_exchange(state.peers[0], state.rank, state.send_buf.data(), state.recv_buf.data(), xfer, 0)) {
         LOG_ERROR("[%s] the exchange with the peer failed or timed out (GGML_RPC_COMM_TIMEOUT_MS)\n", __func__);
+        return false;
+    }
+    if (t_check != nullptr && memcmp(state.recv_buf.data() + wire_bytes, &hash, sizeof(hash)) != 0) {
+        LOG_ERROR("[%s] the ranks picked different experts in %s (the router output differs between the GPUs), stopping\n",
+                  __func__, t_check->name);
         return false;
     }
 
@@ -3153,7 +3230,8 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         return false;
     }
 
-    ggml_tensor * t_dst = deserialize_tensor(request_ctx(), &request.tensor);
+    ggml_context * ctx = request_ctx();
+    ggml_tensor * t_dst = deserialize_tensor(ctx, &request.tensor);
     if (t_dst == nullptr || t_dst->buffer == nullptr) {
         LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
@@ -3161,11 +3239,23 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (ggml_nbytes(t_dst) == 0) {
         return true;
     }
+    ggml_tensor * t_check = nullptr;
+    if (request.check.id != 0) {
+        t_check = deserialize_tensor(ctx, &request.check);
+        if (t_check == nullptr || t_check->buffer == nullptr || t_check->type != GGML_TYPE_I32) {
+            LOG_ERROR("[%s] error deserializing the check tensor\n", __func__);
+            return false;
+        }
+    }
 
     // Neither path needs a wait here. The pairwise path waits internally, and the backend orders
     // its reduction after the work that produced the partial sum.
+    // the check is done on the pairwise path, a backend communicator does not take one
     void * comm_ctx = state.backend_comm_ctx != nullptr ? state.backend_comm_ctx : &state;
-    if (!state.allreduce_fn(comm_ctx, &t_dst)) {
+    state.check = t_check;
+    const bool ok = state.allreduce_fn(comm_ctx, &t_dst);
+    state.check = nullptr;
+    if (!ok) {
         LOG_ERROR("[%s] allreduce failed for tensor %s\n", __func__, t_dst->name);
         return false;
     }
@@ -3597,8 +3687,9 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
             return nullptr;
         }
         ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backends[i]->context;
-        // since minor version 2 both ranks round their partials the same way, so the sums match bit for bit
-        if (rpc_ctx->dispatcher->get_server_minor() < 2) {
+        // since minor version 2 both ranks round their partials the same way, so the sums match bit for bit,
+        // since 3 they compare the expert ids
+        if (rpc_ctx->dispatcher->get_server_minor() < 3) {
             LOG_WARN("%s: the server %s is too old for the comm between servers (protocol %d.%u)\n", __func__,
                      rpc_ctx->endpoint.c_str(), RPC_PROTO_MAJOR_VERSION, rpc_ctx->dispatcher->get_server_minor());
             return nullptr;
@@ -3622,7 +3713,21 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
     if (!parse_endpoint(ranks[0].endpoint, host0, port0)) {
         return nullptr;
     }
-    const uint32_t comm_port = (uint32_t) port0 + 1000;
+    // rank 0 listens on the port of its server + 1000, GGML_RPC_COMM_PORT sets another one (for a firewall)
+    uint32_t comm_port = (uint32_t) port0 + 1000;
+    if (const char * env = std::getenv("GGML_RPC_COMM_PORT")) {
+        char * end = nullptr;
+        const long v = std::strtol(env, &end, 10);
+        if (end == env || *end != '\0' || v <= 0 || v > 65535) {
+            LOG_WARN("%s: invalid GGML_RPC_COMM_PORT '%s', give a port from 1 to 65535\n", __func__, env);
+            return nullptr;
+        }
+        comm_port = (uint32_t) v;
+    }
+    if (comm_port > 65535) {
+        LOG_WARN("%s: the comm port %u of rank 0 is too large, set GGML_RPC_COMM_PORT\n", __func__, comm_port);
+        return nullptr;
+    }
     if (host0.size() >= 64) {
         return nullptr;
     }
@@ -3661,12 +3766,12 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
         return nullptr;
     }
-    LOG_INFO("%s: pairwise communicator initialized (%s <-> %s)\n", __func__,
-             ranks[0].endpoint.c_str(), ranks[1].endpoint.c_str());
+    LOG_INFO("%s: pairwise communicator initialized (%s <-> %s, port %u)\n", __func__,
+             ranks[0].endpoint.c_str(), ranks[1].endpoint.c_str(), comm_port);
     return new ggml_backend_rpc_comm_context{std::move(ranks)};
 }
 
-static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tensor ** tensors) {
+static bool ggml_backend_rpc_comm_allreduce_tensor_impl(void * comm_ctx_v, ggml_tensor ** tensors, ggml_tensor ** checks) {
     ggml_backend_rpc_comm_context * comm_ctx = (ggml_backend_rpc_comm_context *) comm_ctx_v;
     if (comm_ctx == nullptr) {
         return false;
@@ -3688,10 +3793,28 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
             return false;
         }
     }
+    // the ids to compare, one tensor per rank in that rank's buffer; without them the sum is not checked
+    bool check = checks != nullptr;
+    for (size_t i = 0; check && i < n_ranks; i++) {
+        check = checks[i] != nullptr && checks[i]->type == GGML_TYPE_I32 && ggml_nelements(checks[i]) == ggml_nelements(checks[0]) &&
+            checks[i]->buffer != nullptr && ggml_backend_buffer_is_rpc(checks[i]->buffer) &&
+            ((ggml_backend_rpc_buffer_context *) checks[i]->buffer->context)->dispatcher ==
+                ((ggml_backend_rpc_buffer_context *) tensors[i]->buffer->context)->dispatcher;
+    }
     for (size_t i = 0; i < n_ranks; i++) {
-        comm_ctx->ranks[i].dispatcher->call_async<RPC_CMD_COMM_ALLREDUCE>({ comm_ctx->ranks[i].device, serialize_tensor(tensors[i]) });
+        comm_ctx->ranks[i].dispatcher->call_async<RPC_CMD_COMM_ALLREDUCE>(
+            { comm_ctx->ranks[i].device, serialize_tensor(tensors[i]), serialize_tensor(check ? checks[i] : nullptr) });
     }
     return true;
+}
+
+static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tensor ** tensors) {
+    return ggml_backend_rpc_comm_allreduce_tensor_impl(comm_ctx_v, tensors, nullptr);
+}
+
+// the ranks also compare checks[i], the expert ids that each rank computed, see ggml_backend_comm_allreduce_tensor_check_t
+static bool ggml_backend_rpc_comm_allreduce_tensor_check(void * comm_ctx_v, ggml_tensor ** tensors, ggml_tensor ** checks) {
+    return ggml_backend_rpc_comm_allreduce_tensor_impl(comm_ctx_v, tensors, checks);
 }
 
 size_t ggml_backend_rpc_server_set_model_dir(const char * dir, size_t n_io_threads) {
@@ -3799,6 +3922,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_rpc_comm_allreduce_tensor;
+    }
+    if (std::strcmp(name, "ggml_backend_comm_allreduce_tensor_check") == 0) {
+        return (void *)ggml_backend_rpc_comm_allreduce_tensor_check;
     }
     return NULL;
 

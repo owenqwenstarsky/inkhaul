@@ -492,6 +492,7 @@ struct common_params {
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+    enum llama_tp_attn    tp_attn    = LLAMA_TP_ATTN_SPLIT;    // attention with LLAMA_SPLIT_MODE_TENSOR
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
@@ -601,6 +602,10 @@ struct common_params {
     std::string expert_share;           // -es
     std::string kv_device;              // -kvd
     std::string longhaul_cache_devices; // -lhcd
+
+    // --tp-host ADDR[:PORT]: with -sm tensor, rank 0 runs in this process as an RPC server for the local GPU,
+    // started after parsing, and the devices become that server and then the --rpc servers
+    std::string tp_host;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

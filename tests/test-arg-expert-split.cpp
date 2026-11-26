@@ -128,6 +128,24 @@ int main(void) {
     assert(parse_fails({ "-es", gpu0 + "=100", "-sm", "tensor" }));
     assert(parse_fails({ "-sm", "tensor", "-lhcd", gpu0 + "=1G" }));
     assert(parse_fails({ "-sm", "tensor", "-kvd", gpu0 }));
+    assert(params.tp_attn == LLAMA_TP_ATTN_SPLIT);
+    assert(parse_ok({ "-sm", "tensor", "--tp-attn", "mirror" }, params));
+    assert(params.tp_attn == LLAMA_TP_ATTN_MIRROR);
+    assert(parse_ok({ "-sm", "tensor", "--tp-attn", "split" }, params));
+    assert(params.tp_attn == LLAMA_TP_ATTN_SPLIT);
+    assert(parse_fails({ "-sm", "tensor", "--tp-attn", "half" }));
+    // the attention policy only means something with the tensor split
+    assert(parse_fails({ "--tp-attn", "mirror" }));
+    assert(parse_fails({ "-sm", "layer", "--tp-attn", "mirror" }));
+    // --tp-host runs rank 0 here, in front of the --rpc servers (the server itself is tested in test-llama-archs --rpc)
+    assert(parse_fails({ "--tp-host", "10.0.0.1" }));
+    assert(parse_fails({ "-sm", "layer", "--tp-host", "10.0.0.1" }));
+    assert(parse_fails({ "-sm", "tensor", "--tp-host", "10.0.0.1", "-dev", gpu0 }));
+    assert(parse_fails({ "-sm", "tensor", "--tp-host", "10.0.0.1:abc" }));
+    assert(parse_fails({ "-sm", "tensor", "--tp-host", "10.0.0.1:70000" }));
+    assert(parse_fails({ "-sm", "tensor", "--tp-host", ":50052" }));
+    // no --rpc: no other rank
+    assert(parse_fails({ "-sm", "tensor", "--tp-host", "10.0.0.1" }));
     assert(parse_fails({ "-es", gpu0 + "=101" }));
     assert(parse_fails({ "-es", gpu0 + "=-1" }));
     assert(parse_fails({ "-es", gpu0 + "=abc" }));

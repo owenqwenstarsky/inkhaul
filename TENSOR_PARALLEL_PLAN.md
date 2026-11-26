@@ -448,3 +448,51 @@ Measured on this Mac (M5, no cable), `llama-tp-probe gpu`:
 - An option this plan does not cover: a GPU kernel that spins on a flag the host writes in shared memory, instead of an event. It could cut the wake-up to a few microseconds. Metal does not document CPU writes as visible to a running kernel, so it is an experiment, for you to decide.
 
 Not done: the measurement on the two laptops (yours to approve).
+
+## 16. Phase 3 results (2026-11-26)
+
+Done:
+- **Shared experts split** like the routed ones: `ffn_gate/up_shexp` by rows (axis 1) and `ffn_down_shexp` by columns (axis 0), in steps of `lcm(block size, 128)`.
+  - The meta backend adds their partial to the one of the routed experts and syncs both at once, so they add no sync.
+  - It does that only when every device has a slice of both. A slice of 0 rows (a shared expert smaller than two steps) costs one more sync per layer, but the result stays right. For Qwen3.5-35B-A3B (`n_ff_shexp` 512) each Mac gets 256 rows.
+- **`--tp-attn split|mirror`** (env `LLAMA_ARG_TP_ATTN`), `tp_attn` in `llama_model_params`, and `llama-bench -tpa split,mirror`.
+  - `mirror` makes every attention, Gated DeltaNet and cache tensor mirrored.
+  - Giving it without `-sm tensor` is an error.
+  - The default stays `split` until you measure. The wake-up finding of section 15 points to `mirror` for two laptops.
+- **Shares per class** at load: `tensor split: experts 50/50 (n_ff 512, step 256), shared experts 50/50 (...), attention mirrored, output 50/50`.
+  - Each share is summed over all layers, since the rounding moves between the devices per layer.
+  - The rotation counts only the earlier layers of the same type (recurrent or attention). So a model whose FFN does not split evenly into steps can round the same way in a recurrent and an attention layer. The test model shows 33/67 for its dense FFN of 384. Real Qwen 3.5 sizes split evenly.
+- **`GGML_RPC_COMM_PORT`**: a client variable that sets the port rank 0 listens on. It replaces the planned server flag `--comm-port`: the client already sends the port to both servers in `COMM_INIT`, so a client setting needs no protocol change and covers `--tp-host` too. A bad value stops the comm with a message, and a port above 65535 is refused.
+- **`--tp-host ADDR[:PORT]`** (env `LLAMA_ARG_TP_HOST`, default port 50052):
+  - After the arguments are parsed, it starts an RPC server thread for the first local GPU and waits until the server answers.
+  - The devices become that server (rank 0), then the `--rpc` servers.
+  - It is an error without `-sm tensor`, with `-dev`, or without `--rpc`. `127.0.0.1` gives a warning.
+- **Router guard** (5.5):
+  - A new optional comm function, `ggml_backend_comm_allreduce_tensor_check`, takes one I32 tensor per rank.
+  - The meta backend passes the ids of the last `MUL_MAT_ID` of each sub-graph.
+  - The RPC request carries the check tensor (protocol 10.3; the comm needs 10.3 on all servers).
+  - Each server hashes the ids and appends 8 bytes to the partial it sends:
+    - on the async path the GPU copies the ids next to the partial, and the comm thread hashes them;
+    - the blocking path reads them.
+  - A mismatch stops the run like a timeout, with `the ranks picked different experts in ffn_moe_topk-N`.
+  - With `-sm tensor`, `llama_model::build_graph` marks the ids as graph outputs. Otherwise the allocator could reuse their memory later in the same sub-graph (for the shared expert) before the comm reads them.
+  - The test hook `GGML_RPC_COMM_TEST_IDS_FLIP=RANK` changes the hash on that rank.
+- The meta backend logs the number of all-reduces of a graph at debug level when it changes.
+
+Not done: with more than 2 ranks, the full-attention layers of Qwen 3.5 (2 KV heads) do not fall back to `mirror` by themselves. With two laptops this does not matter; use `--tp-attn mirror` for more.
+
+Tests, all OK:
+- `test-llama-archs` with `GGML_METAL_DEVICES=2`:
+  - rows `Meta mirror` and `Meta mirror 3:1` for `qwen35` and `qwen35moe`, with NMSE, roundtrip and mixed batch;
+  - test 5, "Tensor syncs": with split attention a 2-layer model has 4 all-reduces per graph, with `mirror` 2.
+    - This checks that the shared experts are merged. With the test model's old shared expert of 192 rows (0/192 after the rounding) it reported 6.
+    - So the test model of `qwen35moe` now has a shared expert of 256.
+    - The test also checks the share line.
+- `test-llama-archs --rpc`:
+  - a case `--tp-host` (rank 0 started by the real argument parser, rank 1 a second server), for both models;
+  - a child with `GGML_RPC_COMM_TEST_IDS_FLIP=1` that must stop and name the layer.
+- `test-tp-comm`:
+  - all-reduces with the ids check (decode and prompt sizes; the ids are a strided view, like the top-k of the argsort);
+  - children with different ids on the async and the blocking path (must stop with the message), and with the same ids on the blocking path (must pass; values outside the view differ and must not count);
+  - `GGML_RPC_COMM_PORT` with a free port, and with 70000 (refused).
+- `test-arg-expert-split`: `--tp-attn`, and the errors of `--tp-host`.

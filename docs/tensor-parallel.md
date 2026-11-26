@@ -35,20 +35,29 @@ The sustained transfers of the 2 MiB test push a lot of data over the cable. One
 
 ## Running `-sm tensor` on two Macs
 
-Each Mac runs a `ggml-rpc-server`, and the main Mac also runs `llama-cli` or `llama-server` with only the two RPC devices. Then the two servers add up their partial results directly between each other, and only the input and the logits pass through the client. The cable setup is the one in [tools/rpc](../tools/rpc/README.md#this-fork-several-macs-over-thunderbolt).
+The remote Mac runs a `ggml-rpc-server`. The main Mac runs `llama-cli` or `llama-server`, which with `--tp-host` also runs the server of its own GPU (rank 0) on a thread. The two servers add up their partial results directly between each other, and only the input and the logits pass through the client. The cable setup is the one in [tools/rpc](../tools/rpc/README.md#this-fork-several-macs-over-thunderbolt).
 
 ```sh
 # on the remote Mac
 ggml-rpc-server -H 10.0.0.2 -p 50052
 
-# on the main Mac: its own server, then the client with both servers
+# on the main Mac: rank 0 on its Thunderbolt address, the remote Mac as rank 1
+llama-cli -m ~/models/Qwen3.5-35B-A3B-Q4_K_M.gguf --rpc 10.0.0.2:50052 -sm tensor --tp-host 10.0.0.1 --tp-attn mirror
+
+# the same with a second process for rank 0 instead of --tp-host
 ggml-rpc-server -H 10.0.0.1 -p 50052 &
-llama-cli -m ~/models/Qwen3.5-35B-A3B-Q4_K_M.gguf --rpc 10.0.0.1:50052,10.0.0.2:50052 -dev RPC0,RPC1 -sm tensor
+llama-cli -m ~/models/Qwen3.5-35B-A3B-Q4_K_M.gguf --rpc 10.0.0.1:50052,10.0.0.2:50052 -dev RPC0,RPC1 -sm tensor --tp-attn mirror
 ```
 
-- The first server in `--rpc` is rank 0. It listens for the other server on its port + 1000 (here `10.0.0.1:51052`), on the address it was started with. Allow that port in the macOS firewall.
-- Give only RPC devices with `-dev`. With the local GPU in the list the partial results go through the client, which is slow, and the log warns.
-- Each large matrix is split by `-ts` (default: evenly). Attention is split by groups of heads, the experts and the dense FFN by rows. The router, the norms and the shared experts are on both Macs.
+- Rank 0 listens for the other server on its port + 1000 (here `10.0.0.1:51052`), on the address it was started with. Allow that port in the macOS firewall, or pick another one with `GGML_RPC_COMM_PORT` on the client.
+- `--tp-host ADDR[:PORT]` (default port 50052) serves the first local GPU. The address must be the one the remote Mac reaches this Mac on, not `127.0.0.1`. The devices become that server and then the `--rpc` servers, so do not give `-dev`.
+- Without `--tp-host`, give only RPC devices with `-dev`. With the local GPU in the list the partial results go through the client, which is slow, and the log warns.
+- Each large matrix is split by `-ts` (default: evenly). The experts, the shared experts and the dense FFN are split by rows, in steps of 128 rows (256 for K-quants). The router and the norms are on both Macs. The load log prints the share that each class of tensors got after the rounding, for example `tensor split: experts 50/50 (n_ff 512, step 256), shared experts 50/50 (n_ff 512, step 256), attention mirrored, output 50/50`.
+- `--tp-attn` sets what happens to attention (and to the Gated DeltaNet layers of Qwen 3.5):
+  - `split` (default): heads, KV cache and recurrent state are split by groups of heads. Two syncs per layer. Attention reads and the KV cache are halved, so the possible context doubles.
+  - `mirror`: both Macs hold all attention weights and the whole KV cache and compute attention in full. One sync per layer, the one after the experts. Attention is not faster and its memory is doubled.
+  - Which one is faster depends on the cost of a sync, see `llama-tp-probe budget`. Above about 100 us per sync `mirror` should win, and between two Macs over Thunderbolt a sync costs more than that. `llama-bench -tpa split,mirror` compares both.
+- The shared experts add no sync: the meta backend adds their partial to the one of the routed experts and syncs both at once.
 - All experts stay in memory, split between the Macs: LongHaul (experts on disk) is off, and `-lhc`, `-lhcd` and `-es` do not apply.
 - Flash attention is turned on (it cannot be off). Backend sampling is off. `--fit` skips this mode with a warning, so set `-c` yourself.
 - The model must fit in the memory of both Macs together, with each Mac holding its share plus the mirrored tensors.
@@ -69,8 +78,10 @@ Payloads of 32768 values or more (prompt processing) go over the wire in bf16. E
 | `GGML_RPC_COMM_TIMEOUT_MS` | `30000` | A server whose peer does not answer for this long stops the run with an error, instead of hanging (TCP only). `0` waits forever. |
 | `GGML_RPC_COMM_SPIN_US` | `500` | How long the sync thread spins before it sleeps, while it waits for the GPU and for small messages. Spinning costs a CPU core, sleeping costs tens of microseconds per wake-up. |
 | `GGML_RPC_COMM_SYNC` | unset | Set it to use the blocking sync: the server waits for its GPU, exchanges, then queues the add. Use it to compare, or for backends without host events. |
+| `GGML_RPC_COMM_PORT` | port of rank 0 + 1000 | Set on the client: the port rank 0 listens on for the other servers. |
 
-- Both servers need protocol 10.2 or newer (this build). With an older server the client logs a warning and the partials go through the client.
+- Both servers need protocol 10.3 or newer (this build). With an older server the client logs a warning and the partials go through the client.
+- Each Mac runs the router of every MoE layer itself. On two Macs with the same chip both pick the same experts, bit for bit. To be sure, each server sends a hash of the expert ids of the layer with its partial (8 more bytes, no extra trip), and a mismatch stops the run with an error that names the layer, for example `the ranks picked different experts in ffn_moe_topk-12`. On two different chips the GPUs can round the router differently; that case is not supported yet.
 - Two servers on one Mac must use different devices (for example `GGML_METAL_DEVICES=2` and `-d MTL0`, `-d MTL1`). On one device both servers share one GPU queue, so each GPU would wait for the other forever; Metal then stops the queue with a GPU timeout error.
 - Over RDMA (Thunderbolt 5) the servers keep the ordered exchange (rank 0 sends first); the same-time exchange is for TCP.
 - The client sends the small commands of a pass in fewer TCP sends: each command goes out in one send, and the commands already queued behind it share that send.

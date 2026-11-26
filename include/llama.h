@@ -224,6 +224,12 @@ extern "C" {
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
     };
 
+    // attention with LLAMA_SPLIT_MODE_TENSOR
+    enum llama_tp_attn {
+        LLAMA_TP_ATTN_SPLIT  = 0, // heads, KV cache and recurrent state split over the devices: two syncs per layer
+        LLAMA_TP_ATTN_MIRROR = 1, // every device holds and computes all of the attention: one sync per layer
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
     };
@@ -337,6 +343,8 @@ extern "C" {
         enum llama_load_mode  load_mode;  // how to load the model
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
+
+        enum llama_tp_attn tp_attn; // attention with LLAMA_SPLIT_MODE_TENSOR
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         // with LLAMA_SPLIT_MODE_EXPERT: the device of every layer and of the KV cache (an index into the devices of the model)

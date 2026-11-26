@@ -370,6 +370,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            model->log_tensor_split();
+        }
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
