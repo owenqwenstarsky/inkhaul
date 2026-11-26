@@ -1208,6 +1208,7 @@ struct ggml_backend_sched {
     int                 * hv_tensor_backend_ids;   // [hash_set.size]
     struct ggml_tensor ** hv_tensor_copies;        // [hash_set.size][n_backends][n_copies]
     bool                * hv_tensor_requires_copy; // [hash_set.size] decides if input needs to be copied to each split
+    bool                * hv_tensor_split_start;   // [hash_set.size] the node starts a new split, see ggml_backend_sched_set_split_start
 
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
@@ -1753,7 +1754,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // this also applies to a split without inputs, e.g. one that follows a split that only writes to a host buffer
             bool need_new_split = false;
             if (node_backend_id == cur_backend_id && split_has_nodes) {
-                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                need_new_split = sched->hv_tensor_split_start[hash_id(node)];
+                for (int j = 0; j < GGML_MAX_SRC && !need_new_split; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
                         continue;
@@ -2341,6 +2343,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hv_tensor_backend_ids   = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies        = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
     sched->hv_tensor_requires_copy = (bool *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_requires_copy[0]));
+    sched->hv_tensor_split_start   = (bool *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_split_start[0]));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -2403,6 +2406,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->hv_tensor_requires_copy);
+    free(sched->hv_tensor_split_start);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
@@ -2421,6 +2425,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         memset(sched->hv_tensor_backend_ids,  -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,        0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         memset(sched->hv_tensor_requires_copy, 0, sched->hash_set.size * sizeof(sched->hv_tensor_requires_copy[0]));
+        memset(sched->hv_tensor_split_start,   0, sched->hash_set.size * sizeof(sched->hv_tensor_split_start[0]));
         sched->is_reset = true;
     }
     sched->is_alloc = false;
@@ -2571,6 +2576,12 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
     tensor_backend_id(node) = backend_index;
     SET_CAUSE(node, "usr");
+    sched->is_reset = false;
+}
+
+void ggml_backend_sched_set_split_start(ggml_backend_sched_t sched, struct ggml_tensor * node) {
+    GGML_ASSERT(sched);
+    sched->hv_tensor_split_start[hash_id(node)] = true;
     sched->is_reset = false;
 }
 

@@ -1792,10 +1792,11 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
         std::vector<size_t> sizes; // per device, empty: none
         bool                fails;
         bool                rebalance = false; // move experts toward the shares at every graph, off in the other cases
+        bool                check_splits = false; // the scheduler splits let the devices compute at the same time
     };
     const expert_case cases[] = {
         { "50/50, layers on GPU 2",           { 1.0f, 1.0f }, 1, 2*size_dev,       {},           false },
-        { "30/70, layers on GPU 1",           { 3.0f, 7.0f }, 0, 4*size_dev,       {},           false },
+        { "30/70, layers on GPU 1",           { 3.0f, 7.0f }, 0, 4*size_dev,       {},           false, false, true },
         { "100/0, layers on GPU 2",           { 1.0f, 0.0f }, 1, size_dev,         {},           false },
         { "0/100, layers on GPU 2",           { 0.0f, 1.0f }, 1, size_dev,         {},           false },
         { "50/50, 512 MiB",                   { 1.0f, 1.0f }, 1, 512ull*1024*1024, {},           false },
@@ -1821,6 +1822,9 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
         setenv("LLAMA_EXPERT_SHARE_REBALANCE", ec.rebalance ? "1" : "0", 1);
         if (ec.rebalance) {
             setenv("LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL", "1", 1);
+        }
+        if (ec.check_splits) {
+            setenv("GGML_SCHED_DEBUG", "1", 1); // the splits of each graph in the log
         }
         try {
             auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu, gpu2 }, LLAMA_SPLIT_MODE_EXPERT, nullptr, ec.size, {}, ec.ts,
@@ -1858,6 +1862,7 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
         llama_log_set(log_cb, log_ud);
         unsetenv("LLAMA_EXPERT_SHARE_REBALANCE");
         unsetenv("LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL");
+        unsetenv("GGML_SCHED_DEBUG");
 
         // the reason of a failed load is in the log
         if (failed) {
@@ -1898,6 +1903,24 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
             detail += ", " + std::to_string(n_moved) + " moved";
             if (!ec.rebalance && n_moved > 0) {
                 ok = false;
+            }
+            // a split that copies a slot map copies nothing else: the sums of the other devices are copied in a later split, so
+            // the home device queues its own experts before it waits for them
+            if (ec.check_splits) {
+                size_t n_lookup = 0;
+                size_t n_bad    = 0;
+                for (size_t pos = log.find("## SPLIT #"); pos != std::string::npos; pos = log.find("## SPLIT #", pos + 1)) {
+                    const std::string line = log.substr(pos, log.find('\n', pos) - pos);
+                    if (line.find("moe_cache.slot_map") != std::string::npos) {
+                        n_lookup++;
+                        n_bad += line.find(" # 1 inputs") == std::string::npos;
+                    }
+                }
+                detail += ", " + std::to_string(n_lookup) + " lookup splits";
+                if (n_lookup == 0 || n_bad > 0) {
+                    ok = false;
+                    detail += " (" + std::to_string(n_bad) + " also copy other inputs)";
+                }
             }
         }
         LOG("LongHaul %s, expert split, %s: %s (%s)\n", label.c_str(), ec.name, ok ? "OK" : "FAIL", detail.c_str());

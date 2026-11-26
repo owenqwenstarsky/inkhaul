@@ -2004,6 +2004,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // per-expert scales keep a skipped row at zero, a bias would not
         // the devices other than the home device come first, so that their work is queued before the home device computes its part
         GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && "the expert split does not support expert biases");
+        std::vector<ggml_tensor *> part_outs;
         for (const llama_moe_cache_part & part : cache.parts) {
             const int n_nodes_prev = ggml_graph_n_nodes(gf);
 
@@ -2019,13 +2020,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
             }
 
-            if (moe_out == nullptr) {
-                moe_out = part_out;
-            } else {
-                moe_out = ggml_add(ctx0, moe_out, part_out);
-                ggml_backend_sched_set_tensor_backend(sched, moe_out, moe_cache->home());
-                ggml_build_forward_expand(gf, moe_out);
+            part_outs.push_back(part_out);
+        }
+
+        // the home backend adds the sums after all parts, in a split of its own: the inputs of a split are copied when it starts,
+        // so the home device queues its part before it waits for the sums of the other devices
+        moe_out = part_outs[0];
+        for (size_t ip = 1; ip < part_outs.size(); ++ip) {
+            moe_out = ggml_add(ctx0, moe_out, part_outs[ip]);
+            ggml_backend_sched_set_tensor_backend(sched, moe_out, moe_cache->home());
+            if (ip == 1) {
+                ggml_backend_sched_set_split_start(sched, moe_out);
             }
+            ggml_build_forward_expand(gf, moe_out);
         }
     }
 

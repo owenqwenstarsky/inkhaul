@@ -370,6 +370,11 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // Start a new split at node, also when it runs on the same backend as the node before it
+    // The inputs of a split are copied before the split starts: a node that reads the result of another backend can start a split,
+    // so that the nodes before it are queued before the copy waits for that result
+    GGML_API void                 ggml_backend_sched_set_split_start(ggml_backend_sched_t sched, struct ggml_tensor * node);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 

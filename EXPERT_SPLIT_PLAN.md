@@ -1,6 +1,6 @@
 # Plan: expert split over several laptops
 
-Status: phases 1 to 3 committed, phases 4 and 5 open. Builds on THUNDERBOLT_PLAN.md (commit e9e55df).
+Status: all phases done. Phase 4 fixed the overlap of the devices and dropped the two unmeasured tunings, phase 5 is dropped (its gate needs measurements on your laptops). See sections 13 and 14. Builds on THUNDERBOLT_PLAN.md (commit e9e55df).
 
 ## 1. Goal
 
@@ -294,4 +294,35 @@ Changes from the plan:
 - The preference for experts that are not cached is a penalty (a cached expert counts as a quarter of the gap further away), not a strict order: a strict order would move small uncached experts first and need many more checks.
 - No RPC case with moves: the RPC test models route every token to the same two experts, which 60/40 already splits one each, so no move fits. The moves use the same host-side LRU and fill paths as the RPC cases that pass.
 - The measured share at exit on a real prompt (the "done when" of phase 3) needs your laptops.
+
+## 13. Phase 4 results (2026-11-25)
+
+Found while looking at the overlap: in phases 1 to 3 the devices did not compute at the same time. `GGML_SCHED_DEBUG=2` on the 30/70 test case showed this split list for one layer (home MTL0, the other device MTL1):
+
+```
+## SPLIT #2: MTL0 # 1 inputs: [moe_cache.slot_map-0.1]            <- lookup of the MTL1 part
+## SPLIT #3: MTL1 # 6 inputs: [attn_post_norm-0] ...                <- MTL1 experts and their sum
+## SPLIT #4: MTL0 # 7 inputs: [moe_cache.slot_map-0.0] [node_104] ...  <- MTL0 lookup, MTL0 experts, the add, the next attention
+```
+
+`node_104` is the sum of MTL1. The scheduler copies the inputs of a split before the split computes, and the inputs that are not host weights before the copy callback of the slot map (`ggml_backend_sched_compute_splits`). So split #4 first waited for MTL1 to finish, then read the misses of MTL0 and computed its experts: the devices took turns within each layer. The plan (3.3) assumed that the add would wait in a split of its own.
+
+Fix:
+- New scheduler API `ggml_backend_sched_set_split_start(sched, node)` (`ggml/include/ggml-backend.h`): the node starts a new split, also on the same backend. It is a flag per node in the scheduler's hash table, reset with the other per-node state. Graphs that do not call it split as before.
+- `build_moe_ffn` builds all parts first and adds their sums after, and the first add starts a split. Now split #4 holds only the MTL0 lookup and experts (`# 1 inputs`), and split #5 starts at the add with `node_104`: the copy waits for MTL1 only after the MTL0 work is queued. With three or more devices the old code also added the first two sums before the home part, which would have waited too early.
+- `test-llama-archs`: the 30/70 case runs with `GGML_SCHED_DEBUG=1` and checks that every split that copies a slot map copies nothing else. Removing the split start makes it fail (84 of 168 lookup splits of `inkling2_loop` also copy the sum of the other device).
+
+On this Mac the two Metal devices are one GPU, so the speed-up cannot be measured here. On the two laptops the remote experts and the local reads and experts now overlap as section 3.3 describes.
+
+Dropped, both because they need measurements on the two laptops (the plan's rule is "measured gain, or dropped"):
+- f16 activations over the link. Per MoE layer pass and remote device, `[n_embd, n_tokens]` f32 goes each way, so a ubatch of 512 tokens moves `2 * 512 * n_embd * 4` bytes per pass, for example 8 MiB for `n_embd` = 2048. In generation (1 token) this is a few KiB and the round trip sets the cost, so f16 would not help there. In prompt processing it can matter on TCP over Thunderbolt. Check with `llama-bench -p 512 -n 0` and the expert split against the layer split: if the expert split is much slower in prompt processing but not in generation, the link bandwidth is the cause and this is worth doing.
+- The shared expert before the wait. The shared expert is about 1/9 of the expert work of a token in Qwen 3.5 / 3.6 and Ling-3.2-air (1 shared and 8 routed experts of the same size), and it would only help when the remote laptop is the slower one. It needs a change in each model graph (a hook in `build_moe_ffn` that builds it before the add).
+
+Tests: two devices 261 OK, one device 93 OK, `--rpc` 20 OK, `ctest -L "main|behavior"` 56 of 61 (the same 5 environment failures as in phase 1).
+
+## 14. Phase 5 (2026-11-25): dropped
+
+The gate is "attention above about 25% of the prefill time", measured on the two laptops. That measurement is not possible here: the test models are tiny and the two Metal devices of this Mac are one GPU. The two-batch overlap also touches `llama_context` (two ubatches per graph), the KV cache and the recurrent state of the hybrid models and the node order, which is a large change to make without a measured need.
+
+To check the gate on your laptops: `llama-bench -m M --rpc R -sm expert -ts 50/50 -p 512 -n 0 -d 0,8192`. The attention work grows with the depth and the expert work does not, so if the prompt processing at depth 8192 is more than about 25% slower than at depth 0, attention is a large part of the prefill time at long contexts and the overlap may be worth doing. This is a rough test: at depth 0 the attention also has a cost. Phase 4 already lets the remote laptop compute its experts while the main laptop computes its own.
 
