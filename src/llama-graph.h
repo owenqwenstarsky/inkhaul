@@ -820,12 +820,13 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see llama_moe_cache::build_lookup)
+    // if slots is set, the experts are selected by slots instead of ids, from the MoE cache of device cache_dev (see llama_moe_cache::build_lookup)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * slots = nullptr,
+                  int32_t   cache_dev = -1) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range

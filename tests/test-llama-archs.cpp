@@ -504,7 +504,7 @@ static llama_model_ptr get_model(
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr,
-        const std::vector<std::string> & splits = {}, const float * tensor_split = nullptr) {
+        const std::vector<std::string> & splits = {}, const float * tensor_split = nullptr, const int32_t main_gpu = 0) {
     GGML_ASSERT((gguf_ctx != nullptr) + (file != nullptr) + !splits.empty() == 1);
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -514,6 +514,7 @@ static llama_model_ptr get_model(
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
     model_params.tensor_split = tensor_split;
+    model_params.main_gpu = main_gpu;
 
     tensor_data_params tensor_params = { seed, stdev };
     std::vector<const char *> split_paths;
@@ -535,8 +536,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t longhaul_cache_size = 0,
-        const std::vector<std::string> & splits = {}, const float * tensor_split = nullptr) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, splits, tensor_split);
+        const std::vector<std::string> & splits = {}, const float * tensor_split = nullptr,
+        const int32_t main_gpu = 0, const size_t * longhaul_cache_sizes = nullptr) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, splits, tensor_split, main_gpu);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -545,6 +547,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ubatch = 64;
     // 0: a file-backed model keeps its experts in the mapped file as the reference, see LLAMA_LONGHAUL_RESIDENT in main
     ctx_params.longhaul_cache_size = longhaul_cache_size;
+    ctx_params.longhaul_cache_sizes = longhaul_cache_sizes;
 
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
@@ -1321,6 +1324,10 @@ static bool test_longhaul_two_gpus(const std::string & label, const std::string 
     return all_ok && spanned;
 }
 
+static bool test_longhaul_expert_split(const std::string & label, const std::string & path, const size_t seed, const float stdev,
+        ggml_backend_dev_t gpu, ggml_backend_dev_t gpu2, const size_t size_dev, const size_t size_min,
+        const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref);
+
 // a file for the LongHaul test, rewritten from the file saved from the in-memory model
 struct longhaul_variant {
     const char * name;
@@ -1591,6 +1598,7 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
 
             if (gpu2 != nullptr) {
                 all_ok = test_longhaul_two_gpus(label, path, seed, stdev, gpu, gpu2, cache_size(5), tokens, logits_ref) && all_ok;
+                all_ok = test_longhaul_expert_split(label, path, seed, stdev, gpu, gpu2, cache_size(5), size_min, tokens, logits_ref) && all_ok;
             }
 
             // a cache that cannot hold the experts of one token, no cache without the test hook, and no GPU are errors
@@ -1748,6 +1756,121 @@ static std::vector<float> get_logits_steps(llama_model * model, llama_context * 
 
 // LongHaul with bailingmoe3: a dense lead layer, separate gate, up and down experts, a NextN layer that stays on disk,
 // files with two expert layouts and split files; the logits must match the in-memory model, also when decoding in small batches
+// the measured shares of the devices in the stats at exit, see llama_moe_cache::impl::log_stats
+static std::vector<double> get_measured_shares(const std::string & log) {
+    std::vector<double> res;
+    for (size_t pos = log.find(": share target "); pos != std::string::npos; pos = log.find(": share target ", pos + 1)) {
+        double target   = 0.0;
+        double measured = 0.0;
+        if (sscanf(log.c_str() + pos, ": share target %lf%%, measured %lf%%", &target, &measured) == 2) {
+            res.push_back(measured);
+        }
+    }
+    return res;
+}
+
+// LongHaul with the expert split over two GPUs: all layers on one GPU, the experts of every layer split by the shares
+// size_dev holds a few slots of every group, size_min the experts of one token on one GPU
+static bool test_longhaul_expert_split(const std::string & label, const std::string & path, const size_t seed, const float stdev,
+        ggml_backend_dev_t gpu, ggml_backend_dev_t gpu2, const size_t size_dev, const size_t size_min,
+        const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref) {
+    struct expert_case {
+        const char *        name;
+        float               ts[2];
+        int32_t             main_gpu;
+        size_t              size;
+        std::vector<size_t> sizes; // per device, empty: none
+        bool                fails;
+    };
+    const expert_case cases[] = {
+        { "50/50, layers on GPU 2",           { 1.0f, 1.0f }, 1, 2*size_dev,       {},           false },
+        { "30/70, layers on GPU 1",           { 3.0f, 7.0f }, 0, 4*size_dev,       {},           false },
+        { "100/0, layers on GPU 2",           { 1.0f, 0.0f }, 1, size_dev,         {},           false },
+        { "0/100, layers on GPU 2",           { 0.0f, 1.0f }, 1, size_dev,         {},           false },
+        { "50/50, 512 MiB",                   { 1.0f, 1.0f }, 1, 512ull*1024*1024, {},           false },
+        { "50/50, smallest cache on GPU 1",   { 1.0f, 1.0f }, 1, size_dev,         { size_min, 0 }, false },
+        { "50/50, too small cache on GPU 1",  { 1.0f, 1.0f }, 1, size_dev,         { size_min - 1, 0 }, true },
+    };
+    bool all_ok = true;
+    for (const expert_case & ec : cases) {
+        std::string log;
+        ggml_log_callback log_cb;
+        void * log_ud;
+        llama_log_get(&log_cb, &log_ud);
+        llama_log_set([](ggml_log_level, const char * text, void * ud) { ((std::string *) ud)->append(text); }, &log);
+
+        FILE * file = fopen(path.c_str(), "rb");
+        GGML_ASSERT(file != nullptr);
+        bool ok = true;
+        bool failed = false;
+        std::string detail;
+        try {
+            auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu, gpu2 }, LLAMA_SPLIT_MODE_EXPERT, nullptr, ec.size, {}, ec.ts,
+                ec.main_gpu, ec.sizes.empty() ? nullptr : ec.sizes.data());
+            const llama_model * model = model_and_ctx.first.get();
+
+            // all layers, and so the KV cache, on main_gpu
+            ggml_backend_dev_t home = ec.main_gpu == 0 ? gpu : gpu2;
+            for (int32_t il = 0; il < llama_model_n_layer(model); il++) {
+                if (llama_model_dev_layer(model, il) != home) {
+                    ok = false;
+                    detail = "layer " + std::to_string(il) + " is not on main_gpu, ";
+                    break;
+                }
+            }
+
+            const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+            // also decode and small batches after a prompt
+            const double nmse_val = std::max(nmse(logits_ref, logits),
+                nmse(logits_ref, get_logits_steps(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, 100)));
+            char buf[32];
+            snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+            detail += buf;
+            // the same backend as the reference, only the order of the sums differs: tighter than across backends, so that
+            // rows of skipped experts that are not zeroed show up
+            ok = ok && nmse_val <= 1e-5;
+        } catch (const std::exception & err) {
+            failed = true;
+            detail = err.what();
+        }
+        fclose(file);
+        llama_log_set(log_cb, log_ud);
+
+        // the reason of a failed load is in the log
+        if (failed) {
+            const size_t pos = std::min(log.find("error"), log.find("failed to initialize"));
+            if (pos != std::string::npos) {
+                const size_t bol = log.rfind('\n', pos);
+                const size_t eol = log.find('\n', pos);
+                detail += ": " + log.substr(bol == std::string::npos ? 0 : bol + 1, eol == std::string::npos ? std::string::npos : eol - (bol == std::string::npos ? 0 : bol + 1));
+            }
+        }
+        if (ec.fails) {
+            ok = failed && log.find("is too small") != std::string::npos;
+            detail = failed ? detail : "no error";
+        } else if (failed) {
+            ok = false;
+        } else {
+            // every device with a share computed some of the selected experts
+            const std::vector<double> measured = get_measured_shares(log);
+            const size_t n_shared = (ec.ts[0] > 0.0f) + (ec.ts[1] > 0.0f);
+            const bool all_used = measured.size() == n_shared && std::all_of(measured.begin(), measured.end(), [](double m) { return m > 0.0; });
+            if (!all_used) {
+                ok = false;
+                detail += ", " + std::to_string(measured.size()) + " devices computed experts, expected " + std::to_string(n_shared);
+            }
+            for (double m : measured) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), ", %.1f%%", m);
+                detail += buf;
+            }
+        }
+        LOG("LongHaul %s, expert split, %s: %s (%s)\n", label.c_str(), ec.name, ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    }
+    return all_ok;
+}
+
 static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
     const llm_arch arch = LLM_ARCH_BAILINGMOE3;
     if (!arch_matches(arch_filter, arch)) {
@@ -1900,6 +2023,7 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
 
         if (gpu2 != nullptr) {
             all_ok = test_longhaul_two_gpus(name, path, seed, stdev, gpu, gpu2, v.mixed ? reserve(2) : cache_size(5), tokens, logits_ref) && all_ok;
+            all_ok = test_longhaul_expert_split(name, path, seed, stdev, gpu, gpu2, v.mixed ? reserve(2) : cache_size(5), reserve(1), tokens, logits_ref) && all_ok;
         }
 
         if (v.mixed) {
@@ -2104,11 +2228,16 @@ static int test_longhaul_rpc(const std::string & arch_filter, const size_t seed,
             std::vector<ggml_backend_dev_t> devs;
             std::vector<float>              ts;
             size_t                          size;
+            llama_split_mode                split_mode = LLAMA_SPLIT_MODE_LAYER;
+            int32_t                         main_gpu   = 0;
         };
         const rpc_case cases[] = {
             { "RPC, 5 slots",            { rpc },      {},           size_5           },
             { "RPC, 512 MiB",            { rpc },      {},           512ull*1024*1024 },
             { "RPC + GPU 1/3, 5 slots",  { rpc, gpu }, { 1.0f, 3.0f }, 4*size_5       },
+            // the expert split: the RPC device computes 60% of the selected experts
+            { "expert split 60/40, layers on GPU", { rpc, gpu }, { 3.0f, 2.0f }, 4*size_5, LLAMA_SPLIT_MODE_EXPERT, 1 },
+            { "expert split 60/40, layers on RPC", { rpc, gpu }, { 3.0f, 2.0f }, 4*size_5, LLAMA_SPLIT_MODE_EXPERT, 0 },
         };
         for (size_t ic = 0; ic < sizeof(cases)/sizeof(cases[0]); ic++) {
             const rpc_case & rc = cases[ic];
@@ -2120,8 +2249,8 @@ static int test_longhaul_rpc(const std::string & arch_filter, const size_t seed,
             bool ok = true;
             std::string detail;
             try {
-                auto model_and_ctx = get_model_and_ctx(nullptr, nullptr, seed, stdev, rc.devs, LLAMA_SPLIT_MODE_LAYER, nullptr, rc.size,
-                    { rf.path }, rc.ts.empty() ? nullptr : rc.ts.data());
+                auto model_and_ctx = get_model_and_ctx(nullptr, nullptr, seed, stdev, rc.devs, rc.split_mode, nullptr, rc.size,
+                    { rf.path }, rc.ts.empty() ? nullptr : rc.ts.data(), rc.main_gpu);
                 const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
                 const double nmse_val = nmse(logits_ref, logits);
                 char buf[32];
@@ -2139,6 +2268,16 @@ static int test_longhaul_rpc(const std::string & arch_filter, const size_t seed,
                 detail = err.what();
             }
             llama_log_set(log_cb, log_ud);
+
+            // with the expert split both devices compute some of the selected experts (the router of the test model picks the same
+            // two experts for every token, which 60/40 gives to different devices)
+            if (rc.split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+                const std::vector<double> measured = get_measured_shares(log);
+                if (measured.size() != 2 || measured[0] <= 0.0 || measured[1] <= 0.0) {
+                    ok = false;
+                    detail += ", " + std::to_string(measured.size()) + " devices computed experts, expected 2";
+                }
+            }
 
             // the server reads the experts only from an exact copy
             const bool read_by_server = log.find("read by the server") != std::string::npos;

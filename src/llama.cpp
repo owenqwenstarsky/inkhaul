@@ -252,6 +252,12 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         }
     }
 
+    // the expert split keeps all devices, main_gpu is the device of the layers
+    if (params.split_mode == LLAMA_SPLIT_MODE_EXPERT && (params.main_gpu < 0 || params.main_gpu >= (int) model->devices.size())) {
+        LLAMA_LOG_ERROR("%s: invalid value for main_gpu with split_mode = expert: %d (available devices: %zu)\n", __func__, params.main_gpu, model->devices.size());
+        return false;
+    }
+
     for (const auto & dev : model->devices) {
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev.dev, &props);

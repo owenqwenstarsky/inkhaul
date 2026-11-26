@@ -1234,12 +1234,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * slots) const {
+          ggml_tensor * slots,
+              int32_t   cache_dev) const {
     ggml_tensor * w_s = model.get_w_scale(w);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w, cache_dev), cur, slots);
 
     if (w->type == GGML_TYPE_NVFP4) {
         ggml_prec_set_acc(res, GGML_PREC_BF16);
@@ -1249,7 +1250,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     prec_policy.apply(res, w);
 
     if (slots != nullptr) {
-        moe_cache->check_op(w, res);
+        moe_cache->check_op(w, res, cache_dev);
     }
 
     if (w_s) {
@@ -1802,14 +1803,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
-    // the experts selected by mm_ids, up to the down projection, from the MoE cache if mm_ids are slots
+    // the experts selected by mm_ids, up to the down projection, from the MoE cache of device cache_dev if mm_ids are slots
     // ids are the selected experts, for the biases and scales
-    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids) {
+    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, int32_t cache_dev) {
         ggml_tensor * up = nullptr;
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cache_dev); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (gate_up_exps_b) {
@@ -1824,7 +1825,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up", il);
         } else {
             // separate gate and up path
-            up = build_lora_mm_id(up_exps, cur, ids, mm_ids); // [n_ff, n_expert_used, n_tokens]
+            up = build_lora_mm_id(up_exps, cur, ids, mm_ids, cache_dev); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
             if (up_exps_b) {
@@ -1833,7 +1834,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (gate_exps) {
-                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids); // [n_ff, n_expert_used, n_tokens]
+                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids, cache_dev); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
@@ -1930,7 +1931,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cache_dev); // [n_embd, n_expert_used, n_tokens]
         cb(experts, "ffn_moe_down", il);
 
         if (amax_src1.scale_s) {
@@ -1940,52 +1941,92 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
-    ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots);
+    // the weighted sum of the outputs of the selected experts, [n_embd, n_tokens]
+    auto sum_experts = [&](ggml_tensor * experts) {
+        // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
+        if (post_exp_norm) {
+            experts = ggml_mul(ctx0, experts, post_exp_norm);
+            experts = ggml_rms_norm(ctx0, experts, post_exp_norm_eps);
+            cb(experts, "ffn_moe_post_exp_norm", il);
+        }
 
-    if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
-        cb(experts, "ffn_moe_down_biased", il);
-    }
+        experts = ggml_mul(ctx0, experts, weights);
+        cb(experts, "ffn_moe_weighted", il);
 
-    // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
-    if (post_exp_norm) {
-        experts = ggml_mul(ctx0, experts, post_exp_norm);
-        experts = ggml_rms_norm(ctx0, experts, post_exp_norm_eps);
-        cb(experts, "ffn_moe_post_exp_norm", il);
-    }
+        ggml_build_forward_expand(gf, experts);
 
-    experts = ggml_mul(ctx0, experts, weights);
-    cb(experts, "ffn_moe_weighted", il);
+        ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
-    ggml_build_forward_expand(gf, experts);
+        assert(n_expert_used > 0);
 
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+        // order the views before the adds
+        // Use per-layer n_expert_used to bound the graph even during warmup (avoids
+        // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
+        // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
+        const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+        for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
-    assert(n_expert_used > 0);
+            ggml_build_forward_expand(gf, cur_experts[i]);
+        }
 
-    // order the views before the adds
-    // Use per-layer n_expert_used to bound the graph even during warmup (avoids
-    // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
-    // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
-    for (uint32_t i = 0; i < n_expert_used_il; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        // aggregate experts
+        ggml_tensor * moe_out = cur_experts[0];
 
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
+        for (uint32_t i = 1; i < n_expert_used_il; ++i) {
+            moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
-    // aggregate experts
-    ggml_tensor * moe_out = cur_experts[0];
+            ggml_build_forward_expand(gf, moe_out);
+        }
 
-    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        if (n_expert_used_il == 1) {
+            // avoid returning a non-contiguous tensor
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
+        return moe_out;
+    };
 
-        ggml_build_forward_expand(gf, moe_out);
-    }
+    ggml_tensor * moe_out = nullptr;
 
-    if (n_expert_used_il == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx0, moe_out);
+    if (cache.parts.size() <= 1) {
+        const llama_moe_cache_part part = cache.parts.empty() ? llama_moe_cache_part{} : cache.parts[0];
+        ggml_tensor * experts = build_experts(cur, selected_experts, part.slots, part.dev);
+
+        if (down_exps_b) {
+            experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+            cb(experts, "ffn_moe_down_biased", il);
+        }
+
+        moe_out = sum_experts(experts);
+    } else {
+        // expert split: each device computes the selected experts it owns (the others have a slot of -1 and give zeros) and sums
+        // them, so that only [n_embd, n_tokens] crosses to the home backend, which adds the sums of the devices
+        // per-expert scales keep a skipped row at zero, a bias would not
+        // the devices other than the home device come first, so that their work is queued before the home device computes its part
+        GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && "the expert split does not support expert biases");
+        for (const llama_moe_cache_part & part : cache.parts) {
+            const int n_nodes_prev = ggml_graph_n_nodes(gf);
+
+            ggml_tensor * part_out = sum_experts(build_experts(cur, selected_experts, part.slots, part.dev));
+            ggml_build_forward_expand(gf, part_out);
+
+            // the new nodes run on the device of the part, except the slot lookup, which is already on the home backend
+            ggml_backend_t backend = moe_cache->backend(part.dev);
+            for (int i = n_nodes_prev; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node->view_src == nullptr && ggml_backend_sched_get_tensor_backend(sched, node) == nullptr) {
+                    ggml_backend_sched_set_tensor_backend(sched, node, backend);
+                }
+            }
+
+            if (moe_out == nullptr) {
+                moe_out = part_out;
+            } else {
+                moe_out = ggml_add(ctx0, moe_out, part_out);
+                ggml_backend_sched_set_tensor_backend(sched, moe_out, moe_cache->home());
+                ggml_build_forward_expand(gf, moe_out);
+            }
+        }
     }
 
     cb(moe_out, "ffn_moe_out", il);

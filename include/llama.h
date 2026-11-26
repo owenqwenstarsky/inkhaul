@@ -203,6 +203,7 @@ extern "C" {
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
         LLAMA_SPLIT_MODE_ROW    = 2, // split layers and KV across GPUs, use tensor parallelism if supported
         LLAMA_SPLIT_MODE_TENSOR = 3, // not supported, model loading fails
+        LLAMA_SPLIT_MODE_EXPERT = 4, // LongHaul only: every layer and the KV on main_gpu, the routed experts of each MoE layer split over the devices by tensor_split
     };
 
     enum llama_load_mode {
@@ -338,9 +339,11 @@ extern "C" {
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
+        // with LLAMA_SPLIT_MODE_EXPERT: the device of every layer and of the KV cache (an index into the devices of the model)
         int32_t main_gpu;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
+        // with LLAMA_SPLIT_MODE_EXPERT: the share of the experts of each MoE layer that each device computes
         const float * tensor_split;
 
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
@@ -402,6 +405,9 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t longhaul_cache_size; // LongHaul: device cache in bytes for the experts kept on disk (default: 512 MiB, must be > 0 for such models)
+        // LongHaul: cache size in bytes per device of the model, size: llama_max_devices(), 0 = not set (NULL: none set)
+        // longhaul_cache_size is then the total of the devices that are not set
+        const size_t * longhaul_cache_sizes;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

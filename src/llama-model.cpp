@@ -718,8 +718,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(n_layer_off + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_off + 1);
+
+    // the expert split: every layer and its KV on main_gpu, the output on the last device, the experts in the LongHaul cache of each device
+    const bool split_expert = split_mode == LLAMA_SPLIT_MODE_EXPERT;
+    if (split_expert) {
+        if (devices.empty()) {
+            throw std::runtime_error("split_mode = expert needs at least one GPU");
+        }
+        if (n_gpu_layers < n_layer_off + 1) {
+            throw std::runtime_error("split_mode = expert needs all layers on the GPU (n_gpu_layers)");
+        }
+        if (params.tensor_buft_overrides != nullptr && params.tensor_buft_overrides[0].pattern != nullptr) {
+            throw std::runtime_error("split_mode = expert does not support tensor buffer type overrides");
+        }
+    }
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        if (split_expert) {
+            auto * dev = il < n_layer_all ? devices.at(params.main_gpu).dev : devices.back().dev;
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+            return {dev, &pimpl->gpu_buft_list.at(dev)};
+        }
         const int ip = il < n_layer_all ? layer_phys(il) : n_layer_off;
         if (ip < i_gpu_start || (ip - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
@@ -932,6 +952,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_INFO("%s: LongHaul: %zu expert tensors, %.2f GiB kept on disk\n", __func__,
                 pimpl->longhaul.size(), longhaul_bytes/1024.0/1024.0/1024.0);
         }
+    }
+    if (split_expert && pimpl->longhaul.empty()) {
+        throw std::runtime_error("split_mode = expert needs a model with its experts on disk (LongHaul)");
     }
 
     // map each weight to its "<name>.scale" tensor: shape {1} for a 2D weight, {n_expert} for a 3D weight

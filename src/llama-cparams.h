@@ -48,6 +48,7 @@ struct llama_cparams {
     bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
 
     size_t longhaul_cache_size;
+    std::vector<size_t> longhaul_cache_sizes; // [n_devices] 0 = not set, empty if none set
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host

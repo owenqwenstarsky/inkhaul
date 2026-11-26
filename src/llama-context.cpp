@@ -215,6 +215,9 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.longhaul_cache_size = params.longhaul_cache_size;
+    if (params.longhaul_cache_sizes != nullptr) {
+        cparams.longhaul_cache_sizes.assign(params.longhaul_cache_sizes, params.longhaul_cache_sizes + model.n_devices());
+    }
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -455,7 +458,7 @@ llama_context::llama_context(
 
         if (model.has_longhaul()) {
             if (cparams.longhaul_cache_size > 0) {
-                moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.longhaul_cache_size);
+                moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.longhaul_cache_size, cparams.longhaul_cache_sizes);
 
                 // the experts on disk have no other path, so every ubatch must fit in the cache
                 const int64_t max_ubatch = moe_cache->max_ubatch();
@@ -3997,6 +4000,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.longhaul_cache_size         =*/ 512ull*1024*1024,
+        /*.longhaul_cache_sizes        =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
