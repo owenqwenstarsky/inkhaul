@@ -2711,6 +2711,9 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    if (moe_cache) {
+        moe_cache->begin_graph();
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {

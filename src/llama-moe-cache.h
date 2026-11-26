@@ -61,6 +61,9 @@ public:
     // aborts if device dev cannot compute op, an expert matmul that reads the cached experts of w
     void check_op(const ggml_tensor * w, const ggml_tensor * op, int32_t dev) const;
 
+    // call before each graph compute: with the expert split, moves experts between the devices toward the target shares
+    void begin_graph();
+
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 

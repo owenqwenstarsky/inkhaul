@@ -54,6 +54,16 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+// the largest NMSE of the rows of n values (the logits of one token), so that an error in a few tokens is not averaged away
+static double nmse_max_row(const std::vector<float> & a, const std::vector<float> & b, size_t n) {
+    GGML_ASSERT(a.size() == b.size() && n > 0 && a.size() % n == 0);
+    double res = 0.0;
+    for (size_t i0 = 0; i0 < a.size(); i0 += n) {
+        res = std::max(res, nmse(std::vector<float>(a.begin() + i0, a.begin() + i0 + n), std::vector<float>(b.begin() + i0, b.begin() + i0 + n)));
+    }
+    return res;
+}
+
 struct tensor_data_params {
     size_t seed;
     float  stdev;
@@ -1781,6 +1791,7 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
         size_t              size;
         std::vector<size_t> sizes; // per device, empty: none
         bool                fails;
+        bool                rebalance = false; // move experts toward the shares at every graph, off in the other cases
     };
     const expert_case cases[] = {
         { "50/50, layers on GPU 2",           { 1.0f, 1.0f }, 1, 2*size_dev,       {},           false },
@@ -1790,6 +1801,8 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
         { "50/50, 512 MiB",                   { 1.0f, 1.0f }, 1, 512ull*1024*1024, {},           false },
         { "50/50, smallest cache on GPU 1",   { 1.0f, 1.0f }, 1, size_dev,         { size_min, 0 }, false },
         { "50/50, too small cache on GPU 1",  { 1.0f, 1.0f }, 1, size_dev,         { size_min - 1, 0 }, true },
+        { "30/70, rebalanced",                { 3.0f, 7.0f }, 0, 4*size_dev,       {},           false, true },
+        { "30/70, rebalanced, smallest cache on GPU 1", { 3.0f, 7.0f }, 1, size_dev, { size_min, 0 }, false, true },
     };
     bool all_ok = true;
     for (const expert_case & ec : cases) {
@@ -1804,6 +1817,11 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
         bool ok = true;
         bool failed = false;
         std::string detail;
+        // read when the context is created
+        setenv("LLAMA_EXPERT_SHARE_REBALANCE", ec.rebalance ? "1" : "0", 1);
+        if (ec.rebalance) {
+            setenv("LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL", "1", 1);
+        }
         try {
             auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu, gpu2 }, LLAMA_SPLIT_MODE_EXPERT, nullptr, ec.size, {}, ec.ts,
                 ec.main_gpu, ec.sizes.empty() ? nullptr : ec.sizes.data());
@@ -1821,20 +1839,25 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
 
             const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
             // also decode and small batches after a prompt
-            const double nmse_val = std::max(nmse(logits_ref, logits),
-                nmse(logits_ref, get_logits_steps(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, 100)));
-            char buf[32];
-            snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+            const std::vector<float> logits_steps = get_logits_steps(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, 100);
+            const double nmse_val = std::max(nmse(logits_ref, logits), nmse(logits_ref, logits_steps));
+            // per token, so that a wrong expert in a few tokens shows up (e.g. a slot that a move left to the old device)
+            const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+            const double nmse_row = std::max(nmse_max_row(logits_ref, logits, n_vocab), nmse_max_row(logits_ref, logits_steps, n_vocab));
+            char buf[64];
+            snprintf(buf, sizeof(buf), "NMSE %.2e, per token at most %.2e", nmse_val, nmse_row);
             detail += buf;
             // the same backend as the reference, only the order of the sums differs: tighter than across backends, so that
             // rows of skipped experts that are not zeroed show up
-            ok = ok && nmse_val <= 1e-5;
+            ok = ok && nmse_val <= 1e-5 && nmse_row <= 1e-5;
         } catch (const std::exception & err) {
             failed = true;
             detail = err.what();
         }
         fclose(file);
         llama_log_set(log_cb, log_ud);
+        unsetenv("LLAMA_EXPERT_SHARE_REBALANCE");
+        unsetenv("LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL");
 
         // the reason of a failed load is in the log
         if (failed) {
@@ -1863,6 +1886,18 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
                 char buf[32];
                 snprintf(buf, sizeof(buf), ", %.1f%%", m);
                 detail += buf;
+            }
+            // without the rebalance no expert moves
+            size_t n_moved = 0;
+            for (size_t pos = log.find(", moved in "); pos != std::string::npos; pos = log.find(", moved in ", pos + 1)) {
+                size_t in = 0;
+                if (sscanf(log.c_str() + pos, ", moved in %zu", &in) == 1) {
+                    n_moved += in;
+                }
+            }
+            detail += ", " + std::to_string(n_moved) + " moved";
+            if (!ec.rebalance && n_moved > 0) {
+                ok = false;
             }
         }
         LOG("LongHaul %s, expert split, %s: %s (%s)\n", label.c_str(), ec.name, ok ? "OK" : "FAIL", detail.c_str());

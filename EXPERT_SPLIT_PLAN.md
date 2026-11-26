@@ -1,6 +1,6 @@
 # Plan: expert split over several laptops
 
-Status: phases 1 and 2 committed, phases 3-5 open. Builds on THUNDERBOLT_PLAN.md (commit e9e55df).
+Status: phases 1 to 3 committed, phases 4 and 5 open. Builds on THUNDERBOLT_PLAN.md (commit e9e55df).
 
 ## 1. Goal
 
@@ -272,4 +272,26 @@ Changes from the plan:
 - The RPC servers must run on Metal: a CUDA server would not skip the experts of the other devices, and the client cannot see the backend of a server. The docs say so.
 
 Not done: the measurement of layer split vs expert split on the two laptops. That needs your laptops and is not an in-memory test. The commands are in `docs/longhaul.md` ("Layer split or expert split").
+
+## 12. Phase 3 results (2026-11-25)
+
+Done:
+- `llama_expert_share_rebalance` (`src/llama-expert-share.cpp`): the rule of 3.6 as a pure function. It returns the moves and applies them to the owner table.
+- `moe_cache_lru::drop` frees the slot of a moved expert and puts it at the front of list 0, where `victim()` looks first. The CRF of the expert is kept.
+- `llama_moe_cache::begin_graph()`, called by `llama_context::graph_compute` before each graph compute. It checks the layers with at least 512 new selections. The copy of the first part of each layer counts the selections it already reads, and halves the counts of a layer every 4096 selections.
+- The exit line per device shows the experts it owns at exit (average over the layers) and the moves in and out.
+- Env: `LLAMA_EXPERT_SHARE_REBALANCE=0` turns it off, `LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL=N` sets the selections between checks (for tests).
+
+Tests:
+- `test-expert-share`: convergence to within 2 points on Zipf-like counts (2 and 3 devices, 128 to 512 experts), each move makes the sum of the gaps smaller, the caps and `max_moves` hold, no move within the tolerance or without counts, deterministic, no move to a device with a cap of 0, the cached preference, the 1.5x limit, swaps at the cap, and alternating routing with halved counts (6 moves in the first 100 checks, 0 in the next 100). OK.
+- `GGML_METAL_DEVICES=2 test-llama-archs -a 'inkling2|qwen35moe|bailingmoe3' -s 1`: exit 0, 261 OK, 0 FAIL. Two new cases per file: 30/70 with a check at every graph, with 4 times the 5-slot cache and with the smallest cache on the device of 30%. For qwen35moe the measured share goes from 26.0/74.0 (no rebalance) to 29.0/71.0 (2 moves), and to 31.7/68.3 with the smallest cache (52 moves, mostly swaps). The other cases now run with the rebalance off and check that nothing moves.
+- One device: 93 OK. `--rpc`: 20 OK.
+
+Mutation check (reverted): `drop` that frees the slot but leaves the expert's slot map entry, so that an expert that moves back reads a slot that holds another expert. The NMSE over all logits only went from 2.2e-07 to 2.8e-06, under the 1e-5 threshold. The expert-split cases now also check the NMSE of each token's logits (at most 1.4e-06 on correct code), which catches it with 4.2e-05.
+
+Changes from the plan:
+- Swaps: when the device below its target already owns its cap of experts, a step swaps an expert of each device, so that the counts do not change. Without them, a device whose cache has fewer slots than it owns experts could never take experts. A swap counts as two of the 2 moves of a check.
+- The preference for experts that are not cached is a penalty (a cached expert counts as a quarter of the gap further away), not a strict order: a strict order would move small uncached experts first and need many more checks.
+- No RPC case with moves: the RPC test models route every token to the same two experts, which 60/40 already splits one each, so no move fits. The moves use the same host-side LRU and fill paths as the RPC cases that pass.
+- The measured share at exit on a real prompt (the "done when" of phase 3) needs your laptops.
 

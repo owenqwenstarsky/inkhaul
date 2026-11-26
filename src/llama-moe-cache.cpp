@@ -89,12 +89,9 @@ struct moe_cache_lru {
         seen.assign(n_expert, 0);
     }
 
-    // move slot s to the most recently used end of list c
-    void move(int32_t s, int c) {
+    // remove slot s from its list
+    void unlink(int32_t s) {
         const int from = list_of[s];
-        if (from == c && s == tail[from]) {
-            return;
-        }
         if (prev[s] >= 0) {
             next[prev[s]] = next[s];
         } else {
@@ -105,6 +102,15 @@ struct moe_cache_lru {
         } else {
             tail[from] = prev[s];
         }
+    }
+
+    // move slot s to the most recently used end of list c
+    void move(int32_t s, int c) {
+        const int from = list_of[s];
+        if (from == c && s == tail[from]) {
+            return;
+        }
+        unlink(s);
 
         prev[s] = tail[c];
         next[s] = -1;
@@ -182,6 +188,30 @@ struct moe_cache_lru {
             GGML_ABORT("no MoE cache victim");
         }
         return res;
+    }
+
+    // remove expert e of layer il from the cache, its slot is the next victim (its CRF is kept)
+    void drop(int32_t il, int32_t e) {
+        int32_t * slots = slot_map[il];
+        const int32_t s = slots[e];
+        if (s >= n_slots) {
+            return;
+        }
+        slots[e]  = empty;
+        key_of[s] = -1;
+        n_filled--;
+
+        // to the least recently used end of list 0, where victim() looks first
+        unlink(s);
+        prev[s] = -1;
+        next[s] = head[0];
+        if (head[0] >= 0) {
+            prev[head[0]] = s;
+        } else {
+            tail[0] = s;
+        }
+        head[0] = s;
+        list_of[s] = 0;
     }
 
     struct fill {
@@ -401,6 +431,8 @@ struct llama_moe_cache::impl {
         int32_t n_owned = 0;   // experts it owns per layer, all of them without the expert split
         int32_t n_ubatch_reserved = 0; // tokens per ubatch that every group can hold before the rest is shared
         stats st;
+        size_t moved_in  = 0; // expert split: experts moved to this device by the rebalance
+        size_t moved_out = 0;
 
         // banks and their views
         ggml_context_ptr ctx;
@@ -467,6 +499,16 @@ struct llama_moe_cache::impl {
     bool split_expert = false;
     ggml_backend_t home = nullptr;
     std::vector<std::vector<int32_t>> owner_dev; // [n_layer][n_expert] for the layers with their own experts
+
+    // expert split: the rebalance of owner_dev toward the target shares, see begin_graph()
+    static constexpr int64_t rebalance_halve = 4096; // selections of a layer after which its counts are halved, so that old routing fades
+    static constexpr double  rebalance_tol   = 0.02; // no move while every device is within 2 points of its target
+    static constexpr int     rebalance_moves = 2;    // the most moves per layer per check
+    bool    rebalance = false;
+    int64_t rebalance_interval = 512; // selections of a layer between two checks
+    std::vector<std::vector<uint32_t>> sel_count; // [n_layer][n_expert] selections of each expert of the layers with their own experts
+    std::vector<int64_t> sel_since_halve;         // [n_layer]
+    std::vector<int64_t> sel_since_check;         // [n_layer]
 
     std::vector<int32_t> ids;     // the selected experts of the current layer, read by the copy of its first part
     int64_t ids_n_tokens = 0;
@@ -554,6 +596,16 @@ struct llama_moe_cache::impl {
         for (size_t il = 0; il < model.layers.size(); ++il) {
             owner_dev[il] = owners;
         }
+
+        // LLAMA_EXPERT_SHARE_REBALANCE=0 keeps the initial owners, LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL sets the selections between checks (for tests)
+        const char * env = getenv("LLAMA_EXPERT_SHARE_REBALANCE");
+        rebalance = env == nullptr || atoi(env) != 0;
+        if (const char * env_interval = getenv("LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL")) {
+            rebalance_interval = std::max(1, atoi(env_interval));
+        }
+        sel_count.assign(model.layers.size(), std::vector<uint32_t>(n_expert, 0));
+        sel_since_halve.assign(model.layers.size(), 0);
+        sel_since_check.assign(model.layers.size(), 0);
     }
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts,
@@ -1157,6 +1209,9 @@ struct llama_moe_cache::impl {
             if (trace != nullptr) {
                 write_trace(il, n_used);
             }
+            if (split_expert && rebalance) {
+                count_selections(l.owner);
+            }
             l.next_part = 1;
         } else {
             GGML_ASSERT(l.next_part == ip && "the parts of a layer are copied in order");
@@ -1277,6 +1332,77 @@ struct llama_moe_cache::impl {
         return true;
     }
 
+    // expert split: count the selected experts of the layer that owns them, for the rebalance
+    void count_selections(int32_t owner) {
+        std::vector<uint32_t> & cnt = sel_count[owner];
+        for (const int32_t e : ids) {
+            GGML_ASSERT(e >= 0 && e < (int32_t) cnt.size());
+            cnt[e]++;
+        }
+        sel_since_check[owner] += ids.size();
+        sel_since_halve[owner] += ids.size();
+        if (sel_since_halve[owner] >= rebalance_halve) {
+            for (uint32_t & c : cnt) {
+                c /= 2;
+            }
+            sel_since_halve[owner] = 0;
+        }
+    }
+
+    // the part of layer il on device dev, nullptr if none
+    const part * part_on(int32_t il, int32_t dev) const {
+        for (const part & p : layers[il].parts) {
+            if (groups[p.ig].id == dev) {
+                return &p;
+            }
+        }
+        return nullptr;
+    }
+
+    // expert split: between two graphs, move experts between the devices of the layers that had enough selections since their
+    // last check, so that the share of the selections of each device gets closer to its target
+    // never during a graph, so that all devices plan a layer with the same owners
+    void begin_graph() {
+        if (!split_expert || !rebalance) {
+            return;
+        }
+        const size_t n_expert = model.hparams.n_expert;
+        std::vector<double>  counts(n_expert);
+        std::vector<double>  targets(devices.size());
+        std::vector<int32_t> caps(devices.size());
+        std::vector<bool>    cached(n_expert);
+        for (size_t d = 0; d < devices.size(); ++d) {
+            targets[d] = devices[d].share;
+        }
+        for (size_t il = 0; il < layers.size(); ++il) {
+            const layer & l = layers[il];
+            if (l.parts.empty() || l.owner != (int32_t) il || sel_since_check[il] < rebalance_interval) {
+                continue;
+            }
+            sel_since_check[il] = 0;
+
+            // a device takes experts up to its group's slots, or up to its initial count, so that max_ubatch() stays valid
+            std::fill(caps.begin(), caps.end(), 0);
+            for (const part & p : l.parts) {
+                const group & g = groups[p.ig];
+                caps[g.id] = std::max(devices[g.id].n_owned, g.n_slots);
+            }
+            std::vector<int32_t> & own = owner_dev[il];
+            for (size_t e = 0; e < n_expert; ++e) {
+                counts[e] = sel_count[il][e];
+                const part * p = part_on((int32_t) il, own[e]);
+                GGML_ASSERT(p != nullptr);
+                const moe_cache_lru & lru = groups[p->ig].lru;
+                cached[e] = lru.slot_map[il][e] < lru.n_slots;
+            }
+            for (const llama_expert_move & mv : llama_expert_share_rebalance(counts, own, targets, caps, cached, rebalance_tol, rebalance_moves)) {
+                groups[part_on((int32_t) il, mv.from)->ig].lru.drop((int32_t) il, mv.expert);
+                devices[mv.from].moved_out++;
+                devices[mv.to].moved_in++;
+            }
+        }
+    }
+
     void log_stats() const {
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
@@ -1298,15 +1424,26 @@ struct llama_moe_cache::impl {
         for (const device & d : devices) {
             n_used += d.st.n_used;
         }
-        for (const device & d : devices) {
+        for (size_t id = 0; id < devices.size(); ++id) {
+            const device & d = devices[id];
             if (d.n_owned == 0 || n_used == 0) {
                 continue;
             }
+            // the experts it owns now, on average over the layers with their own experts
+            size_t n_owned = 0;
+            size_t n_layer = 0;
+            for (size_t il = 0; il < layers.size(); ++il) {
+                if (!layers[il].parts.empty() && layers[il].owner == (int32_t) il) {
+                    n_owned += std::count(owner_dev[il].begin(), owner_dev[il].end(), (int32_t) id);
+                    n_layer++;
+                }
+            }
             const stats & st = d.st;
             const size_t n = st.hits + st.misses;
-            LLAMA_LOG_INFO("llama_moe_cache: %s: share target %.1f%%, measured %.1f%%, %d of %u experts per layer, hits = %zu, misses = %zu, hit rate = %.2f%%, read = %.2f MiB%s\n",
-                d.name.c_str(), 100.0*d.share, 100.0*st.n_used/n_used, d.n_owned, model.hparams.n_expert,
-                st.hits, st.misses, n > 0 ? 100.0*st.hits/n : 0.0, st.bytes/1024.0/1024.0, d.server_files.empty() ? "" : " (by the server)");
+            LLAMA_LOG_INFO("llama_moe_cache: %s: share target %.1f%%, measured %.1f%%, %.1f of %u experts per layer, hits = %zu, misses = %zu, hit rate = %.2f%%, read = %.2f MiB%s, moved in %zu, out %zu\n",
+                d.name.c_str(), 100.0*d.share, 100.0*st.n_used/n_used, n_layer > 0 ? (double) n_owned/n_layer : 0.0, model.hparams.n_expert,
+                st.hits, st.misses, n > 0 ? 100.0*st.hits/n : 0.0, st.bytes/1024.0/1024.0, d.server_files.empty() ? "" : " (by the server)",
+                d.moved_in, d.moved_out);
         }
     }
 };
@@ -1324,6 +1461,10 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w, int32_t dev) c
 
 ggml_backend_t llama_moe_cache::backend(int32_t dev) const {
     return pimpl->devices.at(dev).backend;
+}
+
+void llama_moe_cache::begin_graph() {
+    pimpl->begin_graph();
 }
 
 ggml_backend_t llama_moe_cache::home() const {
