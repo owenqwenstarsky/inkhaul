@@ -1716,6 +1716,31 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.longhaul_cache_sizes.clear();
     }
 
+    // the tensor split pays a sync per layer, which a small draft model cannot earn back: without -devd,
+    // the draft model goes whole on the first local GPU (the GPU of rank 0 with --tp-host), not through RPC
+    if (has_draft && result.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        if (params_spec.devices.empty()) {
+            ggml_backend_dev_t local = nullptr;
+            for (size_t i = 0; i < ggml_backend_dev_count() && local == nullptr; i++) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                const auto type = ggml_backend_dev_type(dev);
+                if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                        std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev))) != "RPC") {
+                    local = dev;
+                }
+            }
+            if (local == nullptr && !params.devices.empty() && params.devices[0] != nullptr) {
+                local = params.devices[0];
+            }
+            if (local != nullptr) {
+                result.devices = { local, nullptr };
+            }
+        }
+        result.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        result.main_gpu   = 0;
+        std::fill(std::begin(result.tensor_split), std::end(result.tensor_split), 0.0f);
+    }
+
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;

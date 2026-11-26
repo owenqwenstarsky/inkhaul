@@ -411,7 +411,8 @@ static int timeout_child() {
     ggml_backend_load_all();
     ggml_backend_dev_t gpus[2];
     get_gpus(gpus);
-    if (gpus[0] == nullptr) {
+    if (gpus[0] == nullptr || gpus[1] == gpus[0]) {
+        printf("timeout child: SKIP\n"); // the test delay is only on the async path, which needs two GPUs
         return 0;
     }
     rpc_pair pair;
@@ -492,6 +493,10 @@ static bool test_timeout(const char * argv0) {
     }
     const int status = pclose(p);
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (status == 0 && out.find("timeout child: SKIP") != std::string::npos) {
+        printf("timeout: SKIP (needs two GPUs, GGML_METAL_DEVICES=2 gives two)\n");
+        return true;
+    }
     const bool failed_run = status != 0;
     const bool message    = out.find("failed or timed out") != std::string::npos;
     const bool ok = failed_run && message && s < 30.0;

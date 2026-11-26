@@ -86,3 +86,12 @@ Payloads of 32768 values or more (prompt processing) go over the wire in bf16. E
 - Two servers on one Mac must use different devices (for example `GGML_METAL_DEVICES=2` and `-d MTL0`, `-d MTL1`). On one device both servers share one GPU queue, so each GPU would wait for the other forever; Metal then stops the queue with a GPU timeout error.
 - Over RDMA (Thunderbolt 5) the servers keep the ordered exchange (rank 0 sends first); the same-time exchange is for TCP.
 - The client sends the small commands of a pass in fewer TCP sends: each command goes out in one send, and the commands already queued behind it share that send.
+
+## Speculative decoding
+
+A pass checks all the guessed tokens of a draft at once, so it pays the same syncs per layer for several tokens. That makes the split pass cheaper per token, and it is the best way to get more tokens per second out of two Macs on one stream.
+
+- n-gram speculation (`--spec-type ngram-simple`, `ngram-mod`, ...) needs no extra model and no extra memory. It helps when the output repeats the prompt (code edits, summaries with quotes).
+- A draft model (`-md`) runs whole on the first local GPU by default (the GPU behind `--tp-host`), not split and not through RPC: a small model cannot earn back a sync per layer. Set `-devd` to put it elsewhere.
+- DSpark (`--spec-type draft-dspark`) reads the inputs of some target layers. With a split target those come from host copies, because the draft is on another device than the target's meta buffer. This works for Qwen 3.5 targets (tested). Inkling 2 targets do not record layer inputs in this build, so DSpark stops with an assert there, also on one Mac.
+- The gain on two Macs is not measured yet. Compare with `llama-bench` or `llama-speculative` before and after `--spec-type`.

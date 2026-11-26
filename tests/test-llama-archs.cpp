@@ -2669,6 +2669,82 @@ static int test_tensor_syncs(const std::string & arch_filter, const size_t seed,
     return all_ok ? 0 : 1;
 }
 
+// a DSpark draft reads the inputs of some target layers: from host copies, or from a device buffer of the target;
+// with a tensor split target both must work (the draft on its own GPU falls back to the host copies)
+static int test_tensor_layer_inp(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    std::vector<llm_arch> archs;
+    for (const llm_arch arch : { LLM_ARCH_QWEN35, LLM_ARCH_QWEN35MOE }) { // the archs that record layer inputs
+        if (arch_matches(arch_filter, arch)) {
+            archs.push_back(arch);
+        }
+    }
+    if (archs.empty()) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu  = get_gpu(target_backend, nullptr);
+    ggml_backend_dev_t gpu2 = target_backend == nullptr ? get_gpu(nullptr, gpu) : nullptr;
+    if (gpu == nullptr || gpu2 == nullptr) {
+        LOG("Tensor layer inputs: SKIP (needs two GPUs, GGML_METAL_DEVICES=2 gives two)\n");
+        return 0;
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(64, 128, seed);
+    const uint32_t lids[] = { 0, 1 };
+    bool all_ok = true;
+    for (const llm_arch arch : archs) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, arch == LLM_ARCH_QWEN35MOE, 0, 256);
+        // returns the logits, and the layer inputs from the host copies unless dev
+        auto run = [&](const std::vector<ggml_backend_dev_t> & devs, llama_split_mode split_mode, bool dev,
+                std::vector<std::vector<float>> & inps) {
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, devs, split_mode);
+            llama_context * lctx = model_and_ctx.second.get();
+            for (const uint32_t lid : lids) {
+                llama_set_embeddings_layer_inp(lctx, lid, true);
+            }
+            if (dev) {
+                llama_set_embeddings_layer_inp_dev(lctx, true);
+            }
+            std::vector<float> logits = get_logits(model_and_ctx.first.get(), lctx, tokens);
+            inps.clear();
+            if (!dev) {
+                const size_t n = (size_t) llama_model_n_embd(model_and_ctx.first.get())*tokens.size();
+                for (const uint32_t lid : lids) {
+                    const float * inp = llama_get_embeddings_layer_inp(lctx, lid);
+                    if (inp == nullptr) {
+                        throw std::runtime_error("layer input " + std::to_string(lid) + " not extracted");
+                    }
+                    inps.emplace_back(inp, inp + n);
+                }
+            }
+            return logits;
+        };
+        bool ok = true;
+        std::string detail;
+        try {
+            std::vector<std::vector<float>> inps_ref;
+            std::vector<std::vector<float>> inps_meta;
+            std::vector<std::vector<float>> inps_dev;
+            const std::vector<float> logits_ref  = run({ gpu },       LLAMA_SPLIT_MODE_LAYER,  false, inps_ref);
+            const std::vector<float> logits_meta = run({ gpu, gpu2 }, LLAMA_SPLIT_MODE_TENSOR, false, inps_meta);
+            const std::vector<float> logits_dev  = run({ gpu, gpu2 }, LLAMA_SPLIT_MODE_TENSOR, true,  inps_dev);
+            double worst = std::max(nmse(logits_ref, logits_meta), nmse(logits_ref, logits_dev));
+            for (size_t k = 0; k < inps_ref.size(); k++) {
+                worst = std::max(worst, nmse(inps_ref[k], inps_meta[k]));
+            }
+            char buf[48];
+            snprintf(buf, sizeof(buf), "worst NMSE %.2e", worst);
+            detail = buf;
+            ok = worst <= 1e-6;
+        } catch (const std::exception & err) {
+            ok = false;
+            detail = err.what();
+        }
+        LOG("Tensor layer inputs %s: %s (%s)\n", llama_arch_name(arch), ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    }
+    return all_ok ? 0 : 1;
+}
+
 // Ling 3 rotates adjacent pairs: a bailingmoe3 model ropes with NORM (one position per token) even with the mrope sections of the VL files
 static int test_rope_type(const std::string & arch_filter, const size_t seed, const float stdev) {
     if (!arch_matches(arch_filter, LLM_ARCH_BAILINGMOE3)) {
@@ -3105,6 +3181,7 @@ int main(int argc, char ** argv) {
         int ret = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
         ret = test_rope_type(arch_filter, seed, stdev) != 0 ? 1 : ret;
         ret = test_tensor_syncs(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        ret = test_tensor_layer_inp(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_longhaul(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         return test_longhaul_bailingmoe3(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
     } catch (const std::exception & err) {

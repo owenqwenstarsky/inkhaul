@@ -229,6 +229,24 @@ int main(void) {
         assert(draft.longhaul_cache_sizes.empty());
     }
 
+    // a draft model leaves the tensor split, by default it goes whole on the first local GPU
+    {
+        assert(parse_ok({ "-sm", "tensor", "-ts", "3,1" }, params));
+        params.speculative.draft.mparams.path = "draft.gguf";
+        const common_params draft = common_base_params_to_speculative(params);
+        assert(draft.split_mode == LLAMA_SPLIT_MODE_LAYER);
+        assert(devices_of(draft).size() == 1 && devices_of(draft)[0] == devs[0]);
+        assert(draft.main_gpu == 0);
+        assert(draft.tensor_split[0] == 0.0f);
+        // -devd (only parsed by the speculative examples) still wins
+        assert(parse_ok({ "-sm", "tensor" }, params));
+        params.speculative.draft.mparams.path = "draft.gguf";
+        params.speculative.draft.devices = { devs[1], nullptr };
+        const common_params draft_d1 = common_base_params_to_speculative(params);
+        assert(draft_d1.split_mode == LLAMA_SPLIT_MODE_LAYER);
+        assert(devices_of(draft_d1).size() == 1 && devices_of(draft_d1)[0] == devs[1]);
+    }
+
     // invalid splits
     assert(parse_fails({ "-es", "100" }));                       // one share for several devices
     assert(parse_fails({ "-es", d0 + "=60," + d1 + "=60" }));    // over 100%

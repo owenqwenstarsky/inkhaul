@@ -524,3 +524,18 @@ Tests, all OK:
   - Right sums gave at most 2e-8.
   - A mutation that drops the peer's partial gave 2.5e-6 to 7e-5 depending on the seed and the model, so the old limit let it pass for `qwen35` and `inkling2`.
   - With the new limit all 12 cases fail under that mutation.
+
+## 18. Phase 5 results (2026-11-26)
+
+Done:
+- With `-sm tensor` a draft model is not split. Without `-devd` it goes whole on the first local GPU (not RPC), or on the first target device if there is none (`common_base_params_to_speculative`). With `-devd` the given devices win. Split mode, main GPU and `-ts` of the draft are reset.
+- `docs/tensor-parallel.md` has a section on speculative decoding: n-gram, draft model, DSpark.
+
+Found:
+- DSpark reads target layer inputs through `t_layer_inp`, which only `qwen35`, `qwen35moe` and `bailingmoe3` set. An `inkling2` target asserts in `set_outputs` (`layer input tensor is null`), also on one GPU. This was there before this plan. The fix is to record the layer input in `llama_model_inkling2::graph`, but which tensor the shipped draft was trained on must be checked first, so it is not done here.
+
+Tests, all OK:
+- `test-arg-expert-split`: `-sm tensor -ts 3,1` gives a layer split draft on the first device, and set draft devices win.
+- `test-llama-archs` with two devices, "Tensor layer inputs" for `qwen35` and `qwen35moe`: logits and layer inputs of a Meta context match one GPU (NMSE ~1e-17), on the host copy path and the device buffer path.
+
+Not done: the measured gain. It needs the laptops.
