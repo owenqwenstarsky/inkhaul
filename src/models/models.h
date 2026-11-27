@@ -331,6 +331,32 @@ struct llama_model_qwen35moe : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_model_kolibri1 : public llama_model_base {
+    llama_model_kolibri1(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    class llm_graph_input_sparse;
+
+    struct graph : public llm_graph_context {
+        graph(const llm_graph_params & params);
+
+        // sparse attention of a full-attention layer of Kolibri-1.1
+        //   pool: in: key pool of the closest preceding indexer, out: the key pool for the next reindexers
+        ggml_tensor * build_attn_sparse(
+                llm_graph_input_attn_kv_iswa * inp_attn,
+                llm_graph_input_sparse * inp_sparse,
+                ggml_tensor * q_cur,  // [n_embd_head, n_head,    n_tokens]
+                ggml_tensor * k_cur,  // [n_embd_head, n_head_kv, n_tokens], nullptr for layers reading another layer's K/V
+                ggml_tensor * v_cur,  // [n_embd_head, n_head_kv, n_tokens], nullptr for layers reading another layer's K/V
+                ggml_tensor * & pool, // F16 [n_kv, n_tokens]
+                        float   kq_scale,
+                          int   il) const;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_bailingmoe3 : public llama_model_base {
     llama_model_bailingmoe3(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

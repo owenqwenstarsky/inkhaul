@@ -24,6 +24,7 @@ enum llm_type {
     LLM_TYPE_UNKNOWN,
     LLM_TYPE_7_9B_A1_3B,
     LLM_TYPE_124B_A5_1B,
+    LLM_TYPE_78B_A3_5B,  // Kolibri1
 };
 
 std::string llama_rope_scaling_type_name(llama_rope_scaling_type rope_scaling_type);
