@@ -103,11 +103,15 @@ bool llama_supports_gpu_offload(void) {
         ggml_backend_load_all();
     }
     return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
-           ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr;
+           ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr ||
+           llama_supports_rpc();
 }
 
 bool llama_supports_rpc(void) {
-    return false;
+    if (!ggml_backend_reg_count()) {
+        ggml_backend_load_all();
+    }
+    return ggml_backend_reg_by_name("RPC") != nullptr;
 }
 
 const char * llama_version(void) {
@@ -153,10 +157,54 @@ int64_t llama_time_us(void) {
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
     if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR is not supported\n", __func__);
-        return false;
-    }
-    if (params.devices) {
+        // one meta device over the given devices, or over all GPUs (RPC first, like the other modes)
+        std::vector<ggml_backend_dev_t> devs;
+        if (params.devices) {
+            for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+                devs.push_back(*dev);
+            }
+        } else {
+            std::vector<ggml_backend_dev_t> rpc;
+            std::vector<ggml_backend_dev_t> gpus;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                const auto type = ggml_backend_dev_type(dev);
+                if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    continue;
+                }
+                const bool is_rpc = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) == std::string("RPC");
+                (is_rpc ? rpc : gpus).push_back(dev);
+            }
+            devs = rpc;
+            devs.insert(devs.end(), gpus.begin(), gpus.end());
+        }
+        if (devs.empty()) {
+            LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 GPU devices\n", __func__);
+            return false;
+        }
+        if (devs.size() > GGML_BACKEND_META_MAX_DEVICES) {
+            LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR supports at most %d devices\n", __func__, GGML_BACKEND_META_MAX_DEVICES);
+            return false;
+        }
+        // the servers sum between each other only when every device is an RPC device
+        size_t n_rpc = 0;
+        for (ggml_backend_dev_t dev : devs) {
+            n_rpc += ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) == std::string("RPC");
+        }
+        if (n_rpc > 0 && n_rpc < devs.size()) {
+            LLAMA_LOG_WARN("%s: RPC and local devices are mixed, so the sums of every layer go through this process (slow); "
+                "run an RPC server on this machine too and give only RPC devices, e.g. -dev RPC0,RPC1\n", __func__);
+        }
+        LLAMA_LOG_INFO("%s: creating a meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
+        for (size_t i = 0; i < devs.size(); ++i) {
+            LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
+        }
+        model->get_split_state_ud.n_devices = devs.size();
+        model->get_split_state_ud.model     = model;
+        model->devices.push_back({
+            true, ggml_backend_meta_device(devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
+        });
+    } else if (params.devices) {
         for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
             model->devices.push_back({false, *dev});
         }
@@ -166,6 +214,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         // build list of available devices
         std::vector<llama_device> gpus;
         std::vector<llama_device> igpus;
+        std::vector<llama_device> rpc_servers;
 
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -176,26 +225,31 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     break;
 
                 case GGML_BACKEND_DEVICE_TYPE_GPU: {
-                    // check if there is already a GPU with the same device id
-                    ggml_backend_dev_props props;
-                    ggml_backend_dev_get_props(dev, &props);
-                    auto it = std::find_if(gpus.begin(), gpus.end(), [&props](const llama_device & d) {
-                        ggml_backend_dev_props d_props;
-                        ggml_backend_dev_get_props(d.dev, &d_props);
-                        if (props.device_id && d_props.device_id) {
-                            return strcmp(props.device_id, d_props.device_id) == 0;
-                        }
-                        return false;
-                    });
-
-                    if (it != gpus.end()) {
-                        LLAMA_LOG_INFO("%s: skipping device %s (%s) with id %s - already using device %s (%s) with the same id\n",
-                                __func__,
-                                ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-                                props.device_id ? props.device_id : "unknown id",
-                                ggml_backend_dev_name(it->dev), ggml_backend_dev_description(it->dev));
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    if (ggml_backend_reg_name(reg) == std::string("RPC")) {
+                        rpc_servers.push_back({false, dev});
                     } else {
-                        gpus.push_back({false, dev});
+                        // check if there is already a GPU with the same device id
+                        ggml_backend_dev_props props;
+                        ggml_backend_dev_get_props(dev, &props);
+                        auto it = std::find_if(gpus.begin(), gpus.end(), [&props](const llama_device & d) {
+                            ggml_backend_dev_props d_props;
+                            ggml_backend_dev_get_props(d.dev, &d_props);
+                            if (props.device_id && d_props.device_id) {
+                                return strcmp(props.device_id, d_props.device_id) == 0;
+                            }
+                            return false;
+                        });
+
+                        if (it != gpus.end()) {
+                            LLAMA_LOG_INFO("%s: skipping device %s (%s) with id %s - already using device %s (%s) with the same id\n",
+                                    __func__,
+                                    ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                                    props.device_id ? props.device_id : "unknown id",
+                                    ggml_backend_dev_name(it->dev), ggml_backend_dev_description(it->dev));
+                        } else {
+                            gpus.push_back({false, dev});
+                        }
                     }
                     break;
                 }
@@ -214,13 +268,38 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
         }
 
+        // add RPC servers at the front of the list to minimize network transfers
+        model->devices.insert(model->devices.begin(), rpc_servers.begin(), rpc_servers.end());
+
         // add GPUs
         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
 
         // add integrated GPUs only if no discrete GPUs were found
+        // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
         if (gpus.empty()) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
+    }
+
+    // kv_gpu: a device for the KV cache and the attention of the full-attention layers, it gets no layers
+    if (params.kv_gpu >= 0) {
+        if (params.kv_gpu >= (int) model->devices.size()) {
+            LLAMA_LOG_ERROR("%s: invalid value for kv_gpu: %d (available devices: %zu)\n", __func__, params.kv_gpu, model->devices.size());
+            return false;
+        }
+        if (params.split_mode != LLAMA_SPLIT_MODE_LAYER && params.split_mode != LLAMA_SPLIT_MODE_NONE) {
+            LLAMA_LOG_ERROR("%s: kv_gpu needs split_mode = layer or none\n", __func__);
+            return false;
+        }
+        if (params.split_mode == LLAMA_SPLIT_MODE_NONE && params.main_gpu == params.kv_gpu) {
+            LLAMA_LOG_ERROR("%s: kv_gpu must not be the main_gpu, which holds the layers\n", __func__);
+            return false;
+        }
+        model->kv_dev = model->devices[params.kv_gpu].dev;
+    }
+    if (params.tokenize_on_kv_gpu && model->kv_dev == nullptr) {
+        LLAMA_LOG_ERROR("%s: tokenize_on_kv_gpu needs kv_gpu\n", __func__);
+        return false;
     }
 
     // if using single GPU mode, remove all except the main GPU
@@ -236,6 +315,29 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             model->devices.clear();
             model->devices.push_back(main_gpu);
         }
+        // the KV device stays, last
+        if (model->kv_dev != nullptr) {
+            model->devices.push_back({false, model->kv_dev});
+        }
+    }
+
+    if (model->kv_dev != nullptr) {
+        size_t n_layer_devs = 0;
+        for (const auto & dev : model->devices) {
+            n_layer_devs += dev.dev != model->kv_dev;
+        }
+        if (n_layer_devs == 0) {
+            LLAMA_LOG_ERROR("%s: kv_gpu needs another device for the layers\n", __func__);
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: the KV cache and the attention of the full-attention layers are on %s, it holds no layers\n",
+                __func__, ggml_backend_dev_name(model->kv_dev));
+    }
+
+    // the expert split keeps all devices, main_gpu is the device of the layers
+    if (params.split_mode == LLAMA_SPLIT_MODE_EXPERT && (params.main_gpu < 0 || params.main_gpu >= (int) model->devices.size())) {
+        LLAMA_LOG_ERROR("%s: invalid value for main_gpu with split_mode = expert: %d (available devices: %zu)\n", __func__, params.main_gpu, model->devices.size());
+        return false;
     }
 
     for (const auto & dev : model->devices) {
@@ -305,6 +407,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            model->log_tensor_split();
+        }
+        // not for a model that only simulates its allocations (e.g. the memory measurements of --fit)
+        if (params.tokenize_on_kv_gpu && !params.no_alloc) {
+            llama_vocab_set_remote(model->vocab, model->kv_dev, fname);
         }
 
         return {0, model_ptr.release()};

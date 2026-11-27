@@ -431,3 +431,6 @@ bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
 bool llm_arch_supports_mixed_batch(const llm_arch & arch);
 bool llm_arch_mmid_down_bf16(const llm_arch & arch);
+bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+// with LLAMA_SPLIT_MODE_TENSOR: false if attention is always mirrored (LLAMA_TP_ATTN_MIRROR)
+bool llm_arch_sm_tensor_splits_attn(const llm_arch & arch);

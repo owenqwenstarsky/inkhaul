@@ -492,6 +492,7 @@ struct common_params {
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+    enum llama_tp_attn    tp_attn    = LLAMA_TP_ATTN_SPLIT;    // attention with LLAMA_SPLIT_MODE_TENSOR
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
@@ -595,6 +596,21 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     size_t longhaul_cache_size = 512ull*1024*1024; // LongHaul: cache size in bytes for the experts kept on disk
+    std::vector<size_t> longhaul_cache_sizes;      // LongHaul: cache size per device (llama_max_devices() entries, 0 = from longhaul_cache_size), empty if none set
+
+    // LongHaul expert split, as given on the command line, resolved to split_mode, tensor_split, main_gpu and devices after parsing
+    std::string expert_share;           // -es
+    std::string kv_device;              // -kvd
+    std::string longhaul_cache_devices; // -lhcd
+
+    // --kv-remote DEV: the RPC device that holds the KV cache and runs the attention of the full-attention layers, and tokenizes;
+    // resolved after parsing to kv_gpu, an index into devices
+    std::string kv_remote;
+    int32_t     kv_gpu = -1;
+
+    // --tp-host ADDR[:PORT]: with -sm tensor, rank 0 runs in this process as an RPC server for the local GPU,
+    // started after parsing, and the devices become that server and then the --rpc servers
+    std::string tp_host;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

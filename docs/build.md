@@ -4,7 +4,7 @@ The main product of this project is the `llama` library. Its C-style interface c
 
 The project also includes many example programs and tools using the `llama` library. The examples range from simple, minimal code snippets to sophisticated sub-projects such as an OpenAI-compatible HTTP server.
 
-This fork builds for macOS on Apple Silicon (arm64), with the Metal (GPU), CPU and BLAS (Accelerate) backends, and for Linux and Windows on x86_64, with the CUDA (GPU) and CPU backends.
+This fork builds for macOS on Apple Silicon (arm64), with the Metal (GPU), CPU, BLAS (Accelerate) and RPC backends, and for Linux and Windows on x86_64, with the CUDA (GPU) and CPU backends.
 
 **To get the Code:**
 
@@ -18,6 +18,7 @@ The following sections describe how to build with the available backends and opt
 * [CPU Build](#cpu-build)
 * [BLAS Build](#blas-build)
 * [Metal Build](#metal-build)
+* [RPC](#rpc)
 * [CUDA](#cuda)
 * [Arm® KleidiAI™](#arm-kleidiai)
 * [Notes about GPU-accelerated backends](#notes-about-gpu-accelerated-backends)
@@ -93,6 +94,10 @@ To disable the Metal build at compile time use the `-DGGML_METAL=OFF` cmake opti
 
 When built with Metal support, you can explicitly disable GPU inference with the `--n-gpu-layers 0` command-line argument.
 
+## RPC
+
+On macOS the RPC backend and `ggml-rpc-server` are built by default, to run one model over several Macs (see [tools/rpc](../tools/rpc/README.md) and [longhaul.md](longhaul.md#several-laptops)). Building them starts nothing: the server listens only when you run it, and `--rpc` connects only when you pass it. To disable them use the `-DGGML_RPC=OFF` cmake option. On Linux and Windows add `-DGGML_RPC=ON` to build them.
+
 ## CUDA
 
 This provides GPU acceleration using an NVIDIA GPU. Make sure to have the [CUDA toolkit](https://developer.nvidia.com/cuda-toolkit) installed.
@@ -135,7 +140,7 @@ cmake --build build-x64-linux-gcc+cuda-release
 
 ### LongHaul on CUDA
 
-Inkling 2 keeps its experts on disk and caches them in VRAM (see [longhaul.md](longhaul.md)). This fork supports one CUDA GPU with LongHaul: on a machine with several GPUs, select one with `-dev CUDA0` (or `-sm none -mg N`).
+Inkling 2 keeps its experts on disk and caches them in VRAM (see [longhaul.md](longhaul.md)). On a machine with several GPUs the layers are split over them and each GPU caches the experts of its own layers. This fork checks that split with emulated Metal devices only, it is not tested on several CUDA GPUs. To use one GPU, select it with `-dev CUDA0` (or `-sm none -mg N`).
 
 ### Non-Native Builds
 

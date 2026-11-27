@@ -1,11 +1,13 @@
 #include "llama-moe-cache.h"
 
+#include "llama-expert-share.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
+#include "ggml-rpc.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,7 +20,9 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -85,12 +89,9 @@ struct moe_cache_lru {
         seen.assign(n_expert, 0);
     }
 
-    // move slot s to the most recently used end of list c
-    void move(int32_t s, int c) {
+    // remove slot s from its list
+    void unlink(int32_t s) {
         const int from = list_of[s];
-        if (from == c && s == tail[from]) {
-            return;
-        }
         if (prev[s] >= 0) {
             next[prev[s]] = next[s];
         } else {
@@ -101,6 +102,15 @@ struct moe_cache_lru {
         } else {
             tail[from] = prev[s];
         }
+    }
+
+    // move slot s to the most recently used end of list c
+    void move(int32_t s, int c) {
+        const int from = list_of[s];
+        if (from == c && s == tail[from]) {
+            return;
+        }
+        unlink(s);
 
         prev[s] = tail[c];
         next[s] = -1;
@@ -178,6 +188,30 @@ struct moe_cache_lru {
             GGML_ABORT("no MoE cache victim");
         }
         return res;
+    }
+
+    // remove expert e of layer il from the cache, its slot is the next victim (its CRF is kept)
+    void drop(int32_t il, int32_t e) {
+        int32_t * slots = slot_map[il];
+        const int32_t s = slots[e];
+        if (s >= n_slots) {
+            return;
+        }
+        slots[e]  = empty;
+        key_of[s] = -1;
+        n_filled--;
+
+        // to the least recently used end of list 0, where victim() looks first
+        unlink(s);
+        prev[s] = -1;
+        next[s] = head[0];
+        if (head[0] >= 0) {
+            prev[head[0]] = s;
+        } else {
+            tail[0] = s;
+        }
+        head[0] = s;
+        list_of[s] = 0;
     }
 
     struct fill {
@@ -374,18 +408,39 @@ static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, co
 }
 
 struct llama_moe_cache::impl {
+    struct stats {
+        size_t  hits    = 0;
+        size_t  misses  = 0;
+        size_t  bytes   = 0;
+        size_t  bytes_server = 0; // read by RPC servers from their copies of the model files
+        int64_t read_us = 0;      // of the local reads
+        size_t  n_used  = 0;      // selected experts (with repeats) that the device computed
+    };
+
     // a GPU with its own budget and banks, it caches the layers assigned to it
+    // with the expert split it caches the experts it owns of every MoE layer
     struct device {
         ggml_backend_t backend;
         ggml_backend_buffer_type_t buft;
-        size_t host_bytes = 0; // experts on disk of the layers it caches
+        std::string name; // of the device, the stats at exit come after the backends are freed
+        bool is_rpc = false;
+        size_t host_bytes = 0; // experts on disk of the layers it caches (the owned ones with the expert split)
         double split = 0.0;    // share of the budget
+        bool   named = false;  // its budget is set by the per-device sizes
+        double share = 0.0;    // expert split: target share of the selected experts, normalized
+        int32_t n_owned = 0;   // experts it owns per layer, all of them without the expert split
         int32_t n_ubatch_reserved = 0; // tokens per ubatch that every group can hold before the rest is shared
+        stats st;
+        size_t moved_in  = 0; // expert split: experts moved to this device by the rebalance
+        size_t moved_out = 0;
 
         // banks and their views
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
+
+        // an RPC server with copies of the model files reads the missing experts itself
+        std::vector<int32_t> server_files; // [model file] id of the server's copy, -1 if not needed, empty if the server does not read
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -400,18 +455,18 @@ struct llama_moe_cache::impl {
         moe_cache_lru lru;
     };
 
-    struct layer {
-        int32_t ig    = -1; // -1 if the layer is not cached
-        int32_t owner = -1; // layer that owns the experts, its LRU keys and slot map data are used (a loop pass reuses the experts of an earlier layer)
-        ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
-        std::vector<ggml_tensor *> experts; // expert tensors on disk, in the order of the banks
+    // the cache of a layer on one device
+    struct part {
+        int32_t ig = -1;
+        ggml_tensor * slot_map = nullptr; // I32 [1, n_expert] in host memory
+        std::vector<int32_t> masked;      // expert split: the slot map as copied, -1 for the experts of the other devices
     };
 
-    struct stats {
-        size_t  hits    = 0;
-        size_t  misses  = 0;
-        size_t  bytes   = 0;
-        int64_t read_us = 0;
+    struct layer {
+        int32_t owner = -1; // layer that owns the experts, its LRU keys and slot map data are used (a loop pass reuses the experts of an earlier layer)
+        std::vector<part> parts;            // empty if the layer is not cached, one per device with the expert split (the home device last)
+        std::vector<ggml_tensor *> experts; // expert tensors on disk, in the order of the banks
+        int32_t next_part = 0;              // the part whose slot map is copied next, see copy()
     };
 
     // reads go through host buffers, the device banks are not host memory
@@ -437,10 +492,27 @@ struct llama_moe_cache::impl {
     std::vector<device> devices;
     std::vector<group> groups;
     std::vector<layer> layers;
-    std::unordered_map<const ggml_tensor *, ggml_tensor *> bindings; // experts on disk -> cached experts
-    std::unordered_map<const ggml_tensor *, int32_t> layer_of;       // slot map -> layer
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> bindings; // experts on disk -> cached experts per device
+    std::unordered_map<const ggml_tensor *, std::pair<int32_t, int32_t>> layer_of; // slot map -> layer, part
 
-    std::vector<int32_t> ids;
+    // the expert split: the backend of the layers, which looks up the slots of all devices, and the device of each expert
+    bool split_expert = false;
+    ggml_backend_t home = nullptr;
+    std::vector<std::vector<int32_t>> owner_dev; // [n_layer][n_expert] for the layers with their own experts
+
+    // expert split: the rebalance of owner_dev toward the target shares, see begin_graph()
+    static constexpr int64_t rebalance_halve = 4096; // selections of a layer after which its counts are halved, so that old routing fades
+    static constexpr double  rebalance_tol   = 0.02; // no move while every device is within 2 points of its target
+    static constexpr int     rebalance_moves = 2;    // the most moves per layer per check
+    bool    rebalance = false;
+    int64_t rebalance_interval = 512; // selections of a layer between two checks
+    std::vector<std::vector<uint32_t>> sel_count; // [n_layer][n_expert] selections of each expert of the layers with their own experts
+    std::vector<int64_t> sel_since_halve;         // [n_layer]
+    std::vector<int64_t> sel_since_check;         // [n_layer]
+
+    std::vector<int32_t> ids;     // the selected experts of the current layer, read by the copy of its first part
+    int64_t ids_n_tokens = 0;
+    std::vector<int32_t> ids_dev; // the ones of one device
     std::vector<moe_cache_lru::fill> fills;
     std::vector<read_job> jobs;
     std::vector<uint8_t *> staging; // [n_io_threads]
@@ -450,6 +522,9 @@ struct llama_moe_cache::impl {
     std::unique_ptr<moe_cache_io_pool> io_pool;
     std::mutex set_mtx; // the uploads to the banks, the backends do not promise concurrent set_tensor
 
+    decltype(ggml_backend_rpc_dev_set_tensors_from_file) * rpc_set_from_file = nullptr;
+    std::vector<ggml_backend_rpc_file_read> server_reads;
+
     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
     FILE * trace = nullptr;
 
@@ -458,24 +533,121 @@ struct llama_moe_cache::impl {
     ggml_backend_buffer_ptr buf_host;
     size_t buf_host_size = 0;
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+    // the index of a device in the devices of the model, -1 if not used by the model
+    int model_index(const device & d) const {
+        ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+        const auto it = std::find_if(model.devices.begin(), model.devices.end(), [&](const llama_device & ld) { return ld.dev == dev; });
+        return it == model.devices.end() ? -1 : (int) (it - model.devices.begin());
+    }
+
+    // the expert split: the shares of the devices, the owned experts and the home backend
+    void init_split_expert(const std::vector<ggml_backend_t> & backends) {
+        const int64_t n_expert = model.hparams.n_expert;
+        ggml_backend_dev_t dev_home = model.dev_layer(0);
+        for (ggml_backend_t b : backends) {
+            if (ggml_backend_get_device(b) == dev_home) {
+                home = b;
+            }
+        }
+        if (home == nullptr) {
+            throw std::runtime_error(format("LongHaul: no backend for the device of the layers %s", ggml_backend_dev_name(dev_home)));
+        }
+
+        // no tensor split: every device gets the same share
+        const float * ts = model.tensor_split();
+        const bool all_zero = ts == nullptr || std::all_of(ts, ts + model.n_devices(), [](float x) { return x == 0.0f; });
+        for (size_t i = 0; i < model.n_devices(); ++i) {
+            const float share = all_zero ? 1.0f : ts[i];
+            if (share < 0.0f) {
+                throw std::runtime_error("LongHaul: the expert shares must be >= 0");
+            }
+            ggml_backend_dev_t dev = model.devices[i].dev;
+            const bool cached = std::any_of(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == dev; });
+            if (share > 0.0f && !cached) {
+                throw std::runtime_error(format("LongHaul: %s has an expert share but is not a GPU", ggml_backend_dev_name(dev)));
+            }
+        }
+        std::vector<double> shares;
+        for (device & d : devices) {
+            const int idx = model_index(d);
+            shares.push_back(idx < 0 ? 0.0 : all_zero ? 1.0 : (double) ts[idx]);
+        }
+        const double sum = std::accumulate(shares.begin(), shares.end(), 0.0);
+        if (!(sum > 0.0)) {
+            throw std::runtime_error("LongHaul: no device has an expert share");
+        }
+        const std::vector<int32_t> counts = llama_expert_share_counts((int32_t) n_expert, shares);
+        for (size_t id = 0; id < devices.size(); ++id) {
+            device & d = devices[id];
+            d.share   = shares[id]/sum;
+            d.n_owned = counts[id];
+            if (d.n_owned == 0) {
+                continue;
+            }
+            // the experts that a device does not compute have a slot of -1, which the expert matmuls must skip
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(d.backend));
+            const char * reg_name = reg != nullptr ? ggml_backend_reg_name(reg) : "";
+            if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "RPC") != 0) {
+                throw std::runtime_error(format("LongHaul: the expert split supports Metal and RPC devices, not %s", ggml_backend_dev_name(ggml_backend_get_device(d.backend))));
+            }
+        }
+        const std::vector<int32_t> owners = llama_expert_share_owners((int32_t) n_expert, shares);
+        owner_dev.assign(model.layers.size(), {});
+        for (size_t il = 0; il < model.layers.size(); ++il) {
+            owner_dev[il] = owners;
+        }
+
+        // LLAMA_EXPERT_SHARE_REBALANCE=0 keeps the initial owners, LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL sets the selections between checks (for tests)
+        const char * env = getenv("LLAMA_EXPERT_SHARE_REBALANCE");
+        rebalance = env == nullptr || atoi(env) != 0;
+        if (const char * env_interval = getenv("LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL")) {
+            rebalance_interval = std::max(1, atoi(env_interval));
+        }
+        sel_count.assign(model.layers.size(), std::vector<uint32_t>(n_expert, 0));
+        sel_since_halve.assign(model.layers.size(), 0);
+        sel_since_check.assign(model.layers.size(), 0);
+    }
+
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts,
+            size_t size, const std::vector<size_t> & sizes) :
             model(model), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
-            const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+            ggml_backend_dev_t dev = ggml_backend_get_device(backends[i]);
+            const auto dev_type = ggml_backend_dev_type(dev);
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 auto & d = devices.emplace_back();
                 d.backend = backends[i];
                 d.buft    = bufts[i];
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                d.name    = ggml_backend_dev_name(dev);
+                d.is_rpc  = reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0;
+                d.n_owned = (int32_t) model.hparams.n_expert;
             }
         }
         if (devices.empty()) {
-            throw std::runtime_error("LongHaul requires a GPU backend (CUDA or Metal) for the expert cache");
+            throw std::runtime_error("LongHaul requires a GPU backend (CUDA, Metal or RPC) for the expert cache");
         }
         if (model.hparams.n_expert == 0 || n_expert_used == 0) {
             throw std::runtime_error("LongHaul requires a MoE model");
         }
 
+        split_expert = model.split_mode() == LLAMA_SPLIT_MODE_EXPERT;
+        if (split_expert) {
+            init_split_expert(backends);
+        }
+
         // cache the layers whose experts are on disk, on the device the layer is assigned to
+        // with the expert split, on every device that owns experts, the device of the layers last
+        std::vector<int32_t> part_devs;
+        if (split_expert) {
+            for (int pass = 0; pass < 2; ++pass) {
+                for (size_t id = 0; id < devices.size(); ++id) {
+                    if (devices[id].n_owned > 0 && (devices[id].backend == home) == (pass == 1)) {
+                        part_devs.push_back((int32_t) id);
+                    }
+                }
+            }
+        }
         std::unordered_map<const ggml_tensor *, int32_t> owner_of;
         for (size_t il = 0; il < model.layers.size(); ++il) {
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
@@ -486,17 +658,30 @@ struct llama_moe_cache::impl {
             if (n_disk != experts.size()) {
                 throw std::runtime_error(format("LongHaul: layer %zu has experts both on disk and in memory", il));
             }
-            const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
-            if (it_dev == devices.end()) {
-                throw std::runtime_error(format("LongHaul: layer %zu is not on the GPU, offload all layers", il));
+            std::vector<int32_t> ids_layer = part_devs;
+            if (split_expert) {
+                // the slots of all devices are looked up on the home backend
+                if (model.dev_layer(il) != ggml_backend_get_device(home)) {
+                    throw std::runtime_error(format("LongHaul: layer %zu is not on the device of the other layers", il));
+                }
+            } else {
+                const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
+                if (it_dev == devices.end()) {
+                    throw std::runtime_error(format("LongHaul: layer %zu is not on the GPU, offload all layers", il));
+                }
+                ids_layer = { (int32_t) (it_dev - devices.begin()) };
             }
-            const int32_t id = (int32_t) (it_dev - devices.begin());
 
             // loop passes share the expert tensors of an earlier layer, they share its slots too
             int32_t owner = (int32_t) il;
             if (const auto it_own = owner_of.find(experts[0]); it_own != owner_of.end()) {
                 owner = it_own->second;
                 GGML_ASSERT(layers[owner].experts == experts);
+                // the slots of the owner are in the banks of its device
+                if (model.dev_layer(owner) != model.dev_layer(il)) {
+                    throw std::runtime_error(format("LongHaul: layer %zu uses the experts of layer %d but is on device %s instead of %s",
+                        il, owner, ggml_backend_dev_name(model.dev_layer(il)), ggml_backend_dev_name(model.dev_layer(owner))));
+                }
             } else {
                 for (const ggml_tensor * t : experts) {
                     owner_of[t] = owner;
@@ -505,28 +690,28 @@ struct llama_moe_cache::impl {
             layers[il].owner   = owner;
             layers[il].experts = experts;
 
-            auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && llama_moe_cache_same_layout(g.ref, experts); });
-            if (it == groups.end()) {
-                groups.emplace_back();
-                it = groups.end() - 1;
-                it->id  = id;
-                it->ref = experts;
-            }
-            it->layers.push_back(il);
-            if (owner == (int32_t) il) {
-                it->n_owners++;
-                for (const ggml_tensor * t : experts) {
-                    it->host_bytes         += ggml_nbytes(t);
-                    devices[id].host_bytes += ggml_nbytes(t);
+            for (const int32_t id : ids_layer) {
+                auto it = std::find_if(groups.begin(), groups.end(), [&](const group & g) { return g.id == id && llama_moe_cache_same_layout(g.ref, experts); });
+                if (it == groups.end()) {
+                    groups.emplace_back();
+                    it = groups.end() - 1;
+                    it->id  = id;
+                    it->ref = experts;
+                }
+                it->layers.push_back(il);
+                layers[il].parts.push_back({ (int32_t) (it - groups.begin()), nullptr, {} });
+                if (owner == (int32_t) il) {
+                    it->n_owners++;
+                    for (const ggml_tensor * t : experts) {
+                        GGML_ASSERT(t->ne[2] == model.hparams.n_expert);
+                        it->host_bytes         += t->nb[2]*devices[id].n_owned;
+                        devices[id].host_bytes += t->nb[2]*devices[id].n_owned;
+                    }
                 }
             }
         }
         if (groups.empty()) {
             throw std::runtime_error("LongHaul: the model has no experts on disk");
-        }
-        // one GPU: a loop pass on another device than the layer that owns its experts would need the banks of that device
-        if (std::any_of(groups.begin(), groups.end(), [&](const group & g) { return g.id != groups[0].id; })) {
-            throw std::runtime_error("LongHaul supports one GPU, select it with -dev (for example -dev CUDA0) or use -sm none");
         }
 
         // one extra slot at the end, some kernels read past the last expert
@@ -539,33 +724,46 @@ struct llama_moe_cache::impl {
             return res;
         };
 
-        // the budget is split among the devices with experts like the layers, by the tensor split or by default by free memory
+        // a device with a size of its own gets that size, the budget is split among the others like the layers, by the tensor split
+        // or by default by free memory, with the expert split by the expert shares
         const float * tensor_split = model.tensor_split();
         const bool split_by_free = tensor_split == nullptr ||
             std::all_of(tensor_split, tensor_split + model.n_devices(), [](float x) { return x == 0.0f; });
+        std::vector<size_t> dev_sizes(devices.size(), 0);
         double split_sum = 0.0;
         for (device & d : devices) {
             if (d.host_bytes == 0) {
                 continue;
             }
-            ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
-            if (split_by_free) {
+            const int idx = model_index(d);
+            GGML_ASSERT(idx >= 0);
+            if ((size_t) idx < sizes.size() && sizes[idx] > 0) {
+                d.named = true;
+                dev_sizes[&d - devices.data()] = sizes[idx];
+                continue;
+            }
+            if (split_expert) {
+                d.split = d.share;
+            } else if (split_by_free) {
                 size_t free;
                 size_t total;
-                ggml_backend_dev_memory(dev, &free, &total);
+                ggml_backend_dev_memory(ggml_backend_get_device(d.backend), &free, &total);
                 d.split = (double) free;
             } else {
-                const auto it = std::find_if(model.devices.begin(), model.devices.end(), [&](const llama_device & ld) { return ld.dev == dev; });
-                GGML_ASSERT(it != model.devices.end());
-                d.split = (double) tensor_split[it - model.devices.begin()];
+                d.split = (double) tensor_split[idx];
             }
             split_sum += d.split;
         }
         if (split_sum == 0.0) {
             // the devices do not report their free memory
             for (device & d : devices) {
-                d.split    = d.host_bytes > 0 ? 1.0 : 0.0;
+                d.split    = d.host_bytes > 0 && !d.named ? 1.0 : 0.0;
                 split_sum += d.split;
+            }
+        }
+        for (size_t id = 0; id < devices.size(); ++id) {
+            if (!devices[id].named && devices[id].host_bytes > 0) {
+                dev_sizes[id] = (size_t) ((double) size*devices[id].split/split_sum);
             }
         }
 
@@ -584,10 +782,10 @@ struct llama_moe_cache::impl {
         // The largest ubatch that fits in half of the budget is reserved, the rest is split by the size of the experts, so
         // each group caches the same fraction of its experts on top. With one group the whole budget goes to it either way.
         auto max_slots = [&](const group & g) {
-            return g.n_owners*(int32_t) g.ref[0]->ne[2];
+            return g.n_owners*devices[g.id].n_owned;
         };
         auto reserved_slots = [&](const group & g, int32_t n_ubatch) {
-            return (int32_t) std::min<int64_t>((int64_t) n_ubatch*n_expert_used, g.ref[0]->ne[2]);
+            return (int32_t) std::min<int64_t>((int64_t) n_ubatch*n_expert_used, devices[g.id].n_owned);
         };
         auto reserve = [&](int32_t id, int32_t n_ubatch) {
             size_t res = 0;
@@ -605,20 +803,22 @@ struct llama_moe_cache::impl {
             if (d.host_bytes == 0) {
                 continue;
             }
-            const double dev_share = d.split/split_sum;
-            const size_t dev_size  = (size_t) ((double) size*dev_share);
+            const size_t dev_size = dev_sizes[id];
 
             const size_t reserve_min = reserve(id, 1);
-            min_size  = std::max(min_size, (size_t) std::ceil(reserve_min/dev_share));
-            too_small = too_small || reserve_min > dev_size;
+            if (d.named) {
+                if (reserve_min > dev_size) {
+                    throw std::runtime_error(format("the LongHaul cache of %.0f MiB of %s is too small to hold the experts of one token, use at least %.0f MiB",
+                        dev_size/1024.0/1024.0, ggml_backend_dev_name(ggml_backend_get_device(d.backend)), std::ceil(reserve_min/1024.0/1024.0)));
+                }
+            } else {
+                const double dev_share = d.split/split_sum;
+                min_size  = std::max(min_size, (size_t) std::ceil(reserve_min/dev_share));
+                too_small = too_small || reserve_min > dev_size;
+            }
 
             // the reserve stops growing once every group holds the experts of one layer
-            int32_t n_max = 1;
-            for (const group & g : groups) {
-                if (g.id == (int32_t) id) {
-                    n_max = std::max(n_max, (int32_t) ((g.ref[0]->ne[2] + n_expert_used - 1)/n_expert_used));
-                }
-            }
+            const int32_t n_max = std::max(1, (d.n_owned + n_expert_used - 1)/n_expert_used);
             d.n_ubatch_reserved = 1;
             while (d.n_ubatch_reserved < n_max && reserve(id, d.n_ubatch_reserved + 1) <= dev_size/2) {
                 d.n_ubatch_reserved++;
@@ -681,19 +881,26 @@ struct llama_moe_cache::impl {
             }
             for (int32_t il : g.layers) {
                 layer & l = layers[il];
-                l.ig = (int32_t) ig;
+                const auto it_part = std::find_if(l.parts.begin(), l.parts.end(), [&](const part & p) { return p.ig == (int32_t) ig; });
+                GGML_ASSERT(it_part != l.parts.end());
+                part & p = *it_part;
                 if (l.owner == il) {
                     for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                         ggml_tensor * bank   = g.banks[ip];
                         ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
-                        ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
-                        bindings[l.experts[ip]] = cached;
+                        ggml_format_name(cached, "moe_cache.%d.%s", g.id, l.experts[ip]->name);
+                        auto & b = bindings[l.experts[ip]];
+                        b.resize(devices.size(), nullptr);
+                        b[g.id] = cached;
                     }
                 }
-                l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
-                ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
-                layer_of[l.slot_map] = il;
-                buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
+                p.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                ggml_format_name(p.slot_map, "moe_cache.slot_map-%d.%d", il, g.id);
+                layer_of[p.slot_map] = { il, (int32_t) (it_part - l.parts.begin()) };
+                buf_host_size += GGML_PAD(ggml_nbytes(p.slot_map), alignment_host);
+                if (split_expert) {
+                    p.masked.assign(g.ref[0]->ne[2], -1);
+                }
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
         }
@@ -714,11 +921,13 @@ struct llama_moe_cache::impl {
             ggml_backend_buffer_clear(buf_host.get(), 0);
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
 
-            for (group & g : groups) {
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                group & g = groups[ig];
                 for (int32_t il : g.layers) {
                     if (layers[il].owner == il) {
-                        int32_t * slots = (int32_t *) layers[il].slot_map->data;
-                        std::fill(slots, slots + layers[il].slot_map->ne[1], g.lru.empty);
+                        const part & p = part_of(il, (int32_t) ig);
+                        int32_t * slots = (int32_t *) p.slot_map->data;
+                        std::fill(slots, slots + p.slot_map->ne[1], g.lru.empty);
                         g.lru.slot_map[il] = slots;
                     }
                 }
@@ -731,7 +940,7 @@ struct llama_moe_cache::impl {
             }
             io_pool = std::make_unique<moe_cache_io_pool>(n_io_threads);
 
-            // pinned memory makes the uploads to a discrete GPU faster
+            // pinned memory makes the uploads to a discrete GPU faster, the buffers are shared by all devices
             staging_thread_size = GGML_PAD(std::max(staging_size, max_expert_size), 64);
             uint8_t * base = nullptr;
             ggml_backend_buffer_type_t buft_staging = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(devices[groups[0].id].backend));
@@ -750,6 +959,8 @@ struct llama_moe_cache::impl {
             for (int i = 0; i < n_io_threads; ++i) {
                 staging.push_back(base + i*staging_thread_size);
             }
+
+            open_server_files();
         }
 
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
@@ -760,32 +971,117 @@ struct llama_moe_cache::impl {
         }
         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+        if (split_expert) {
+            LLAMA_LOG_INFO("llama_moe_cache: expert split, the layers are on %s\n", ggml_backend_dev_name(ggml_backend_get_device(home)));
+        }
         for (size_t id = 0; id < devices.size(); ++id) {
             const device & d = devices[id];
+            if (split_expert && d.n_owned == 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: %10s computes no experts (share %.1f%%)\n", ggml_backend_buft_name(d.buft), 100.0*d.share);
+            }
             if (d.host_bytes == 0) {
                 continue;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: %10s LongHaul cache size = %8.2f MiB for %.2f MiB of experts on disk, %d I/O threads, %d tokens reserved per group\n",
-                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, io_pool ? io_pool->n_threads() : 0, d.n_ubatch_reserved);
+            LLAMA_LOG_INFO("llama_moe_cache: %10s LongHaul cache size = %8.2f MiB for %.2f MiB of experts on disk, %d I/O threads, %d tokens reserved per group%s\n",
+                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, io_pool ? io_pool->n_threads() : 0, d.n_ubatch_reserved,
+                d.server_files.empty() ? "" : ", read by the server");
+            if (split_expert) {
+                LLAMA_LOG_INFO("llama_moe_cache: %10s share %.1f%%, %d of %u experts per layer\n",
+                    ggml_backend_buft_name(d.buft), 100.0*d.share, d.n_owned, model.hparams.n_expert);
+            }
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("llama_moe_cache: %2zu layers (%d with own experts), %s: %5d slots (%.1f%%, %.1f tokens worth)\n",
-                        g.layers.size(), g.n_owners, ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.n_owners*g.ref[0]->ne[2]),
+                        g.layers.size(), g.n_owners, ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.n_owners*d.n_owned),
                         (double) g.n_slots/(g.layers.size()*n_expert_used));
                 }
             }
         }
     }
 
-    // the device that caches layer il
-    ggml_backend_t backend(int32_t il) const {
-        return devices[groups[layers[il].ig].id].backend;
+    // the RPC devices whose servers have the model files read the missing experts themselves, the others get them from this host
+    void open_server_files() {
+        for (device & d : devices) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            if (d.host_bytes == 0 || reg == nullptr || strcmp(ggml_backend_reg_name(reg), "RPC") != 0) {
+                continue;
+            }
+            auto open_fn = (decltype(ggml_backend_rpc_dev_open_file) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_open_file");
+            auto read_fn = (decltype(ggml_backend_rpc_dev_set_tensors_from_file) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_set_tensors_from_file");
+            if (open_fn == nullptr || read_fn == nullptr) {
+                continue;
+            }
+
+            std::vector<int32_t> ids;
+            std::string missing;
+            for (const group & g : groups) {
+                if (g.id != (int32_t) (&d - devices.data())) {
+                    continue;
+                }
+                for (int32_t il : g.layers) {
+                    for (const ggml_tensor * w : layers[il].experts) {
+                        size_t file = 0;
+                        size_t offs = 0;
+                        if (!model.longhaul_src(w, file, offs)) {
+                            missing = w->name;
+                            break;
+                        }
+                        if (file >= ids.size()) {
+                            ids.resize(file + 1, -1);
+                        }
+                        if (ids[file] >= 0) {
+                            continue;
+                        }
+                        const std::string & path = model.longhaul_path(file);
+                        ids[file] = path.empty() ? -1 : open_fn(dev, path.c_str());
+                        if (ids[file] < 0) {
+                            missing = path.empty() ? "a model file opened without a path" : path;
+                            break;
+                        }
+                    }
+                    if (!missing.empty()) {
+                        break;
+                    }
+                }
+                if (!missing.empty()) {
+                    break;
+                }
+            }
+            if (!missing.empty()) {
+                LLAMA_LOG_INFO("llama_moe_cache: %s has no copy of %s (see ggml-rpc-server --model-dir), the experts are sent from this host\n",
+                    ggml_backend_dev_name(dev), missing.c_str());
+                continue;
+            }
+            d.server_files = std::move(ids);
+            rpc_set_from_file = read_fn;
+        }
+    }
+
+    // the part of layer il in group ig
+    const part & part_of(int32_t il, int32_t ig) const {
+        for (const part & p : layers[il].parts) {
+            if (p.ig == ig) {
+                return p;
+            }
+        }
+        GGML_ABORT("layer %d has no part in group %d", il, ig);
+    }
+
+    // the device of part ip of layer il
+    int32_t part_dev(int32_t il, size_t ip) const {
+        return groups[layers[il].parts[ip].ig].id;
+    }
+
+    // the backend that looks up the slots of part ip of layer il, the device of the cache without the expert split
+    ggml_backend_t lookup_backend(int32_t il, size_t ip) const {
+        return split_expert ? home : devices[part_dev(il, ip)].backend;
     }
 
     int64_t max_ubatch() const {
         int64_t res = INT64_MAX;
         for (const group & g : groups) {
-            if (g.n_slots < g.ref[0]->ne[2]) {
+            if (g.n_slots < devices[g.id].n_owned) {
                 res = std::min<int64_t>(res, g.n_slots/n_expert_used);
             }
         }
@@ -837,24 +1133,30 @@ struct llama_moe_cache::impl {
         }
     }
 
-    // the slot map of layer il for n_tokens tokens, nullptr if the layer is not cached
-    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
-        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || n_tokens == 0) {
+    // the parts of layer il for n_tokens tokens, nullptr if the layer is not cached
+    const std::vector<part> * get_parts(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+        if (il < 0 || il >= (int32_t) layers.size() || layers[il].parts.empty() || n_tokens == 0) {
             return nullptr;
         }
         const layer & l = layers[il];
 
         // the experts on disk have no other path, so the context keeps the ubatch within max_ubatch()
-        if (std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
-            GGML_ABORT("LongHaul: a ubatch of %" PRId64 " tokens selects more experts in layer %d than the %d slots of the cache",
-                n_tokens, il, groups[l.ig].n_slots);
+        for (const part & p : l.parts) {
+            const group & g = groups[p.ig];
+            if (std::min<int64_t>(n_tokens*n_expert_used, devices[g.id].n_owned) > g.n_slots) {
+                GGML_ABORT("LongHaul: a ubatch of %" PRId64 " tokens selects more experts in layer %d than the %d slots of the cache",
+                    n_tokens, il, g.n_slots);
+            }
         }
-        return l.slot_map;
+        return &l.parts;
     }
 
-    ggml_tensor * get_experts(const ggml_tensor * w) const {
+    ggml_tensor * get_experts(const ggml_tensor * w, int32_t dev) const {
         const auto it = bindings.find(w);
-        return it != bindings.end() ? it->second : nullptr;
+        if (it == bindings.end() || dev < 0 || dev >= (int32_t) it->second.size()) {
+            return nullptr;
+        }
+        return it->second[dev];
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -862,59 +1164,143 @@ struct llama_moe_cache::impl {
         if (it == layer_of.end()) {
             return false;
         }
-        const int32_t il = it->second;
-        const layer & l = layers[il];
-        group & g = groups[l.ig];
+        const int32_t il = it->second.first;
+        const int32_t ip = it->second.second;
+        layer & l = layers[il];
+        part  & p = l.parts[ip];
+        group & g = groups[p.ig];
+        device & d = devices[g.id];
 
-        GGML_ASSERT(backend == devices[g.id].backend);
+        GGML_ASSERT(backend == lookup_backend(il, ip));
 
-        // the get_rows that looks up the slots of the selected experts
-        const int n_nodes = ggml_graph_n_nodes(graph);
-        const ggml_tensor * lookup = nullptr;
-        for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
-            const ggml_tensor * node = ggml_graph_node(graph, i);
-            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
-                lookup = node;
+        // the first part reads the selected experts, the later parts of the layer (expert split) come next in the same graph and reuse them
+        if (ip == 0) {
+            // the get_rows that looks up the slots of the selected experts
+            const int n_nodes = ggml_graph_n_nodes(graph);
+            const ggml_tensor * lookup = nullptr;
+            for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
+                const ggml_tensor * node = ggml_graph_node(graph, i);
+                if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
+                    lookup = node;
+                }
             }
-        }
-        GGML_ASSERT(lookup != nullptr);
+            GGML_ASSERT(lookup != nullptr);
 
-        // the selected experts must be computed in an earlier split
-        // the scheduler starts a new split at the lookup because it reads a host weight, unless the lookup is the first node of its split
-        const ggml_tensor * sel = lookup->src[1];
-        for (int i = 0; i < n_nodes; ++i) {
-            const ggml_tensor * node = ggml_graph_node(graph, i);
-            if (node == sel || node == sel->view_src) {
-                GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
+            // the selected experts must be computed in an earlier split
+            // the scheduler starts a new split at the lookup because it reads a host weight, unless the lookup is the first node of its split
+            const ggml_tensor * sel = lookup->src[1];
+            for (int i = 0; i < n_nodes; ++i) {
+                const ggml_tensor * node = ggml_graph_node(graph, i);
+                if (node == sel || node == sel->view_src) {
+                    GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
+                }
             }
+            GGML_ASSERT(ggml_is_contiguous(sel));
+            GGML_ASSERT(sel->op == GGML_OP_RESHAPE); // of the [n_expert_used, n_tokens] ids, see build_lookup
+
+            const int32_t n_used = (int32_t) sel->src[0]->ne[0];
+            ids_n_tokens = sel->src[0]->ne[1];
+
+            // this also waits for the earlier splits, so the slots they read can be refilled
+            // the backend is idle after this, so the plain get and set below need no extra command (a memcpy for unified memory)
+            ggml_backend_synchronize(backend);
+            ids.resize(ggml_nelements(sel));
+            ggml_backend_tensor_get(sel, ids.data(), 0, ggml_nbytes(sel));
+
+            if (trace != nullptr) {
+                write_trace(il, n_used);
+            }
+            if (split_expert && rebalance) {
+                count_selections(l.owner);
+            }
+            l.next_part = 1;
+        } else {
+            GGML_ASSERT(l.next_part == ip && "the parts of a layer are copied in order");
+            l.next_part++;
         }
-        GGML_ASSERT(ggml_is_contiguous(sel));
-        GGML_ASSERT(sel->op == GGML_OP_RESHAPE); // of the [n_expert_used, n_tokens] ids, see build_lookup
 
-        const int32_t n_used = (int32_t) sel->src[0]->ne[0];
-
-        // this also waits for the earlier splits, so the slots they read can be refilled
-        // the backend is idle after this, so the plain get and set below need no extra command (a memcpy for unified memory)
-        ggml_backend_synchronize(backend);
-        ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get(sel, ids.data(), 0, ggml_nbytes(sel));
-
-        if (trace != nullptr) {
-            write_trace(il, n_used);
+        // the experts that this device computes
+        const int32_t * ids_d = ids.data();
+        size_t n_ids_d = ids.size();
+        if (split_expert) {
+            const std::vector<int32_t> & own = owner_dev[l.owner];
+            ids_dev.clear();
+            for (const int32_t e : ids) {
+                GGML_ASSERT(e >= 0 && e < (int32_t) own.size());
+                if (own[e] == g.id) {
+                    ids_dev.push_back(e);
+                }
+            }
+            ids_d   = ids_dev.data();
+            n_ids_d = ids_dev.size();
         }
 
         size_t n_hit = 0;
-        if (!g.lru.plan(l.owner, ids.data(), ids.size(), sel->src[0]->ne[1], il == l.owner, fills, n_hit)) {
+        if (!g.lru.plan(l.owner, ids_d, n_ids_d, ids_n_tokens, il == l.owner, fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+
+        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        st.hits     += n_hit;
+        st.misses   += fills.size();
+        d.st.hits   += n_hit;
+        d.st.misses += fills.size();
+        d.st.n_used += n_ids_d;
+
+        // the copied slot map: -1 for the experts of the other devices, which the expert matmuls skip
+        const int32_t * map = g.lru.slot_map[l.owner];
+        if (split_expert) {
+            const std::vector<int32_t> & own = owner_dev[l.owner];
+            for (size_t e = 0; e < p.masked.size(); ++e) {
+                p.masked[e] = own[e] == g.id ? map[e] : -1;
+            }
+            map = p.masked.data();
+        }
+
+        // the server reads the missing experts from its copies of the model files, in order with the graph computes
+        if (!d.server_files.empty()) {
+            server_reads.clear();
+            size_t bytes = 0;
+            for (size_t ie = 0; ie < l.experts.size(); ++ie) {
+                const ggml_tensor * w = l.experts[ie];
+                size_t file = 0;
+                size_t offs = 0;
+                GGML_ASSERT(model.longhaul_src(w, file, offs) && file < d.server_files.size() && d.server_files[file] >= 0);
+                const size_t expert_size = w->nb[2];
+                for (size_t i = 0; i < fills.size();) {
+                    size_t n = 1;
+                    while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                        n++;
+                    }
+                    server_reads.push_back({ g.banks[ie], fills[i].slot*expert_size, d.server_files[file], offs + fills[i].expert*expert_size, n*expert_size });
+                    bytes += n*expert_size;
+                    i += n;
+                }
+            }
+            rpc_set_from_file(ggml_backend_get_device(d.backend), server_reads.data(), server_reads.size());
+            st.bytes          += bytes;
+            st.bytes_server   += bytes;
+            d.st.bytes        += bytes;
+            d.st.bytes_server += bytes;
+
+            // the next copy synchronizes the backend before it changes the slot map again
+            ggml_backend_tensor_set_async(backend, dst, map, 0, ggml_nbytes(p.slot_map));
+            return true;
+        }
+
+        // the banks of another device than the lookup backend can still be read by its earlier splits
+        // an RPC server runs the uploads in order with its graph computes, so it needs no wait
+        if (!fills.empty() && (ip > 0 || d.backend != backend) && !d.is_rpc) {
+            ggml_backend_synchronize(d.backend);
         }
 
         // read the missing experts from the model files, consecutive experts going to consecutive slots are read together
         const int64_t t_start_us = ggml_time_us();
         size_t bytes = 0;
         jobs.clear();
-        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-            const ggml_tensor * w    = l.experts[ip];
-            ggml_tensor       * bank = g.banks[ip];
+        for (size_t ie = 0; ie < l.experts.size(); ++ie) {
+            const ggml_tensor * w    = l.experts[ie];
+            ggml_tensor       * bank = g.banks[ie];
             const size_t expert_size = w->nb[2];
             const size_t max_run     = std::max<size_t>(1, staging_thread_size/expert_size);
             for (size_t i = 0; i < fills.size();) {
@@ -935,15 +1321,92 @@ struct llama_moe_cache::impl {
             ggml_backend_tensor_set(job.bank, buf, job.offs_dst, job.size);
         });
 
-        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
-        st.hits    += n_hit;
-        st.misses  += fills.size();
-        st.bytes   += bytes;
-        st.read_us += ggml_time_us() - t_start_us;
+        const int64_t t_read_us = ggml_time_us() - t_start_us;
+        st.bytes     += bytes;
+        st.read_us   += t_read_us;
+        d.st.bytes   += bytes;
+        d.st.read_us += t_read_us;
 
-        ggml_backend_tensor_set(dst, g.lru.slot_map[l.owner], 0, ggml_nbytes(l.slot_map));
+        // the first part synchronized the backend, the later parts can run while it computes
+        if (ip == 0) {
+            ggml_backend_tensor_set(dst, map, 0, ggml_nbytes(p.slot_map));
+        } else {
+            // the next copy synchronizes the backend before it changes the slot map again
+            ggml_backend_tensor_set_async(backend, dst, map, 0, ggml_nbytes(p.slot_map));
+        }
 
         return true;
+    }
+
+    // expert split: count the selected experts of the layer that owns them, for the rebalance
+    void count_selections(int32_t owner) {
+        std::vector<uint32_t> & cnt = sel_count[owner];
+        for (const int32_t e : ids) {
+            GGML_ASSERT(e >= 0 && e < (int32_t) cnt.size());
+            cnt[e]++;
+        }
+        sel_since_check[owner] += ids.size();
+        sel_since_halve[owner] += ids.size();
+        if (sel_since_halve[owner] >= rebalance_halve) {
+            for (uint32_t & c : cnt) {
+                c /= 2;
+            }
+            sel_since_halve[owner] = 0;
+        }
+    }
+
+    // the part of layer il on device dev, nullptr if none
+    const part * part_on(int32_t il, int32_t dev) const {
+        for (const part & p : layers[il].parts) {
+            if (groups[p.ig].id == dev) {
+                return &p;
+            }
+        }
+        return nullptr;
+    }
+
+    // expert split: between two graphs, move experts between the devices of the layers that had enough selections since their
+    // last check, so that the share of the selections of each device gets closer to its target
+    // never during a graph, so that all devices plan a layer with the same owners
+    void begin_graph() {
+        if (!split_expert || !rebalance) {
+            return;
+        }
+        const size_t n_expert = model.hparams.n_expert;
+        std::vector<double>  counts(n_expert);
+        std::vector<double>  targets(devices.size());
+        std::vector<int32_t> caps(devices.size());
+        std::vector<bool>    cached(n_expert);
+        for (size_t d = 0; d < devices.size(); ++d) {
+            targets[d] = devices[d].share;
+        }
+        for (size_t il = 0; il < layers.size(); ++il) {
+            const layer & l = layers[il];
+            if (l.parts.empty() || l.owner != (int32_t) il || sel_since_check[il] < rebalance_interval) {
+                continue;
+            }
+            sel_since_check[il] = 0;
+
+            // a device takes experts up to its group's slots, or up to its initial count, so that max_ubatch() stays valid
+            std::fill(caps.begin(), caps.end(), 0);
+            for (const part & p : l.parts) {
+                const group & g = groups[p.ig];
+                caps[g.id] = std::max(devices[g.id].n_owned, g.n_slots);
+            }
+            std::vector<int32_t> & own = owner_dev[il];
+            for (size_t e = 0; e < n_expert; ++e) {
+                counts[e] = sel_count[il][e];
+                const part * p = part_on((int32_t) il, own[e]);
+                GGML_ASSERT(p != nullptr);
+                const moe_cache_lru & lru = groups[p->ig].lru;
+                cached[e] = lru.slot_map[il][e] < lru.n_slots;
+            }
+            for (const llama_expert_move & mv : llama_expert_share_rebalance(counts, own, targets, caps, cached, rebalance_tol, rebalance_moves)) {
+                groups[part_on((int32_t) il, mv.from)->ig].lru.drop((int32_t) il, mv.expert);
+                devices[mv.from].moved_out++;
+                devices[mv.to].moved_in++;
+            }
+        }
     }
 
     void log_stats() const {
@@ -952,23 +1415,66 @@ struct llama_moe_cache::impl {
             if (n == 0) {
                 return;
             }
-            const double mib = st.bytes/1024.0/1024.0;
-            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, read = %.2f MiB in %.2f s (%.1f MiB/s)\n",
-                name, st.hits, st.misses, 100.0*st.hits/n, mib, st.read_us/1e6, st.read_us > 0 ? mib/(st.read_us/1e6) : 0.0);
+            const double mib       = st.bytes/1024.0/1024.0;
+            const double mib_local = (st.bytes - st.bytes_server)/1024.0/1024.0;
+            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, read = %.2f MiB, local %.2f MiB in %.2f s (%.1f MiB/s)\n",
+                name, st.hits, st.misses, 100.0*st.hits/n, mib, mib_local, st.read_us/1e6, st.read_us > 0 ? mib_local/(st.read_us/1e6) : 0.0);
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
+
+        if (!split_expert) {
+            return;
+        }
+        size_t n_used = 0;
+        for (const device & d : devices) {
+            n_used += d.st.n_used;
+        }
+        for (size_t id = 0; id < devices.size(); ++id) {
+            const device & d = devices[id];
+            if (d.n_owned == 0 || n_used == 0) {
+                continue;
+            }
+            // the experts it owns now, on average over the layers with their own experts
+            size_t n_owned = 0;
+            size_t n_layer = 0;
+            for (size_t il = 0; il < layers.size(); ++il) {
+                if (!layers[il].parts.empty() && layers[il].owner == (int32_t) il) {
+                    n_owned += std::count(owner_dev[il].begin(), owner_dev[il].end(), (int32_t) id);
+                    n_layer++;
+                }
+            }
+            const stats & st = d.st;
+            const size_t n = st.hits + st.misses;
+            LLAMA_LOG_INFO("llama_moe_cache: %s: share target %.1f%%, measured %.1f%%, %.1f of %u experts per layer, hits = %zu, misses = %zu, hit rate = %.2f%%, read = %.2f MiB%s, moved in %zu, out %zu\n",
+                d.name.c_str(), 100.0*d.share, 100.0*st.n_used/n_used, n_layer > 0 ? (double) n_owned/n_layer : 0.0, model.hparams.n_expert,
+                st.hits, st.misses, n > 0 ? 100.0*st.hits/n : 0.0, st.bytes/1024.0/1024.0, d.server_files.empty() ? "" : " (by the server)",
+                d.moved_in, d.moved_out);
+        }
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts,
+        size_t size, const std::vector<size_t> & sizes) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, sizes)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
 
-ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
-    return pimpl->get_experts(w);
+ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w, int32_t dev) const {
+    return pimpl->get_experts(w, dev);
+}
+
+ggml_backend_t llama_moe_cache::backend(int32_t dev) const {
+    return pimpl->devices.at(dev).backend;
+}
+
+void llama_moe_cache::begin_graph() {
+    pimpl->begin_graph();
+}
+
+ggml_backend_t llama_moe_cache::home() const {
+    return pimpl->home;
 }
 
 int64_t llama_moe_cache::max_ubatch() const {
@@ -979,8 +1485,8 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
     const int32_t il = layer.il;
     ggml_context * ctx0 = g.ctx0;
 
-    ggml_tensor * slot_map = pimpl->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
-    if (slot_map == nullptr) {
+    const auto * parts = pimpl->get_parts(il, selected_experts->ne[1], selected_experts->ne[0]);
+    if (parts == nullptr) {
         return {};
     }
     // the experts on disk have no other path, so each check below is fatal
@@ -988,32 +1494,49 @@ llama_moe_cache_lookup llama_moe_cache::build_lookup(const llm_graph_context & g
         if (w == nullptr) {
             continue;
         }
-        if (pimpl->get_experts(w) == nullptr) {
-            GGML_ABORT("LongHaul: %s is not in the expert cache", w->name);
+        for (size_t ip = 0; ip < parts->size(); ++ip) {
+            if (pimpl->get_experts(w, pimpl->part_dev(il, ip)) == nullptr) {
+                GGML_ABORT("LongHaul: %s is not in the expert cache", w->name);
+            }
         }
     }
 
     // always a copy: the top-k view is contiguous for 1 token only, and the graph topology must not depend on the ubatch size
     ggml_tensor * ids = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), ggml_nelements(selected_experts));
-
-    // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
-    // the callback reads the selected experts, reads the missing ones from disk and updates the slot map
-    ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
-    if (!ggml_backend_supports_op(pimpl->backend(il), slots)) {
-        GGML_ABORT("LongHaul: the GPU does not support the slot lookup");
+    if (pimpl->split_expert) {
+        // the ids are computed once, before the lookups of the devices
+        ggml_build_forward_expand(g.gf, ids);
     }
-    ggml_backend_sched_set_tensor_backend(g.sched, slots, pimpl->backend(il));
-    g.cb(slots, "ffn_moe_slots", il);
 
-    ggml_build_forward_expand(g.gf, slots);
+    llama_moe_cache_lookup res;
+    res.il = il;
+    for (size_t ip = 0; ip < parts->size(); ++ip) {
+        ggml_backend_t backend = pimpl->lookup_backend(il, ip);
 
-    return { il, ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]) };
+        // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
+        // the callback reads the selected experts, reads the missing ones from disk and updates the slot map
+        ggml_tensor * slots = ggml_get_rows(ctx0, (*parts)[ip].slot_map, ids); // [1, n_expert_used*n_tokens]
+        if (!ggml_backend_supports_op(backend, slots)) {
+            GGML_ABORT("LongHaul: the GPU does not support the slot lookup");
+        }
+        ggml_backend_sched_set_tensor_backend(g.sched, slots, backend);
+        g.cb(slots, "ffn_moe_slots", il);
+
+        // with the expert split, the lookup of a device is added with its experts, so that the lookup of the next device
+        // (and its disk reads) comes after the experts of this device are queued
+        if (!pimpl->split_expert) {
+            ggml_build_forward_expand(g.gf, slots);
+        }
+
+        res.parts.push_back({ pimpl->part_dev(il, ip), ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]) });
+    }
+    return res;
 }
 
-void llama_moe_cache::check_op(const ggml_tensor * w, const ggml_tensor * op) const {
+void llama_moe_cache::check_op(const ggml_tensor * w, const ggml_tensor * op, int32_t dev) const {
     // the device of the cache must compute the matmul, else the scheduler copies the cache to another backend
-    GGML_ASSERT(pimpl->get_experts(w) != nullptr);
-    if (!ggml_backend_supports_op(pimpl->devices[pimpl->groups[0].id].backend, op)) {
+    GGML_ASSERT(pimpl->get_experts(w, dev) != nullptr);
+    if (!ggml_backend_supports_op(pimpl->devices[dev].backend, op)) {
         GGML_ABORT("LongHaul: the GPU does not support %s for %s (%s)", ggml_op_desc(op), w->name, ggml_type_name(w->type));
     }
 }

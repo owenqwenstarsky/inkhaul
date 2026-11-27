@@ -174,6 +174,28 @@ static std::vector<ggml_backend_dev_t> parse_devices_arg(const std::string & val
     return devices;
 }
 
+static void register_rpc_server_list(const std::string & servers) {
+    auto rpc_servers = string_split<std::string>(servers, ',');
+    if (rpc_servers.empty()) {
+        throw std::invalid_argument("no RPC servers specified");
+    }
+
+    auto * rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("failed to find RPC backend");
+    }
+
+    using add_rpc_server_fn = ggml_backend_reg_t (*)(const char * endpoint);
+    auto * ggml_backend_rpc_add_server_fn = (add_rpc_server_fn) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    if (!ggml_backend_rpc_add_server_fn) {
+        throw std::invalid_argument("failed to find RPC add server function");
+    }
+    for (const auto & server : rpc_servers) {
+        auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
+        ggml_backend_register(reg);
+    }
+}
+
 static std::string devices_to_string(const std::vector<ggml_backend_dev_t> & devices) {
     if (devices.empty()) {
         return "auto";
@@ -243,6 +265,10 @@ static const char * split_mode_str(llama_split_mode mode) {
             return "layer";
         case LLAMA_SPLIT_MODE_ROW:
             return "row";
+        case LLAMA_SPLIT_MODE_EXPERT:
+            return "expert";
+        case LLAMA_SPLIT_MODE_TENSOR:
+            return "tensor";
         default:
             GGML_ABORT("invalid split mode");
     }
@@ -258,6 +284,17 @@ static const char * lazy_mode_str(llama_lazy_mode mode) {
             return "on";
         default:
             GGML_ABORT("invalid lazy mode");
+    }
+}
+
+static const char * tp_attn_str(llama_tp_attn mode) {
+    switch (mode) {
+        case LLAMA_TP_ATTN_SPLIT:
+            return "split";
+        case LLAMA_TP_ATTN_MIRROR:
+            return "mirror";
+        default:
+            GGML_ABORT("invalid tp attn");
     }
 }
 
@@ -322,6 +359,7 @@ struct cmd_params {
     std::vector<int>                 n_batch;
     std::vector<int>                 n_ubatch;
     std::vector<int>                 lh_cache; // LongHaul cache in MiB
+    std::vector<size_t>              lh_cache_dev; // LongHaul cache per device in bytes (0 = from lh_cache), the same for all tests
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
     std::vector<int>                 n_threads;
@@ -333,6 +371,8 @@ struct cmd_params {
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
+    std::vector<llama_tp_attn>       tp_attn;
+    std::vector<std::string>         kv_remote;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
@@ -369,6 +409,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_batch              */ { 2048 },
     /* n_ubatch             */ { 512 },
     /* lh_cache             */ { 512 },
+    /* lh_cache_dev         */ {},
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { common_cpu_get_num_math() },
@@ -380,6 +421,8 @@ static const cmd_params cmd_params_defaults = {
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
+    /* tp_attn              */ { LLAMA_TP_ATTN_SPLIT },
+    /* kv_remote            */ { "none" },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
@@ -421,6 +464,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 0)\n");
+    if (llama_supports_rpc()) {
+        printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
+    }
     printf("\n");
     printf("test parameters:\n");
     printf("  -m, --model <filename>                            (default: %s)\n", join(cmd_params_defaults.model, ",").c_str());
@@ -441,6 +487,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -lhc, --longhaul-cache <size>                     LongHaul expert cache, e.g. 512M,1G (default: %sM)\n", join(cmd_params_defaults.lh_cache, ",").c_str());
+    printf("  -lhcd, --longhaul-cache-device <s0/s1/...>        LongHaul expert cache per device in the order of the devices, 0 = from -lhc, e.g. 12G/4G\n");
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -449,13 +496,16 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  -sm, --split-mode <none|layer|row>                (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+    printf("  -sm, --split-mode <none|layer|row|expert|tensor>  (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
+    printf("  -tpa, --tp-attn <split|mirror>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.tp_attn, tp_attn_str), ",").c_str());
+    printf("  -kvr, --kv-remote <none|DEV>                      (default: %s)\n", join(cmd_params_defaults.kv_remote, ",").c_str());
+    printf("                                                    the KV cache and attention of the full-attention layers on the RPC device DEV\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
@@ -624,6 +674,23 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     }
                     params.lh_cache.push_back((int) (bytes/(1024*1024)));
                 }
+            } else if (arg == "-lhcd" || arg == "--longhaul-cache-device") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const auto sizes = string_split<std::string>(argv[i], '/');
+                if (sizes.size() > llama_max_devices()) {
+                    invalid_param = true;
+                    break;
+                }
+                params.lh_cache_dev.assign(llama_max_devices(), 0);
+                for (size_t j = 0; j < sizes.size(); ++j) {
+                    params.lh_cache_dev[j] = sizes[j] == "0" ? 0 : string_parse_mem_size(sizes[j]);
+                    if (sizes[j] != "0" && params.lh_cache_dev[j] == 0) {
+                        throw std::invalid_argument("invalid LongHaul cache size: " + sizes[j]);
+                    }
+                }
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -727,6 +794,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+            } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                try {
+                    register_rpc_server_list(argv[i]);
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "error: %s\n", e.what());
+                    invalid_param = true;
+                    break;
+                }
             } else if (arg == "-sm" || arg == "--split-mode") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -743,6 +822,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_SPLIT_MODE_LAYER;
                     } else if (m == "row") {
                         mode = LLAMA_SPLIT_MODE_ROW;
+                    } else if (m == "expert") {
+                        mode = LLAMA_SPLIT_MODE_EXPERT;
+                    } else if (m == "tensor") {
+                        mode = LLAMA_SPLIT_MODE_TENSOR;
                     } else {
                         invalid_param = true;
                         break;
@@ -811,6 +894,37 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.lazy_mode.insert(params.lazy_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "-tpa" || arg == "--tp-attn") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+
+                std::vector<llama_tp_attn> modes;
+                for (const auto & m : p) {
+                    llama_tp_attn mode;
+                    if (m == "split") {
+                        mode = LLAMA_TP_ATTN_SPLIT;
+                    } else if (m == "mirror") {
+                        mode = LLAMA_TP_ATTN_MIRROR;
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                    modes.push_back(mode);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.tp_attn.insert(params.tp_attn.end(), modes.begin(), modes.end());
+            } else if (arg == "-kvr" || arg == "--kv-remote") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.kv_remote.insert(params.kv_remote.end(), p.begin(), p.end());
             } else if (arg == "-mg" || arg == "--main-gpu") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1137,6 +1251,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.lazy_mode.empty()) {
         params.lazy_mode = cmd_params_defaults.lazy_mode;
     }
+    if (params.tp_attn.empty()) {
+        params.tp_attn = cmd_params_defaults.tp_attn;
+    }
+    if (params.kv_remote.empty()) {
+        params.kv_remote = cmd_params_defaults.kv_remote;
+    }
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
     }
@@ -1197,6 +1317,7 @@ struct cmd_params_instance {
     int                n_batch;
     int                n_ubatch;
     int                lh_cache;
+    std::vector<size_t> lh_cache_dev;
     ggml_type          type_k;
     ggml_type          type_v;
     int                n_threads;
@@ -1208,6 +1329,9 @@ struct cmd_params_instance {
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
+    llama_tp_attn      tp_attn;
+    std::string        kv_remote; // "none" or a device name
+    int                kv_gpu;    // kv_remote as an index into devices, -1 for none
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
@@ -1231,6 +1355,9 @@ struct cmd_params_instance {
         mparams.split_mode    = split_mode;
         mparams.load_mode     = load_mode;
         mparams.lazy_mode     = lazy_mode;
+        mparams.tp_attn       = tp_attn;
+        mparams.kv_gpu        = kv_gpu;
+        mparams.tokenize_on_kv_gpu = kv_gpu >= 0;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
@@ -1279,7 +1406,7 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
+               load_mode == other.load_mode && lazy_mode == other.lazy_mode && tp_attn == other.tp_attn && kv_gpu == other.kv_gpu &&
                devices == other.devices && no_host == other.no_host && repack == other.repack &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1291,6 +1418,7 @@ struct cmd_params_instance {
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
         cparams.longhaul_cache_size = (size_t) lh_cache*1024*1024;
+        cparams.longhaul_cache_sizes = lh_cache_dev.empty() ? nullptr : lh_cache_dev.data();
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
@@ -1302,6 +1430,51 @@ struct cmd_params_instance {
         return cparams;
     }
 };
+
+// -kvr: the devices of the model in the order the library uses (the RPC devices first), and the index of the remote one
+// false (with an error) if the device is not an RPC device of the run
+static bool resolve_kv_remote(cmd_params_instance & inst) {
+    if (inst.kv_remote == "none") {
+        return true;
+    }
+    std::vector<ggml_backend_dev_t> devs;
+    for (ggml_backend_dev_t dev : inst.devices) {
+        if (dev != nullptr) {
+            devs.push_back(dev);
+        }
+    }
+    if (devs.empty()) {
+        std::vector<ggml_backend_dev_t> gpus;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(dev);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            const bool is_rpc = std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev))) == "RPC";
+            if (is_rpc) {
+                devs.push_back(dev);
+            } else {
+                gpus.push_back(dev);
+            }
+        }
+        devs.insert(devs.end(), gpus.begin(), gpus.end());
+    }
+    for (size_t i = 0; i < devs.size(); ++i) {
+        if (inst.kv_remote == ggml_backend_dev_name(devs[i]) || inst.kv_remote == ggml_backend_dev_description(devs[i])) {
+            if (std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devs[i]))) != "RPC") {
+                fprintf(stderr, "error: -kvr %s is not an RPC device\n", inst.kv_remote.c_str());
+                return false;
+            }
+            inst.devices = devs;
+            inst.devices.push_back(nullptr);
+            inst.kv_gpu  = (int) i;
+            return true;
+        }
+    }
+    fprintf(stderr, "error: -kvr %s is not a device of the run (see --list-devices)\n", inst.kv_remote.c_str());
+    return false;
+}
 
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
@@ -1316,6 +1489,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
     for (const auto & lzm : params.lazy_mode)
+    for (const auto & tpa : params.tp_attn)
+    for (const auto & kvr : params.kv_remote)
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
@@ -1348,6 +1523,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
                 /* .lh_cache              = */ lhc,
+                /* .lh_cache_dev          = */ params.lh_cache_dev,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1359,6 +1535,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .tp_attn               = */ tpa,
+                /* .kv_remote             = */ kvr,
+                /* .kv_gpu                = */ -1,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1372,6 +1551,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
+            if (!resolve_kv_remote(instance)) {
+                continue;
+            }
             instances.push_back(instance);
         }
 
@@ -1387,6 +1569,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
                 /* .lh_cache              = */ lhc,
+                /* .lh_cache_dev          = */ params.lh_cache_dev,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1398,6 +1581,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .tp_attn               = */ tpa,
+                /* .kv_remote             = */ kvr,
+                /* .kv_gpu                = */ -1,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1411,6 +1597,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
+            if (!resolve_kv_remote(instance)) {
+                continue;
+            }
             instances.push_back(instance);
         }
 
@@ -1426,6 +1615,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
                 /* .lh_cache              = */ lhc,
+                /* .lh_cache_dev          = */ params.lh_cache_dev,
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
@@ -1437,6 +1627,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .tp_attn               = */ tpa,
+                /* .kv_remote             = */ kvr,
+                /* .kv_gpu                = */ -1,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1450,6 +1643,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
+            if (!resolve_kv_remote(instance)) {
+                continue;
+            }
             instances.push_back(instance);
         }
     }
@@ -1481,6 +1677,8 @@ struct test {
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
     llama_lazy_mode          lazy_mode;
+    llama_tp_attn            tp_attn;
+    std::string              kv_remote;
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
@@ -1523,6 +1721,8 @@ struct test {
         split_mode     = inst.split_mode;
         load_mode      = inst.load_mode;
         lazy_mode      = inst.lazy_mode;
+        tp_attn        = inst.tp_attn;
+        kv_remote      = inst.kv_remote;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
@@ -1564,12 +1764,22 @@ struct test {
 
     static std::string get_backend() {
         std::vector<std::string> backends;
+        bool                     rpc_used = false;
         for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
             auto *      reg  = ggml_backend_reg_get(i);
             std::string name = ggml_backend_reg_name(reg);
-            if (name != "CPU") {
-                backends.push_back(name);
+            if (string_starts_with(name, "RPC")) {
+                if (ggml_backend_reg_dev_count(reg) > 0) {
+                    rpc_used = true;
+                }
+            } else {
+                if (name != "CPU") {
+                    backends.push_back(ggml_backend_reg_name(reg));
+                }
             }
+        }
+        if (rpc_used) {
+            backends.push_back("RPC");
         }
         return backends.empty() ? "CPU" : join(backends, ",");
     }
@@ -1581,8 +1791,8 @@ struct test {
             "n_ubatch",       "lh_cache",       "n_threads",     "cpu_mask",       "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
-            "tensor_buft_overrides",            "load_mode",     "lazy_mode",
-            "embeddings",
+            "tensor_buft_overrides",            "load_mode",     "lazy_mode",     "tp_attn",
+            "kv_remote",      "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
@@ -1679,6 +1889,8 @@ struct test {
                                             tensor_buft_overrides_str,
                                             llama_load_mode_name(load_mode),
                                             lazy_mode_str(lazy_mode),
+                                            tp_attn_str(tp_attn),
+                                            kv_remote,
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
@@ -2007,6 +2219,12 @@ struct markdown_printer : public printer {
         }
         if (params.lazy_mode.size() > 1 || params.lazy_mode != cmd_params_defaults.lazy_mode) {
             fields.emplace_back("lazy_mode");
+        }
+        if (params.tp_attn.size() > 1 || params.tp_attn != cmd_params_defaults.tp_attn) {
+            fields.emplace_back("tp_attn");
+        }
+        if (params.kv_remote.size() > 1 || params.kv_remote != cmd_params_defaults.kv_remote) {
+            fields.emplace_back("kv_remote");
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");

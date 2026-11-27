@@ -70,6 +70,7 @@ test parameters:
   -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio>
                                             (default: auto)
   -lzm, --lazy-mode <on|auto|off>           (default: auto)
+  -tpa, --tp-attn <split|mirror>            (default: split)
   -embd, --embeddings <0|1>                 (default: 0)
   -ts, --tensor-split <ts0/ts1/..>          (default: 0)
   -ot --override-tensor <tensor name pattern>=<buffer type>;...

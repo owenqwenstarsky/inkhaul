@@ -1,4 +1,6 @@
+#include "arg.h"
 #include "common.h"
+#include "fit.h"
 #include "log.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -7,8 +9,10 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
+#include "ggml-rpc.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -16,12 +20,16 @@
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -47,6 +55,16 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     }
 
     return mse_a_b / mse_a_0;
+}
+
+// the largest NMSE of the rows of n values (the logits of one token), so that an error in a few tokens is not averaged away
+static double nmse_max_row(const std::vector<float> & a, const std::vector<float> & b, size_t n) {
+    GGML_ASSERT(a.size() == b.size() && n > 0 && a.size() % n == 0);
+    double res = 0.0;
+    for (size_t i0 = 0; i0 < a.size(); i0 += n) {
+        res = std::max(res, nmse(std::vector<float>(a.begin() + i0, a.begin() + i0 + n), std::vector<float>(b.begin() + i0, b.begin() + i0 + n)));
+    }
+    return res;
 }
 
 struct tensor_data_params {
@@ -182,6 +200,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
+    LOG("  --rpc                    Check LongHaul, -sm tensor and --kv-remote over RPC servers on threads of this process (127.0.0.1)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -242,7 +261,8 @@ struct kv_writer {
     }
 };
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0) {
+// n_ff_min: a larger FFN, so that -sm tensor gives each of two devices some rows (it splits in steps of 128)
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0, const uint32_t n_ff_min = 0) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -272,6 +292,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_head_kv = 2; // 4 routing heads in the first KV head
     }
     n_layer = std::max(n_layer, n_layer_min);
+    n_ff    = std::max(n_ff, n_ff_min);
     const uint32_t n_embd_head = n_embd / n_head;
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llama_arch_name(arch));
@@ -448,7 +469,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
 
     if (moe) {
         ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, n_ff);
-        ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, n_ff / 2);  // distinct from n_ff so a saver key-clobber surfaces on reload
+        // distinct from n_ff so a saver key-clobber surfaces on reload,
+        // and 256 for qwen35moe so that -sm tensor gives each of two devices a slice of 128
+        ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, arch == LLM_ARCH_QWEN35MOE ? uint32_t(256) : n_ff / 2);
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         // with more experts than a ubatch uses, the copy of the used experts in host memory skips some of them
@@ -536,15 +559,25 @@ static llama_model_ptr get_model(
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr,
-        const std::vector<std::string> & splits = {}) {
+        const std::vector<std::string> & splits = {}, const float * tensor_split = nullptr, const int32_t main_gpu = 0,
+        const llama_tp_attn tp_attn = LLAMA_TP_ATTN_SPLIT) {
     GGML_ASSERT((gguf_ctx != nullptr) + (file != nullptr) + !splits.empty() == 1);
     llama_model_params model_params = llama_model_default_params();
+    model_params.tp_attn = tp_attn;
     model_params.progress_callback = silent_model_load_progress;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    // the model reads llama_max_devices() values, the callers give one per device
+    std::vector<float> tensor_split_full;
+    if (tensor_split != nullptr) {
+        tensor_split_full.assign(llama_max_devices(), 0.0f);
+        std::copy(tensor_split, tensor_split + std::min(devs.size(), tensor_split_full.size()), tensor_split_full.begin());
+    }
+    model_params.tensor_split = tensor_split != nullptr ? tensor_split_full.data() : nullptr;
+    model_params.main_gpu = main_gpu;
 
     tensor_data_params tensor_params = { seed, stdev };
     std::vector<const char *> split_paths;
@@ -566,8 +599,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t longhaul_cache_size = 0,
-        const std::vector<std::string> & splits = {}) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, splits);
+        const std::vector<std::string> & splits = {}, const float * tensor_split = nullptr,
+        const int32_t main_gpu = 0, const size_t * longhaul_cache_sizes = nullptr, const llama_tp_attn tp_attn = LLAMA_TP_ATTN_SPLIT) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, splits, tensor_split, main_gpu, tp_attn);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -576,6 +610,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ubatch = 64;
     // 0: a file-backed model keeps its experts in the mapped file as the reference, see LLAMA_LONGHAUL_RESIDENT in main
     ctx_params.longhaul_cache_size = longhaul_cache_size;
+    ctx_params.longhaul_cache_sizes = longhaul_cache_sizes;
 
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
@@ -878,13 +913,17 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         std::vector<ggml_backend_dev_t> devs;
         std::string                     label;
         llama_split_mode                split_mode;
+        std::vector<float>              tensor_split;
+        llama_tp_attn                   tp_attn;
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, std::vector<float> ts = {},
+                llama_tp_attn tp_attn = LLAMA_TP_ATTN_SPLIT)
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), tensor_split(std::move(ts)), tp_attn(tp_attn) {}
     };
 
     std::vector<device_config> dev_configs;
     size_t max_device_label_length = 4;
+    std::vector<ggml_backend_dev_t> devices_meta;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (target_backend != nullptr && strcmp(target_backend, ggml_backend_dev_name(dev)) != 0) {
@@ -892,6 +931,24 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         }
         dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, get_device_label(dev), LLAMA_SPLIT_MODE_LAYER);
         max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+        // CPU-based devices cannot be used in tensor split mode
+        if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
+            devices_meta.push_back(dev);
+        }
+    }
+    // tensor parallelism over all GPUs, with an even and an uneven split
+    if (target_backend == nullptr && !devices_meta.empty()) {
+        dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        if (devices_meta.size() > 1) {
+            std::vector<float> ts(devices_meta.size(), 1.0f);
+            ts[0] = 3.0f;
+            dev_configs.emplace_back(devices_meta, "Meta 3:1", LLAMA_SPLIT_MODE_TENSOR, ts);
+            dev_configs.emplace_back(devices_meta, "Meta mirror", LLAMA_SPLIT_MODE_TENSOR, std::vector<float>{}, LLAMA_TP_ATTN_MIRROR);
+            dev_configs.emplace_back(devices_meta, "Meta mirror 3:1", LLAMA_SPLIT_MODE_TENSOR, ts, LLAMA_TP_ATTN_MIRROR);
+        }
+        for (const auto & dc : dev_configs) {
+            max_device_label_length = std::max(max_device_label_length, dc.label.length());
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -956,16 +1013,18 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 char nmse_str[12] = {0};
                 char mixed_str[12] = {0};
 
-                bool skip = !arch_supported(arch);
+                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llama_arch_supports_sm_tensor(arch));
                 bool test_executed = false;
                 bool test_ok = true;
+                const float * dc_ts = dc.tensor_split.empty() ? nullptr : dc.tensor_split.data();
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens);
                     }
                     test_executed = true;
-                    model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode);
+                    model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, nullptr, 0, {}, dc_ts,
+                        0, nullptr, dc.tp_attn);
                     logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens);
                     const double nmse_val = nmse(logits_cpu, logits_dev);
                     snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -1038,7 +1097,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         GGML_ASSERT(file != nullptr);
 
                         {
-                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode);
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, nullptr, 0, {}, dc_ts,
+                                0, nullptr, dc.tp_attn);
                             const std::vector<float> logits_roundtrip = get_logits(
                                 model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens);
                             status_roundtrip = "\033[1;32mOK\033[0m";
@@ -1293,6 +1353,70 @@ static ggml_backend_dev_t get_gpu(const char * name, ggml_backend_dev_t skip) {
     return nullptr;
 }
 
+// LongHaul with the layers split over two GPUs: each GPU caches the experts of its layers in its own banks
+// size_dev is the budget that the GPU with the smallest share of a split gets, the logits must match the reference
+// a small model can have all its layers on one GPU in some splits, but at least one split must use both
+static bool test_longhaul_two_gpus(const std::string & label, const std::string & path, const size_t seed, const float stdev,
+        ggml_backend_dev_t gpu, ggml_backend_dev_t gpu2, const size_t size_dev,
+        const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref) {
+    struct split_case {
+        const char * name;
+        float        ts[2];
+        size_t       size;
+    };
+    const split_case cases[] = {
+        { "even split",           { 1.0f, 1.0f }, 2*size_dev       },
+        { "split 1/3",            { 1.0f, 3.0f }, 4*size_dev       },
+        { "even split, 512 MiB",  { 1.0f, 1.0f }, 512ull*1024*1024 },
+    };
+    bool all_ok = true;
+    bool spanned = false;
+    for (const split_case & sc : cases) {
+        FILE * file = fopen(path.c_str(), "rb");
+        GGML_ASSERT(file != nullptr);
+        bool ok = true;
+        std::string detail;
+        try {
+            auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu, gpu2 }, LLAMA_SPLIT_MODE_LAYER, nullptr, sc.size, {}, sc.ts);
+            const llama_model * model = model_and_ctx.first.get();
+
+            // both GPUs hold layers, and a slot that aliases another layer is on the GPU of that layer
+            int n_dev[2] = { 0, 0 };
+            for (int32_t il = 0; il < llama_model_n_layer(model); il++) {
+                ggml_backend_dev_t dev = llama_model_dev_layer(model, il);
+                n_dev[dev == gpu2]++;
+                if (dev != llama_model_dev_layer(model, llama_model_layer_phys(model, il))) {
+                    ok = false;
+                    detail = "layer " + std::to_string(il) + " is not on the device of its weights";
+                }
+            }
+            spanned = spanned || (n_dev[0] > 0 && n_dev[1] > 0);
+            detail += (detail.empty() ? "" : ", ") + std::string("layers ") + std::to_string(n_dev[0]) + "/" + std::to_string(n_dev[1]);
+
+            const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+            const double nmse_val = nmse(logits_ref, logits);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+            detail += detail.empty() ? buf : std::string(", ") + buf;
+            ok = ok && nmse_val <= 1e-4;
+        } catch (const std::exception & err) {
+            ok = false;
+            detail = err.what();
+        }
+        fclose(file);
+        LOG("LongHaul %s, two GPUs, %s: %s (%s)\n", label.c_str(), sc.name, ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    }
+    if (!spanned) {
+        LOG("LongHaul %s, two GPUs: FAIL (no split puts layers on both GPUs)\n", label.c_str());
+    }
+    return all_ok && spanned;
+}
+
+static bool test_longhaul_expert_split(const std::string & label, const std::string & path, const size_t seed, const float stdev,
+        ggml_backend_dev_t gpu, ggml_backend_dev_t gpu2, const size_t size_dev, const size_t size_min,
+        const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref);
+
 // a file for the LongHaul test, rewritten from the file saved from the in-memory model
 struct longhaul_variant {
     const char * name;
@@ -1382,7 +1506,7 @@ static void write_longhaul_variant(const std::string & src, const std::string & 
 // the logits must match the same file with its experts in the mapped file, for caches from the smallest (evictions in every layer) to one that holds all experts
 static int test_longhaul(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
     ggml_backend_dev_t gpu  = get_gpu(target_backend, nullptr);
-    // a second GPU, for the error of a cache on two GPUs (GGML_CUDA_DEVICES=2 or GGML_METAL_DEVICES=2 emulate one)
+    // a second GPU, for the layers split over two GPUs (GGML_CUDA_DEVICES=2 or GGML_METAL_DEVICES=2 emulate one)
     ggml_backend_dev_t gpu2 = get_gpu(nullptr, gpu);
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
@@ -1561,6 +1685,11 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
                 all_ok = all_ok && ok;
             }
 
+            if (gpu2 != nullptr) {
+                all_ok = test_longhaul_two_gpus(label, path, seed, stdev, gpu, gpu2, cache_size(5), tokens, logits_ref) && all_ok;
+                all_ok = test_longhaul_expert_split(label, path, seed, stdev, gpu, gpu2, cache_size(5), size_min, tokens, logits_ref) && all_ok;
+            }
+
             // a cache that cannot hold the experts of one token, no cache without the test hook, and no GPU are errors
             if (&v == &av.variants.front() && type_exps == GGML_TYPE_COUNT) {
                 struct error_case {
@@ -1573,9 +1702,6 @@ static int test_longhaul(const std::string & arch_filter, const size_t seed, con
                     { "no cache",        0,                    { gpu } },
                     { "no GPU",          cache_size(n_expert), {} },
                 };
-                if (gpu2 != nullptr) {
-                    errors.push_back({ "two GPUs", cache_size(n_expert), { gpu, gpu2 } });
-                }
                 set_longhaul_resident(false);
                 for (const error_case & ec : errors) {
                     FILE * file = fopen(path.c_str(), "rb");
@@ -1719,6 +1845,169 @@ static std::vector<float> get_logits_steps(llama_model * model, llama_context * 
 
 // LongHaul with bailingmoe3: a dense lead layer, separate gate, up and down experts, a NextN layer that stays on disk,
 // files with two expert layouts and split files; the logits must match the in-memory model, also when decoding in small batches
+// the measured shares of the devices in the stats at exit, see llama_moe_cache::impl::log_stats
+static std::vector<double> get_measured_shares(const std::string & log) {
+    std::vector<double> res;
+    for (size_t pos = log.find(": share target "); pos != std::string::npos; pos = log.find(": share target ", pos + 1)) {
+        double target   = 0.0;
+        double measured = 0.0;
+        if (sscanf(log.c_str() + pos, ": share target %lf%%, measured %lf%%", &target, &measured) == 2) {
+            res.push_back(measured);
+        }
+    }
+    return res;
+}
+
+// LongHaul with the expert split over two GPUs: all layers on one GPU, the experts of every layer split by the shares
+// size_dev holds a few slots of every group, size_min the experts of one token on one GPU
+static bool test_longhaul_expert_split(const std::string & label, const std::string & path, const size_t seed, const float stdev,
+        ggml_backend_dev_t gpu, ggml_backend_dev_t gpu2, const size_t size_dev, const size_t size_min,
+        const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref) {
+    struct expert_case {
+        const char *        name;
+        float               ts[2];
+        int32_t             main_gpu;
+        size_t              size;
+        std::vector<size_t> sizes; // per device, empty: none
+        bool                fails;
+        bool                rebalance = false; // move experts toward the shares at every graph, off in the other cases
+        bool                check_splits = false; // the scheduler splits let the devices compute at the same time
+    };
+    const expert_case cases[] = {
+        { "50/50, layers on GPU 2",           { 1.0f, 1.0f }, 1, 2*size_dev,       {},           false },
+        { "30/70, layers on GPU 1",           { 3.0f, 7.0f }, 0, 4*size_dev,       {},           false, false, true },
+        { "100/0, layers on GPU 2",           { 1.0f, 0.0f }, 1, size_dev,         {},           false },
+        { "0/100, layers on GPU 2",           { 0.0f, 1.0f }, 1, size_dev,         {},           false },
+        { "50/50, 512 MiB",                   { 1.0f, 1.0f }, 1, 512ull*1024*1024, {},           false },
+        { "50/50, smallest cache on GPU 1",   { 1.0f, 1.0f }, 1, size_dev,         { size_min, 0 }, false },
+        { "50/50, too small cache on GPU 1",  { 1.0f, 1.0f }, 1, size_dev,         { size_min - 1, 0 }, true },
+        { "30/70, rebalanced",                { 3.0f, 7.0f }, 0, 4*size_dev,       {},           false, true },
+        { "30/70, rebalanced, smallest cache on GPU 1", { 3.0f, 7.0f }, 1, size_dev, { size_min, 0 }, false, true },
+    };
+    bool all_ok = true;
+    for (const expert_case & ec : cases) {
+        std::string log;
+        ggml_log_callback log_cb;
+        void * log_ud;
+        llama_log_get(&log_cb, &log_ud);
+        llama_log_set([](ggml_log_level, const char * text, void * ud) { ((std::string *) ud)->append(text); }, &log);
+
+        FILE * file = fopen(path.c_str(), "rb");
+        GGML_ASSERT(file != nullptr);
+        bool ok = true;
+        bool failed = false;
+        std::string detail;
+        // read when the context is created
+        setenv("LLAMA_EXPERT_SHARE_REBALANCE", ec.rebalance ? "1" : "0", 1);
+        if (ec.rebalance) {
+            setenv("LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL", "1", 1);
+        }
+        if (ec.check_splits) {
+            setenv("GGML_SCHED_DEBUG", "1", 1); // the splits of each graph in the log
+        }
+        try {
+            auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu, gpu2 }, LLAMA_SPLIT_MODE_EXPERT, nullptr, ec.size, {}, ec.ts,
+                ec.main_gpu, ec.sizes.empty() ? nullptr : ec.sizes.data());
+            const llama_model * model = model_and_ctx.first.get();
+
+            // all layers, and so the KV cache, on main_gpu
+            ggml_backend_dev_t home = ec.main_gpu == 0 ? gpu : gpu2;
+            for (int32_t il = 0; il < llama_model_n_layer(model); il++) {
+                if (llama_model_dev_layer(model, il) != home) {
+                    ok = false;
+                    detail = "layer " + std::to_string(il) + " is not on main_gpu, ";
+                    break;
+                }
+            }
+
+            const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+            // also decode and small batches after a prompt
+            const std::vector<float> logits_steps = get_logits_steps(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, 100);
+            const double nmse_val = std::max(nmse(logits_ref, logits), nmse(logits_ref, logits_steps));
+            // per token, so that a wrong expert in a few tokens shows up (e.g. a slot that a move left to the old device)
+            const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+            const double nmse_row = std::max(nmse_max_row(logits_ref, logits, n_vocab), nmse_max_row(logits_ref, logits_steps, n_vocab));
+            char buf[64];
+            snprintf(buf, sizeof(buf), "NMSE %.2e, per token at most %.2e", nmse_val, nmse_row);
+            detail += buf;
+            // the same backend as the reference, only the order of the sums differs: tighter than across backends, so that
+            // rows of skipped experts that are not zeroed show up
+            ok = ok && nmse_val <= 1e-5 && nmse_row <= 1e-5;
+        } catch (const std::exception & err) {
+            failed = true;
+            detail = err.what();
+        }
+        fclose(file);
+        llama_log_set(log_cb, log_ud);
+        unsetenv("LLAMA_EXPERT_SHARE_REBALANCE");
+        unsetenv("LLAMA_EXPERT_SHARE_REBALANCE_INTERVAL");
+        unsetenv("GGML_SCHED_DEBUG");
+
+        // the reason of a failed load is in the log
+        if (failed) {
+            const size_t pos = std::min(log.find("error"), log.find("failed to initialize"));
+            if (pos != std::string::npos) {
+                const size_t bol = log.rfind('\n', pos);
+                const size_t eol = log.find('\n', pos);
+                detail += ": " + log.substr(bol == std::string::npos ? 0 : bol + 1, eol == std::string::npos ? std::string::npos : eol - (bol == std::string::npos ? 0 : bol + 1));
+            }
+        }
+        if (ec.fails) {
+            ok = failed && log.find("is too small") != std::string::npos;
+            detail = failed ? detail : "no error";
+        } else if (failed) {
+            ok = false;
+        } else {
+            // every device with a share computed some of the selected experts
+            const std::vector<double> measured = get_measured_shares(log);
+            const size_t n_shared = (ec.ts[0] > 0.0f) + (ec.ts[1] > 0.0f);
+            const bool all_used = measured.size() == n_shared && std::all_of(measured.begin(), measured.end(), [](double m) { return m > 0.0; });
+            if (!all_used) {
+                ok = false;
+                detail += ", " + std::to_string(measured.size()) + " devices computed experts, expected " + std::to_string(n_shared);
+            }
+            for (double m : measured) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), ", %.1f%%", m);
+                detail += buf;
+            }
+            // without the rebalance no expert moves
+            size_t n_moved = 0;
+            for (size_t pos = log.find(", moved in "); pos != std::string::npos; pos = log.find(", moved in ", pos + 1)) {
+                size_t in = 0;
+                if (sscanf(log.c_str() + pos, ", moved in %zu", &in) == 1) {
+                    n_moved += in;
+                }
+            }
+            detail += ", " + std::to_string(n_moved) + " moved";
+            if (!ec.rebalance && n_moved > 0) {
+                ok = false;
+            }
+            // a split that copies a slot map copies nothing else: the sums of the other devices are copied in a later split, so
+            // the home device queues its own experts before it waits for them
+            if (ec.check_splits) {
+                size_t n_lookup = 0;
+                size_t n_bad    = 0;
+                for (size_t pos = log.find("## SPLIT #"); pos != std::string::npos; pos = log.find("## SPLIT #", pos + 1)) {
+                    const std::string line = log.substr(pos, log.find('\n', pos) - pos);
+                    if (line.find("moe_cache.slot_map") != std::string::npos) {
+                        n_lookup++;
+                        n_bad += line.find(" # 1 inputs") == std::string::npos;
+                    }
+                }
+                detail += ", " + std::to_string(n_lookup) + " lookup splits";
+                if (n_lookup == 0 || n_bad > 0) {
+                    ok = false;
+                    detail += " (" + std::to_string(n_bad) + " also copy other inputs)";
+                }
+            }
+        }
+        LOG("LongHaul %s, expert split, %s: %s (%s)\n", label.c_str(), ec.name, ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    }
+    return all_ok;
+}
+
 static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
     const llm_arch arch = LLM_ARCH_BAILINGMOE3;
     if (!arch_matches(arch_filter, arch)) {
@@ -1869,6 +2158,11 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
             all_ok = all_ok && ok;
         }
 
+        if (gpu2 != nullptr) {
+            all_ok = test_longhaul_two_gpus(name, path, seed, stdev, gpu, gpu2, v.mixed ? reserve(2) : cache_size(5), tokens, logits_ref) && all_ok;
+            all_ok = test_longhaul_expert_split(name, path, seed, stdev, gpu, gpu2, v.mixed ? reserve(2) : cache_size(5), reserve(1), tokens, logits_ref) && all_ok;
+        }
+
         if (v.mixed) {
             // below the reserve of one token, the error names the smallest cache
             std::string log;
@@ -1921,7 +2215,7 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
             all_ok = all_ok && ok;
         }
 
-        // a cache that cannot hold the experts of one token, no cache without the test hook, no GPU and two GPUs are errors
+        // a cache that cannot hold the experts of one token, no cache without the test hook and no GPU are errors
         struct error_case {
             const char *                    name;
             size_t                          size;
@@ -1932,9 +2226,6 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
             { "no cache",        0,                             { gpu } },
             { "no GPU",          cache_size(n_expert),          {} },
         };
-        if (gpu2 != nullptr) {
-            errors.push_back({ "two GPUs", cache_size(n_expert), { gpu, gpu2 } });
-        }
         set_longhaul_resident(false);
         for (const error_case & ec : errors) {
             FILE * file = fopen(path.c_str(), "rb");
@@ -1952,6 +2243,1108 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
         set_longhaul_resident(true);
 
         std::filesystem::remove(path);
+    }
+    return all_ok ? 0 : 1;
+}
+
+// LongHaul over RPC: an RPC server on a thread of this process (127.0.0.1 only) exposes the GPU
+// a file the server has a copy of is read by the server, a file whose copy differs is sent from the client; the logits must match either way
+static int test_longhaul_rpc(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    ggml_backend_dev_t gpu = get_gpu(target_backend, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    if (gpu == nullptr || reg == nullptr) {
+        LOG("LongHaul RPC: SKIP (%s)\n", gpu == nullptr ? "no GPU" : "no RPC backend");
+        return 0;
+    }
+    auto start_server_fn  = (decltype(ggml_backend_rpc_start_server) *)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    auto set_model_dir_fn = (decltype(ggml_backend_rpc_server_set_model_dir) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_server_set_model_dir");
+    auto add_server_fn    = (decltype(ggml_backend_rpc_add_server) *)           ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_add_server");
+    GGML_ASSERT(start_server_fn && set_model_dir_fn && add_server_fn);
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    const uint32_t n_expert      = 16;
+    const uint32_t n_expert_used = 2;
+    const longhaul_variant base  = { "", false, false, false };
+
+    std::random_device rd;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("test-llama-archs-rpc-" + std::to_string(rd()));
+    const std::filesystem::path dir_client = dir / "client";
+    const std::filesystem::path dir_server = dir / "server";
+    std::filesystem::create_directories(dir_client);
+    std::filesystem::create_directories(dir_server);
+
+    // per arch: file "a" with an exact copy on the server, file "b" (another name in the metadata) whose server copy has one changed byte
+    // the weights come from a pool keyed on the tensor names, so both files have the same weights
+    struct rpc_file {
+        llm_arch    arch;
+        std::string path;
+        bool        server_copy; // the server has the same file
+    };
+    std::vector<rpc_file> files;
+    for (const llm_arch arch : { LLM_ARCH_INKLING2, LLM_ARCH_INKLING2_LOOP }) {
+        if (!arch_matches(arch_filter, arch)) {
+            continue;
+        }
+        // "b" first: the logits read by the server must match the logits sent from the client bit for bit
+        for (const bool server_copy : { false, true }) {
+            const std::string name = std::string(llama_arch_name(arch)) + (server_copy ? "-a" : "-b") + ".gguf";
+            const std::string path = (dir_client / name).string();
+
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true, 0);
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_COUNT).c_str(), n_expert);
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_USED_COUNT).c_str(), n_expert_used);
+            gguf_set_val_str(gguf_ctx.get(), "general.name", name.c_str());
+            const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT).c_str()));
+            const std::string path_saved = get_tmp_gguf_path();
+            {
+                llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+                llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path_saved.c_str());
+            }
+            write_longhaul_variant(path_saved, path, arch, base, n_layer);
+            std::filesystem::remove(path_saved);
+
+            const std::filesystem::path path_server = dir_server / name;
+            std::filesystem::copy_file(path, path_server);
+            if (!server_copy) {
+                // the last byte is in a block of the fingerprint
+                std::fstream f(path_server, std::ios::binary | std::ios::in | std::ios::out);
+                f.seekg(-1, std::ios::end);
+                const char c = (char) (f.get() ^ 0xff);
+                f.seekp(-1, std::ios::end);
+                f.put(c);
+            }
+            files.push_back({ arch, path, server_copy });
+        }
+    }
+    if (files.empty()) {
+        std::filesystem::remove_all(dir);
+        return 0;
+    }
+
+    GGML_ASSERT(set_model_dir_fn(dir_server.string().c_str(), 2) == files.size());
+    const std::string endpoint = "127.0.0.1:" + std::to_string(40000 + rd() % 20000);
+    std::thread([start_server_fn, endpoint, gpu]() mutable {
+        start_server_fn(endpoint.c_str(), nullptr, 4, 1, &gpu);
+    }).detach();
+    ggml_backend_reg_t reg_server = nullptr;
+    for (int i = 0; i < 400 && reg_server == nullptr; i++) {
+        reg_server = add_server_fn(endpoint.c_str());
+        if (reg_server == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    if (reg_server == nullptr) {
+        LOG("LongHaul RPC: FAIL (the RPC server on %s did not start)\n", endpoint.c_str());
+        std::filesystem::remove_all(dir);
+        return 1;
+    }
+    ggml_backend_dev_t rpc = ggml_backend_reg_dev_get(reg_server, 0);
+
+    bool all_ok = true;
+    std::map<std::pair<llm_arch, size_t>, std::vector<float>> logits_sent;
+    for (const rpc_file & rf : files) {
+        const std::string label = std::string(llama_arch_name(rf.arch)) + (rf.server_copy ? ", server copy" : ", changed server copy");
+
+        // the reference: the experts in the mapped file, on the local GPU
+        std::vector<float> logits_ref;
+        {
+            FILE * file = fopen(rf.path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            auto model_and_ctx = get_model_and_ctx(nullptr, file, seed, stdev, { gpu });
+            logits_ref = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+            fclose(file);
+        }
+
+        uint32_t n_expert_file = 0;
+        const std::vector<expert_group> groups = get_expert_groups(rf.path, rf.arch, n_expert_file);
+        const size_t alignment = std::max(ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(rpc)), ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(gpu)));
+        const size_t size_5 = get_cache_size(groups, n_expert, n_expert_used, alignment, 5);
+
+        struct rpc_case {
+            const char *                    name;
+            std::vector<ggml_backend_dev_t> devs;
+            std::vector<float>              ts;
+            size_t                          size;
+            llama_split_mode                split_mode = LLAMA_SPLIT_MODE_LAYER;
+            int32_t                         main_gpu   = 0;
+        };
+        const rpc_case cases[] = {
+            { "RPC, 5 slots",            { rpc },      {},           size_5           },
+            { "RPC, 512 MiB",            { rpc },      {},           512ull*1024*1024 },
+            { "RPC + GPU 1/3, 5 slots",  { rpc, gpu }, { 1.0f, 3.0f }, 4*size_5       },
+            // the expert split: the RPC device computes 60% of the selected experts
+            { "expert split 60/40, layers on GPU", { rpc, gpu }, { 3.0f, 2.0f }, 4*size_5, LLAMA_SPLIT_MODE_EXPERT, 1 },
+            { "expert split 60/40, layers on RPC", { rpc, gpu }, { 3.0f, 2.0f }, 4*size_5, LLAMA_SPLIT_MODE_EXPERT, 0 },
+        };
+        for (size_t ic = 0; ic < sizeof(cases)/sizeof(cases[0]); ic++) {
+            const rpc_case & rc = cases[ic];
+            std::string log;
+            ggml_log_callback log_cb;
+            void * log_ud;
+            llama_log_get(&log_cb, &log_ud);
+            llama_log_set([](ggml_log_level, const char * text, void * ud) { ((std::string *) ud)->append(text); }, &log);
+            bool ok = true;
+            std::string detail;
+            try {
+                auto model_and_ctx = get_model_and_ctx(nullptr, nullptr, seed, stdev, rc.devs, rc.split_mode, nullptr, rc.size,
+                    { rf.path }, rc.ts.empty() ? nullptr : rc.ts.data(), rc.main_gpu);
+                const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                const double nmse_val = nmse(logits_ref, logits);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail = buf;
+                ok = nmse_val <= 1e-4;
+                if (!rf.server_copy) {
+                    logits_sent[{ rf.arch, ic }] = logits;
+                } else if (logits != logits_sent[{ rf.arch, ic }]) {
+                    ok = false;
+                    detail += ", differs from the experts sent from the client";
+                }
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            llama_log_set(log_cb, log_ud);
+
+            // with the expert split both devices compute some of the selected experts (the router of the test model picks the same
+            // two experts for every token, which 60/40 gives to different devices)
+            if (rc.split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+                const std::vector<double> measured = get_measured_shares(log);
+                if (measured.size() != 2 || measured[0] <= 0.0 || measured[1] <= 0.0) {
+                    ok = false;
+                    detail += ", " + std::to_string(measured.size()) + " devices computed experts, expected 2";
+                }
+            }
+
+            // the server reads the experts only from an exact copy
+            const bool read_by_server = log.find("read by the server") != std::string::npos;
+            const bool sent           = log.find("has no copy of") != std::string::npos;
+            if (read_by_server != rf.server_copy || sent == rf.server_copy) {
+                ok = false;
+                detail += rf.server_copy ? ", not read by the server" : ", not sent from the client";
+            }
+            LOG("LongHaul %s, %s: %s (%s)\n", label.c_str(), rc.name, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+    }
+
+    std::filesystem::remove_all(dir);
+    return all_ok ? 0 : 1;
+}
+
+// --kv-remote: an RPC server on a thread of this process (127.0.0.1 only) holds the KV cache of the full-attention layers,
+// runs their attention and tokenizes; the weights stay on the local GPU. The logits must match the local GPU, the server must hold
+// only K and V caches and no weights but the attention-only ones, and llama_tokenize must give the tokens of the local tokenizer
+static int test_kv_remote_rpc(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    ggml_backend_dev_t gpu = get_gpu(target_backend, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    if (gpu == nullptr || reg == nullptr) {
+        LOG("KV remote RPC: SKIP (%s)\n", gpu == nullptr ? "no GPU" : "no RPC backend");
+        return 0;
+    }
+    // the server on a second GPU if there is one, as on a second laptop
+    ggml_backend_dev_t gpu2 = get_gpu(nullptr, gpu);
+    if (gpu2 == nullptr) {
+        gpu2 = gpu;
+    }
+    auto start_server_fn  = (decltype(ggml_backend_rpc_start_server) *)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    auto set_model_dir_fn = (decltype(ggml_backend_rpc_server_set_model_dir) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_server_set_model_dir");
+    auto add_server_fn    = (decltype(ggml_backend_rpc_add_server) *)           ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_add_server");
+    GGML_ASSERT(start_server_fn && set_model_dir_fn && add_server_fn);
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    const longhaul_variant base = { "", false, false, false };
+
+    std::random_device rd;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("test-llama-archs-kvr-" + std::to_string(rd()));
+    const std::filesystem::path dir_client = dir / "client";
+    const std::filesystem::path dir_server = dir / "server";
+    std::filesystem::create_directories(dir_client);
+    std::filesystem::create_directories(dir_server);
+
+    // per arch a file with an exact copy on the server; the Inkling 2 files keep their experts on disk (LongHaul)
+    struct kvr_file {
+        llm_arch    arch;
+        std::string path;
+        bool        longhaul;
+    };
+    std::vector<kvr_file> files;
+    const std::pair<llm_arch, bool> archs[] = {
+        { LLM_ARCH_INKLING2, true }, { LLM_ARCH_INKLING2_LOOP, true }, { LLM_ARCH_QWEN35, false }, { LLM_ARCH_QWEN35MOE, true }, { LLM_ARCH_BAILINGMOE3, true },
+    };
+    for (const auto & am : archs) {
+        if (!arch_matches(arch_filter, am.first)) {
+            continue;
+        }
+        const bool longhaul = am.first == LLM_ARCH_INKLING2 || am.first == LLM_ARCH_INKLING2_LOOP;
+        const std::string name = std::string(llama_arch_name(am.first)) + ".gguf";
+        const std::string path = (dir_client / name).string();
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(am.first, am.second, 0);
+        if (longhaul) {
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(am.first, LLM_KV_EXPERT_COUNT).c_str(), 16);
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(am.first, LLM_KV_EXPERT_USED_COUNT).c_str(), 2);
+        }
+        const std::string path_saved = longhaul ? get_tmp_gguf_path() : path;
+        {
+            llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path_saved.c_str());
+        }
+        if (longhaul) {
+            const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(am.first, LLM_KV_BLOCK_COUNT).c_str()));
+            write_longhaul_variant(path_saved, path, am.first, base, n_layer);
+            std::filesystem::remove(path_saved);
+        }
+        std::filesystem::copy_file(path, dir_server / name);
+        files.push_back({ am.first, path, longhaul });
+    }
+    if (files.empty()) {
+        std::filesystem::remove_all(dir);
+        return 0;
+    }
+    // a client file that differs from every server file in one byte (in a block of the fingerprint): the server has no copy
+    // of it, so it cannot tokenize for it and the load fails
+    const std::string path_changed = (dir_client / "changed.gguf").string();
+    {
+        std::filesystem::copy_file(files[0].path, path_changed);
+        std::fstream f(path_changed, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekg(-1, std::ios::end);
+        const char c = (char) (f.get() ^ 0xff);
+        f.seekp(-1, std::ios::end);
+        f.put(c);
+    }
+
+    GGML_ASSERT(set_model_dir_fn(dir_server.string().c_str(), 2) == files.size());
+    if (!llama_rpc_server_enable_tokenizer()) {
+        LOG("KV remote RPC: FAIL (no server tokenizer)\n");
+        std::filesystem::remove_all(dir);
+        return 1;
+    }
+    const std::string endpoint = "127.0.0.1:" + std::to_string(40000 + rd() % 20000);
+    std::thread([start_server_fn, endpoint, gpu2]() mutable {
+        start_server_fn(endpoint.c_str(), nullptr, 4, 1, &gpu2);
+    }).detach();
+    ggml_backend_reg_t reg_server = nullptr;
+    for (int i = 0; i < 400 && reg_server == nullptr; i++) {
+        reg_server = add_server_fn(endpoint.c_str());
+        if (reg_server == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    if (reg_server == nullptr) {
+        LOG("KV remote RPC: FAIL (the RPC server on %s did not start)\n", endpoint.c_str());
+        std::filesystem::remove_all(dir);
+        return 1;
+    }
+    ggml_backend_dev_t rpc = ggml_backend_reg_dev_get(reg_server, 0);
+
+    // the device of each attention node (soft max or flash attention) and of each Inkling 2 bias (kq_b), counted by the eval callback
+    struct attn_count {
+        ggml_backend_dev_t rpc;
+        size_t attn_remote = 0;
+        size_t attn_local  = 0;
+        size_t kq_b_remote = 0;
+        size_t kq_b_local  = 0;
+    };
+    attn_count counts = { rpc };
+    auto count_cb = [](struct ggml_tensor * t, bool ask, void * user_data) {
+        if (!ask) {
+            return true;
+        }
+        attn_count * c = (attn_count *) user_data;
+        const ggml_tensor * base = t->view_src ? t->view_src : t;
+        const bool remote = base->buffer && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(base->buffer)) == c->rpc;
+        const std::string name = t->name;
+        if (t->op == GGML_OP_FLASH_ATTN_EXT || (t->op == GGML_OP_SOFT_MAX && name.rfind("kq_soft_max", 0) == 0)) {
+            (remote ? c->attn_remote : c->attn_local)++;
+        }
+        if (name.rfind("kq_b-", 0) == 0) {
+            (remote ? c->kq_b_remote : c->kq_b_local)++;
+        }
+        // false: no sync after the node, the counts need none
+        return false;
+    };
+
+    // the KV cache on the RPC device (the first of the devices), the layers on the GPU
+    auto load = [&](const std::string & path, bool kv_remote, size_t cache_size) {
+        llama_model_params mparams = llama_model_default_params();
+        mparams.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs = kv_remote ? std::vector<ggml_backend_dev_t>{ rpc, gpu, nullptr } : std::vector<ggml_backend_dev_t>{ gpu, nullptr };
+        mparams.devices = devs.data();
+        if (kv_remote) {
+            mparams.kv_gpu             = 0;
+            mparams.tokenize_on_kv_gpu = true;
+        }
+        llama_model_ptr model(llama_model_load_from_file(path.c_str(), mparams));
+        if (!model) {
+            throw std::runtime_error("failed to load the model");
+        }
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx           = 0;
+        cparams.n_threads       = 4;
+        cparams.n_threads_batch = 4;
+        cparams.n_ubatch        = 64;
+        cparams.longhaul_cache_size = cache_size;
+        cparams.swa_full = false; // as the tools have it
+        if (kv_remote) {
+            cparams.cb_eval           = count_cb;
+            cparams.cb_eval_user_data = &counts;
+        }
+        llama_context_ptr lctx(llama_init_from_model(model.get(), cparams));
+        if (!lctx) {
+            throw std::runtime_error("failed to create the context");
+        }
+        return std::make_pair(std::move(model), std::move(lctx));
+    };
+    auto dev_of = [](const ggml_tensor * t) -> ggml_backend_dev_t {
+        const ggml_tensor * base = t->view_src ? t->view_src : t;
+        return base->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(base->buffer)) : nullptr;
+    };
+
+    bool all_ok = true;
+    for (const kvr_file & kf : files) {
+        const std::string label = std::string(llama_arch_name(kf.arch)) + (kf.longhaul ? " (LongHaul)" : "");
+        bool ok = true;
+        std::string detail;
+        try {
+            // the reference: everything on the local GPU, the experts in the mapped file
+            std::vector<float> ref_batch;
+            std::vector<float> ref_steps;
+            std::vector<llama_token> ref_tok;
+            const std::string text = "Hello tok_5 world, 0123456789 tok_17 \xc3\xa9t\xc3\xa9";
+            {
+                auto mc = load(kf.path, false, 0);
+                ref_batch = get_logits(mc.first.get(), mc.second.get(), tokens);
+                ref_steps = get_logits_steps(mc.first.get(), mc.second.get(), tokens, 20);
+                ref_tok.resize(256);
+                const int32_t n = llama_tokenize(llama_model_get_vocab(mc.first.get()), text.data(), (int32_t) text.size(), ref_tok.data(), (int32_t) ref_tok.size(), true, true);
+                GGML_ASSERT(n > 1);
+                ref_tok.resize(n);
+            }
+
+            counts = { rpc };
+            auto mc = load(kf.path, true, kf.longhaul ? 512ull*1024*1024 : 0);
+            const std::vector<float> got_batch = get_logits(mc.first.get(), mc.second.get(), tokens);
+            const double nmse_batch = nmse(ref_batch, got_batch);
+            const std::vector<float> got_steps = get_logits_steps(mc.first.get(), mc.second.get(), tokens, 20);
+            const double nmse_steps = nmse(ref_steps, got_steps);
+            char buf[96];
+            snprintf(buf, sizeof(buf), "NMSE %.2e batch, %.2e steps", nmse_batch, nmse_steps);
+            detail = buf;
+            // the same GPU kernels on the same data, only the device of the attention differs
+            ok = nmse_batch <= 1e-6 && nmse_steps <= 1e-6;
+
+            // the server holds K and V caches only, and the GPU the rest of the memory
+            size_t n_remote = 0;
+            size_t n_local  = 0;
+            size_t k_remote = 0; // K caches, one per attention layer
+            size_t k_local  = 0;
+            for (const ggml_tensor * t : llama_memory_get_tensors(llama_get_memory(mc.second.get()))) {
+                const ggml_tensor * base = t->view_src ? t->view_src : t;
+                const std::string name = base->name;
+                const bool is_k = name.rfind("cache_", 0) == 0 && name.find("k_l") != std::string::npos;
+                if (dev_of(t) == rpc) {
+                    n_remote++;
+                    k_remote += is_k;
+                    if (name.rfind("cache_", 0) != 0 || (!is_k && name.find("v_l") == std::string::npos)) {
+                        ok = false;
+                        detail += ", " + name + " is on the server";
+                    }
+                } else {
+                    n_local++;
+                    k_local += is_k;
+                }
+            }
+
+            // every graph runs each attention layer once: the attention of a layer runs where its K cache is
+            if (counts.attn_remote == 0 || counts.attn_remote*(k_remote + k_local) != (counts.attn_remote + counts.attn_local)*k_remote) {
+                ok = false;
+                detail += ", " + std::to_string(counts.attn_remote) + " attention nodes on the server and " + std::to_string(counts.attn_local) +
+                    " local for " + std::to_string(k_remote) + " remote and " + std::to_string(k_local) + " local K caches";
+            }
+            // the Inkling 2 bias is n_kv x n_tokens x n_head, it is built where the attention runs
+            if (counts.kq_b_remote != (kf.arch == LLM_ARCH_INKLING2 || kf.arch == LLM_ARCH_INKLING2_LOOP ? counts.attn_remote : 0) ||
+                    counts.kq_b_local != (kf.arch == LLM_ARCH_INKLING2 || kf.arch == LLM_ARCH_INKLING2_LOOP ? counts.attn_local : 0)) {
+                ok = false;
+                detail += ", " + std::to_string(counts.kq_b_remote) + " Inkling 2 biases on the server and " + std::to_string(counts.kq_b_local) + " local";
+            }
+            if (n_remote == 0) {
+                ok = false;
+                detail += ", no KV cache on the server";
+            }
+            detail += ", " + std::to_string(n_remote) + " cache tensors on the server, " + std::to_string(n_local) + " local";
+
+            // no weights on the server but the relative-position bias of the Inkling 2 attention, which is small
+            size_t model_rpc = 0;
+            size_t model_gpu = 0;
+            for (const auto & [buft, mb] : llama_get_memory_breakdown(mc.second.get())) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                (dev == rpc ? model_rpc : model_gpu) += mb.model;
+            }
+            const bool inkling = kf.arch == LLM_ARCH_INKLING2 || kf.arch == LLM_ARCH_INKLING2_LOOP;
+            if (inkling ? model_rpc*20 > model_gpu : model_rpc != 0) {
+                ok = false;
+                detail += ", " + std::to_string(model_rpc) + " bytes of weights on the server";
+            }
+
+            // llama_tokenize runs on the server and gives the local tokens, also when the buffer is too small
+            const llama_vocab * vocab = llama_model_get_vocab(mc.first.get());
+            std::vector<llama_token> got_tok(256);
+            const int32_t n = llama_tokenize(vocab, text.data(), (int32_t) text.size(), got_tok.data(), (int32_t) got_tok.size(), true, true);
+            got_tok.resize(std::max(0, n));
+            const int32_t n_small = llama_tokenize(vocab, text.data(), (int32_t) text.size(), got_tok.data(), 1, true, true);
+            if (got_tok != ref_tok || n_small != -(int32_t) ref_tok.size()) {
+                ok = false;
+                detail += ", the remote tokens differ";
+            }
+        } catch (const std::exception & err) {
+            ok = false;
+            detail = err.what();
+        }
+        LOG("KV remote RPC %s: %s (%s)\n", label.c_str(), ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    }
+
+    // a server whose copy of the file differs cannot tokenize for it: the load fails
+    {
+        ggml_log_callback log_cb;
+        void * log_ud;
+        llama_log_get(&log_cb, &log_ud);
+        llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+        bool failed = false;
+        try {
+            load(path_changed, true, 512ull*1024*1024);
+        } catch (const std::exception &) {
+            failed = true;
+        }
+        llama_log_set(log_cb, log_ud);
+        LOG("KV remote RPC, changed server copy: %s\n", failed ? "OK (the load failed)" : "FAIL (the load did not fail)");
+        all_ok = all_ok && failed;
+    }
+
+    // --fit with the KV cache on the server: the layers cannot move, so only the context changes; the context memory grows on the
+    // server and stays the same on the GPU (recurrent state and sliding-window caches), the fit finds the context of the targets
+    for (const llm_arch arch : { LLM_ARCH_INKLING2, LLM_ARCH_QWEN35 }) {
+        if (!arch_matches(arch_filter, arch)) {
+            continue;
+        }
+        constexpr uint32_t n_ctx_train = 262144;
+        constexpr uint32_t n_ctx_min   = 4096;
+        const ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, arch == LLM_ARCH_INKLING2, 0);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_CONTEXT_LENGTH).c_str(), n_ctx_train);
+        const std::string path = (dir_client / (std::string("fit-") + llama_arch_name(arch) + ".gguf")).string();
+        {
+            llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path.c_str());
+        }
+        const std::vector<std::string> paths = { path };
+        std::vector<ggml_backend_dev_t> devs_param = { rpc, gpu, nullptr };
+        llama_model_params mparams = llama_model_default_params();
+        mparams.devices = devs_param.data();
+        mparams.kv_gpu  = 0;
+        mparams.progress_callback = silent_model_load_progress;
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_seq_max = 1;
+        cparams.swa_full  = false; // as the tools have it: the sliding-window caches stay small
+        auto measure = [&](uint32_t n_ctx) {
+            llama_context_params cp = cparams;
+            cp.n_ctx = n_ctx;
+            std::vector<ggml_backend_dev_t> devs;
+            uint32_t ngl = 0, nct = 0, nex = 0;
+            common_device_memory_data_vec dmds = common_get_device_memory_data(paths, &mparams, &cp, devs, ngl, nct, nex, log_level);
+            if (devs.size() != 2 || devs[0] != rpc || devs[1] != gpu) {
+                throw std::runtime_error("the measurement is not per device");
+            }
+            return dmds;
+        };
+        bool ok = true;
+        std::string detail;
+        try {
+            const common_device_memory_data_vec dmd_max = measure(n_ctx_train);
+            const common_device_memory_data_vec dmd_q   = measure(n_ctx_train/4);
+            if (dmd_max[0].model != 0 && arch != LLM_ARCH_INKLING2) {
+                throw std::runtime_error(string_format("%zu model bytes on the server", dmd_max[0].model));
+            }
+            if (!(dmd_max[0].context > dmd_q[0].context) || dmd_max[1].context != dmd_q[1].context) {
+                throw std::runtime_error(string_format("context on the server %zu -> %zu, on the GPU %zu -> %zu bytes",
+                    dmd_q[0].context, dmd_max[0].context, dmd_q[1].context, dmd_max[1].context));
+            }
+            // targets that leave room for exactly a quarter of the trained context
+            std::vector<size_t> margins(llama_max_devices(), 0);
+            for (size_t j = 0; j < 2; j++) {
+                margins[j] = size_t(int64_t(dmd_q[j].free) - int64_t(dmd_q[j].model + dmd_q[j].context + dmd_q[j].compute));
+            }
+            std::vector<float> ts(llama_max_devices(), 0.0f);
+            std::vector<llama_model_tensor_buft_override> tbo(llama_max_tensor_buft_overrides());
+            llama_context_params cp = cparams;
+            cp.n_ctx = 0;
+            llama_model_params mp = mparams;
+            const common_params_fit_status status = common_fit_params(paths, &mp, &cp, ts.data(), tbo.data(), margins.data(), n_ctx_min, nullptr, log_level);
+            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cp.n_ctx > n_ctx_train/4 + 256 || cp.n_ctx < n_ctx_train/4 - n_ctx_train/16) {
+                throw std::runtime_error(string_format("fit gave status %d and a context of %u, expected about %u", status, cp.n_ctx, n_ctx_train/4));
+            }
+            if (mp.kv_gpu != 0 || mp.n_gpu_layers != mparams.n_gpu_layers || std::any_of(ts.begin(), ts.end(), [](float x) { return x != 0.0f; }) || tbo[0].pattern != nullptr) {
+                throw std::runtime_error("fit moved layers or weights");
+            }
+            detail = string_format("context %u of %u for a quarter of the room, KV on the server %zu MiB at the full context",
+                cp.n_ctx, n_ctx_train, size_t(dmd_max[0].context/(1024*1024)));
+        } catch (const std::exception & err) {
+            ok = false;
+            detail = err.what();
+        }
+        LOG("KV remote RPC fit %s: %s (%s)\n", llama_arch_name(arch), ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    }
+
+    // --kv-remote as the tools read it: the device of the remote by its address, and the conflicts
+    {
+        auto parse = [&](std::vector<std::string> args, common_params & params) {
+            args.insert(args.begin(), { "test", "-m", "unused.gguf", "--rpc", endpoint });
+            std::vector<char *> argv;
+            for (std::string & a : args) {
+                argv.push_back(a.data());
+            }
+            ggml_log_callback log_cb;
+            void * log_ud;
+            llama_log_get(&log_cb, &log_ud);
+            llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+            const bool res = common_params_parse((int) argv.size(), argv.data(), params, LLAMA_EXAMPLE_COMMON);
+            llama_log_set(log_cb, log_ud);
+            return res;
+        };
+        common_params params;
+        bool ok = parse({ "--kv-remote", endpoint }, params) && params.kv_gpu >= 0 &&
+            (size_t) params.kv_gpu < params.devices.size() && params.devices[params.kv_gpu] == rpc;
+        const llama_model_params mparams = common_model_params_to_llama(params);
+        ok = ok && mparams.kv_gpu == params.kv_gpu && mparams.tokenize_on_kv_gpu;
+        for (const auto & bad : std::vector<std::vector<std::string>>{
+                { "--kv-remote", endpoint, "-sm", "tensor" },
+                { "--kv-remote", endpoint, "-nkvo" },
+                { "--kv-remote", ggml_backend_dev_name(gpu) },
+            }) {
+            common_params params_bad;
+            if (parse(bad, params_bad)) {
+                ok = false;
+                LOG("KV remote RPC arguments: accepted %s %s\n", bad[0].c_str(), bad.back().c_str());
+            }
+        }
+        LOG("KV remote RPC arguments: %s\n", ok ? "OK" : "FAIL");
+        all_ok = all_ok && ok;
+    }
+
+    std::filesystem::remove_all(dir);
+    return all_ok ? 0 : 1;
+}
+
+// tensor parallelism over two RPC servers on threads of this process (127.0.0.1)
+// the all-reduce runs between the two servers, the logits must match the local GPU
+static int test_tensor_rpc(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend, const char * argv0) {
+    std::vector<std::pair<llm_arch, bool>> archs; // arch, moe
+    for (const auto & am : { std::make_pair(LLM_ARCH_QWEN35, false), std::make_pair(LLM_ARCH_QWEN35MOE, true),
+                             std::make_pair(LLM_ARCH_INKLING2, true), std::make_pair(LLM_ARCH_INKLING2_LOOP, true) }) {
+        if (arch_matches(arch_filter, am.first)) {
+            archs.push_back(am);
+        }
+    }
+    if (archs.empty()) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu = get_gpu(target_backend, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    if (gpu == nullptr || reg == nullptr) {
+        LOG("Tensor RPC: SKIP (%s)\n", gpu == nullptr ? "no GPU" : "no RPC backend");
+        return 0;
+    }
+    // one GPU per server: with the async all-reduce each GPU waits for the other rank, and two
+    // servers on one Metal device share one queue (GGML_METAL_DEVICES=2 gives two)
+    ggml_backend_dev_t gpu2 = target_backend == nullptr ? get_gpu(nullptr, gpu) : nullptr;
+    if (gpu2 == nullptr) {
+        gpu2 = gpu;
+        setenv("GGML_RPC_COMM_SYNC", "1", 1);
+        LOG("Tensor RPC: one GPU, the servers use the blocking all-reduce\n");
+    }
+    auto start_server_fn = (decltype(ggml_backend_rpc_start_server) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    auto add_server_fn   = (decltype(ggml_backend_rpc_add_server) *)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_add_server");
+    GGML_ASSERT(start_server_fn && add_server_fn);
+
+    // two servers on ports p and p+1, rank 0 listens for rank 1 on p+1000
+    std::random_device rd;
+    const int port0 = 40000 + (int) (rd() % 18000);
+    std::vector<ggml_backend_dev_t> rpcs;
+    for (int i = 0; i < 2; i++) {
+        const std::string endpoint = "127.0.0.1:" + std::to_string(port0 + i);
+        ggml_backend_dev_t dev = i == 0 ? gpu : gpu2;
+        std::thread([start_server_fn, endpoint, dev]() mutable {
+            start_server_fn(endpoint.c_str(), nullptr, 4, 1, &dev);
+        }).detach();
+        ggml_backend_reg_t reg_server = nullptr;
+        for (int j = 0; j < 400 && reg_server == nullptr; j++) {
+            reg_server = add_server_fn(endpoint.c_str());
+            if (reg_server == nullptr) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
+        if (reg_server == nullptr) {
+            LOG("Tensor RPC: FAIL (the RPC server on %s did not start)\n", endpoint.c_str());
+            return 1;
+        }
+        rpcs.push_back(ggml_backend_reg_dev_get(reg_server, 0));
+    }
+
+    // the servers log from their own threads; errors also go to the previous log, they explain an abort
+    struct log_capture {
+        std::mutex        mutex;
+        std::string       text;
+        ggml_log_callback cb_old = nullptr;
+        void *            ud_old = nullptr;
+    };
+
+    // --tp-host: rank 0 as a server thread of this process on the first GPU (as llama-cli starts it), the second server as rank 1;
+    // needs two GPUs, as --tp-host serves the first one, which must not be the GPU of rank 1
+    std::vector<ggml_backend_dev_t> tp_devs;
+    if (gpu2 != gpu) {
+        const std::string tp_host = "127.0.0.1:" + std::to_string(port0 + 2);
+        const std::string remote  = "127.0.0.1:" + std::to_string(port0 + 1);
+        std::vector<std::string> args = { "test", "-m", "unused.gguf", "-sm", "tensor", "--tp-host", tp_host, "--rpc", remote };
+        std::vector<char *> argv;
+        for (std::string & a : args) {
+            argv.push_back(a.data());
+        }
+        common_params params;
+        if (!common_params_parse((int) argv.size(), argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
+            LOG("Tensor RPC --tp-host: FAIL (the arguments were rejected)\n");
+            return 1;
+        }
+        for (ggml_backend_dev_t dev : params.devices) {
+            if (dev != nullptr) {
+                tp_devs.push_back(dev);
+            }
+        }
+        // rank 0 is the new server, rank 1 the one given with --rpc
+        if (tp_devs.size() != 2 || std::string(ggml_backend_dev_description(tp_devs[0])) != tp_host ||
+                std::string(ggml_backend_dev_description(tp_devs[1])) != remote) {
+            LOG("Tensor RPC --tp-host: FAIL (unexpected devices)\n");
+            return 1;
+        }
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    bool all_ok = true;
+    for (const auto & am : archs) {
+        // an expert FFN of 512, so that each server computes a slice of every expert, also with 3:1 (384/128);
+        // a server with no rows of a tensor would send its sum through this process
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(am.first, am.second, 0, 512);
+        std::vector<float> logits_ref;
+        {
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { gpu });
+            logits_ref = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+        }
+        auto run_case = [&](const char * name, const std::vector<ggml_backend_dev_t> & devs, const std::vector<float> & ts) {
+            log_capture log;
+            ggml_log_callback log_cb;
+            void * log_ud;
+            llama_log_get(&log_cb, &log_ud);
+            log.cb_old = log_cb;
+            log.ud_old = log_ud;
+            llama_log_set([](ggml_log_level level, const char * text, void * ud) {
+                log_capture * lc = (log_capture *) ud;
+                std::lock_guard<std::mutex> lock(lc->mutex);
+                lc->text.append(text);
+                if (level == GGML_LOG_LEVEL_ERROR && lc->cb_old != nullptr) {
+                    lc->cb_old(level, text, lc->ud_old);
+                }
+            }, &log);
+            bool ok = true;
+            std::string detail;
+            try {
+                auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, devs, LLAMA_SPLIT_MODE_TENSOR,
+                    nullptr, 0, {}, ts.empty() ? nullptr : ts.data());
+                const std::vector<float> logits = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                const double nmse_val = nmse(logits_ref, logits);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail = buf;
+                // the same GPU kernels as the reference: right sums give at most ~2e-8 here (bf16 on the wire for the prompt);
+                // without the peer's partial it is 2.5e-6 or more (inkling2, whose experts add little to the logits)
+                ok = nmse_val <= 1e-7;
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            llama_log_set(log_cb, log_ud);
+
+            // the sums must go between the servers, not through this process
+            std::lock_guard<std::mutex> lock(log.mutex);
+            if (log.text.find("pairwise communicator initialized") == std::string::npos) {
+                ok = false;
+                detail += ", the servers did not connect to each other";
+            }
+            // with a GPU per server, the GPUs must not stop for the sums
+            if (gpu2 != gpu && log.text.find("pairwise communicator (async,") == std::string::npos) {
+                ok = false;
+                detail += ", the servers did not use the async all-reduce";
+            }
+            if (log.text.find("using the fallback") != std::string::npos) {
+                ok = false;
+                detail += ", some sums went through this process";
+            }
+            LOG("Tensor RPC %s, 2 ranks %s: %s (%s)\n", llama_arch_name(am.first), name, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        };
+        run_case("1:1", rpcs, {});
+        run_case("3:1", rpcs, { 3.0f, 1.0f });
+        if (!tp_devs.empty()) {
+            run_case("--tp-host", tp_devs, {});
+        }
+    }
+
+#ifndef _WIN32
+    // ranks that pick different experts must stop the run and name the layer: a child process where rank 1
+    // changes the hash of its ids (the hook does nothing else); the client aborts once a server stops
+    const bool has_moe = std::any_of(archs.begin(), archs.end(), [](const auto & am) { return am.first == LLM_ARCH_QWEN35MOE; });
+    if (has_moe && std::getenv("GGML_RPC_COMM_TEST_IDS_FLIP") == nullptr) {
+        const std::string cmd = std::string("GGML_RPC_COMM_TEST_IDS_FLIP=1 GGML_RPC_COMM_TIMEOUT_MS=5000 '") + argv0 +
+            "' --rpc -a '^qwen35moe$' 2>&1";
+        std::string out;
+        int status = -1;
+        if (FILE * p = popen(cmd.c_str(), "r")) {
+            char line[4096];
+            while (fgets(line, sizeof(line), p) != nullptr) {
+                out += line;
+            }
+            status = pclose(p);
+        }
+        const bool message = out.find("picked different experts in ffn_moe_topk-") != std::string::npos;
+        const bool ok = status != 0 && message;
+        LOG("Tensor RPC qwen35moe, different expert ids: %s (child status %d%s)\n", ok ? "OK" : "FAIL", status,
+            message ? "" : ", no mismatch message");
+        all_ok = all_ok && ok;
+    }
+#endif
+    return all_ok ? 0 : 1;
+}
+
+// each all-reduce costs a round trip between the laptops: with -sm tensor a layer must sync twice with split attention
+// (the shared experts go into the sum of the routed experts) and once with --tp-attn mirror
+static int test_tensor_syncs(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    std::vector<std::pair<llm_arch, bool>> archs; // arch, moe
+    for (const auto & am : { std::make_pair(LLM_ARCH_QWEN35, false), std::make_pair(LLM_ARCH_QWEN35MOE, true),
+                             std::make_pair(LLM_ARCH_INKLING2, true), std::make_pair(LLM_ARCH_INKLING2_LOOP, true) }) {
+        if (arch_matches(arch_filter, am.first)) {
+            archs.push_back(am);
+        }
+    }
+    if (archs.empty()) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu  = get_gpu(target_backend, nullptr);
+    ggml_backend_dev_t gpu2 = target_backend == nullptr ? get_gpu(nullptr, gpu) : nullptr;
+    if (gpu == nullptr || gpu2 == nullptr) {
+        LOG("Tensor syncs: SKIP (needs two GPUs, GGML_METAL_DEVICES=2 gives two)\n");
+        return 0;
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    bool all_ok = true;
+    for (const auto & am : archs) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(am.first, am.second, 0, 256);
+        // inkling2 always mirrors attention; it pads the vocab and cuts the logits, so its output is mirrored too
+        const bool is_inkling  = am.first == LLM_ARCH_INKLING2 || am.first == LLM_ARCH_INKLING2_LOOP;
+        const bool splits_attn = llama_arch_sm_tensor_splits_attn(am.first);
+        for (const llama_tp_attn tp_attn : { LLAMA_TP_ATTN_SPLIT, LLAMA_TP_ATTN_MIRROR }) {
+            const bool attn_split = splits_attn && tp_attn == LLAMA_TP_ATTN_SPLIT;
+            uint32_t n_layer = 0; // the layer passes, with the loop of inkling2_loop unrolled
+            size_t   expected = 0;
+
+            std::string log;
+            ggml_log_callback log_cb;
+            void * log_ud;
+            llama_log_get(&log_cb, &log_ud);
+            llama_log_set([](ggml_log_level, const char * text, void * ud) { ((std::string *) ud)->append(text); }, &log);
+            bool ok = true;
+            std::string detail;
+            try {
+                auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { gpu, gpu2 }, LLAMA_SPLIT_MODE_TENSOR,
+                    nullptr, 0, {}, nullptr, 0, nullptr, tp_attn);
+                n_layer  = (uint32_t) llama_model_n_layer(model_and_ctx.first.get());
+                expected = (attn_split ? 2 : 1) * (size_t) n_layer;
+                get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            llama_log_set(log_cb, log_ud);
+
+            // the meta backend logs the count each time it changes
+            std::vector<size_t> counts;
+            const std::string key = " sub-graphs, ";
+            for (size_t pos = log.find(key); pos != std::string::npos; pos = log.find(key, pos + 1)) {
+                counts.push_back(std::stoul(log.substr(pos + key.size())));
+            }
+            if (ok && counts.empty()) {
+                ok = false;
+                detail = "the meta backend logged no all-reduce count";
+            }
+            for (const size_t n : counts) {
+                if (n != expected) {
+                    ok = false;
+                    detail = "a graph has " + std::to_string(n) + " all-reduces";
+                    break;
+                }
+            }
+            // the load log gives the share of each class after rounding
+            const size_t pos_split = log.find("tensor split: ");
+            const std::string split_line = pos_split == std::string::npos ? "" : log.substr(pos_split, log.find('\n', pos_split) - pos_split);
+            const std::string attn_expected = attn_split ? "attention 50/50" : "attention mirrored";
+            const std::string out_expected  = is_inkling ? "output mirrored" : "output 50/50";
+            // the dense FFN of 384 rounds to 128/256 in both layers, as each layer type rotates the rounding on its own
+            if (ok && (split_line.find(am.second ? "experts 50/50" : "experts ") == std::string::npos ||
+                    split_line.find(attn_expected) == std::string::npos || split_line.find(out_expected) == std::string::npos ||
+                    (am.first == LLM_ARCH_QWEN35MOE && split_line.find("shared experts 50/50") == std::string::npos))) {
+                ok = false;
+                detail = "unexpected shares: '" + split_line + "'";
+            }
+            LOG("Tensor syncs %s, --tp-attn %s: %s (%zu all-reduces for %u layer passes%s%s)\n", llama_arch_name(am.first),
+                tp_attn == LLAMA_TP_ATTN_SPLIT ? "split" : "mirror", ok ? "OK" : "FAIL", expected, n_layer,
+                detail.empty() ? "" : ", ", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+    }
+    return all_ok ? 0 : 1;
+}
+
+// --fit with -sm tensor: each device is measured with its own share, and only the context size changes
+static int test_tensor_fit(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    std::vector<llm_arch> archs;
+    for (const llm_arch arch : { LLM_ARCH_QWEN35MOE, LLM_ARCH_INKLING2 }) {
+        if (arch_matches(arch_filter, arch)) {
+            archs.push_back(arch);
+        }
+    }
+    if (archs.empty()) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu  = get_gpu(target_backend, nullptr);
+    ggml_backend_dev_t gpu2 = target_backend == nullptr ? get_gpu(nullptr, gpu) : nullptr;
+    if (gpu == nullptr || gpu2 == nullptr) {
+        LOG("Tensor fit: SKIP (needs two GPUs, GGML_METAL_DEVICES=2 gives two)\n");
+        return 0;
+    }
+    constexpr int64_t MiB         = 1024*1024;
+    constexpr uint32_t n_ctx_train = 262144;
+    constexpr uint32_t n_ctx_min   = 4096;
+    const ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
+
+    bool all_ok = true;
+    for (const llm_arch arch : archs) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true, 0, 256);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_CONTEXT_LENGTH).c_str(), n_ctx_train);
+        const std::string path = get_tmp_gguf_path();
+        {
+            llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path.c_str());
+        }
+        const std::vector<std::string> paths = { path };
+
+        std::vector<int64_t> ctx_split; // context memory per device with split attention
+        for (const llama_tp_attn tp_attn : { LLAMA_TP_ATTN_SPLIT, LLAMA_TP_ATTN_MIRROR }) {
+            const char * mode = tp_attn == LLAMA_TP_ATTN_SPLIT ? "split" : "mirror";
+            std::vector<ggml_backend_dev_t> devs_param = { gpu, gpu2, nullptr };
+            llama_model_params mparams = llama_model_default_params();
+            mparams.devices    = devs_param.data();
+            mparams.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            mparams.tp_attn    = tp_attn;
+            mparams.progress_callback = silent_model_load_progress;
+            llama_context_params cparams = llama_context_default_params();
+            cparams.n_seq_max = 1;
+
+            auto measure = [&](uint32_t n_ctx) {
+                llama_context_params cp = cparams;
+                cp.n_ctx = n_ctx;
+                std::vector<ggml_backend_dev_t> devs;
+                uint32_t ngl = 0, nct = 0, nex = 0;
+                common_device_memory_data_vec dmds = common_get_device_memory_data(paths, &mparams, &cp, devs, ngl, nct, nex, log_level);
+                if (devs.size() != 2 || devs[0] != gpu || devs[1] != gpu2) {
+                    throw std::runtime_error("the measurement is not per device");
+                }
+                return dmds;
+            };
+            auto used = [](const common_device_memory_data & d) { return int64_t(d.model + d.context + d.compute); };
+
+            bool ok = true;
+            std::string detail;
+            try {
+                const common_device_memory_data_vec dmd_max = measure(n_ctx_train);
+                const common_device_memory_data_vec dmd_q   = measure(n_ctx_train/4);
+
+                // each device holds only its share of the split weights, less than the whole model (one GPU plus the host)
+                common_device_memory_data_vec dmd_one;
+                {
+                    std::vector<ggml_backend_dev_t> devs_one = { gpu, nullptr };
+                    llama_model_params mp = llama_model_default_params();
+                    mp.devices = devs_one.data();
+                    mp.progress_callback = silent_model_load_progress;
+                    llama_context_params cp = cparams;
+                    cp.n_ctx = n_ctx_train;
+                    std::vector<ggml_backend_dev_t> devs;
+                    uint32_t ngl = 0, nct = 0, nex = 0;
+                    dmd_one = common_get_device_memory_data(paths, &mp, &cp, devs, ngl, nct, nex, log_level);
+                }
+                const size_t model_whole = dmd_one[0].model + dmd_one.back().model;
+                for (size_t j = 0; j < 2; j++) {
+                    if (!(dmd_max[j].model > 0 && dmd_max[j].model < model_whole)) {
+                        throw std::runtime_error(string_format("device %zu holds %zu of %zu model bytes", j, dmd_max[j].model, model_whole));
+                    }
+                }
+                // mirrored attention keeps the whole KV cache on each device, split attention half of it
+                if (tp_attn == LLAMA_TP_ATTN_SPLIT) {
+                    ctx_split = { int64_t(dmd_max[0].context), int64_t(dmd_max[1].context) };
+                } else if (arch == LLM_ARCH_QWEN35MOE) {
+                    for (size_t j = 0; j < 2; j++) {
+                        if (int64_t(dmd_max[j].context) <= ctx_split[j]) {
+                            throw std::runtime_error(string_format("mirror context %zu <= split context %" PRId64, dmd_max[j].context, ctx_split[j]));
+                        }
+                    }
+                }
+
+                // targets that leave room for exactly a quarter of the trained context on each device
+                std::vector<size_t> margins(llama_max_devices(), 0);
+                for (size_t j = 0; j < 2; j++) {
+                    margins[j] = size_t(dmd_q[j].free - used(dmd_q[j]));
+                }
+                std::vector<float> ts(llama_max_devices(), 0.0f);
+                std::vector<llama_model_tensor_buft_override> tbo(llama_max_tensor_buft_overrides());
+                llama_context_params cp = cparams;
+                cp.n_ctx = 0;
+                llama_model_params mp = mparams;
+                const common_params_fit_status status = common_fit_params(paths, &mp, &cp, ts.data(), tbo.data(), margins.data(), n_ctx_min, nullptr, log_level);
+                if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cp.n_ctx > n_ctx_train/4 + 256 || cp.n_ctx < n_ctx_train/4 - n_ctx_train/16) {
+                    throw std::runtime_error(string_format("fit gave status %d and a context of %u, expected about %u", status, cp.n_ctx, n_ctx_train/4));
+                }
+                const uint32_t n_ctx_fit = cp.n_ctx;
+
+                // no room at all: fails, with the context at the minimum
+                for (size_t j = 0; j < 2; j++) {
+                    margins[j] = size_t(dmd_q[j].free);
+                }
+                cp.n_ctx = 0;
+                mp = mparams;
+                const common_params_fit_status status_none = common_fit_params(paths, &mp, &cp, ts.data(), tbo.data(), margins.data(), n_ctx_min, nullptr, log_level);
+                if (status_none != COMMON_PARAMS_FIT_STATUS_FAILURE || cp.n_ctx != n_ctx_min) {
+                    throw std::runtime_error(string_format("without room fit gave status %d and a context of %u", status_none, cp.n_ctx));
+                }
+
+                // the estimate without allocating matches the memory of a loaded model on each device
+                cp = cparams;
+                cp.n_ctx = n_ctx_min;
+                const std::vector<common_memory_breakdown_row> rows_est = common_fit_measure(paths, &mparams, &cp, nullptr, nullptr, log_level);
+                llama_model_ptr model(llama_model_load_from_file(path.c_str(), mparams));
+                llama_context_ptr lctx(model ? llama_init_from_model(model.get(), cp) : nullptr);
+                if (!lctx) {
+                    throw std::runtime_error("failed to load the model");
+                }
+                const std::vector<common_memory_breakdown_row> rows = common_memory_breakdown_rows(lctx.get());
+                double worst = 0.0;
+                for (size_t j = 0; j < 2; j++) {
+                    if (rows[j].kind != common_memory_breakdown_row::DEVICE || rows_est[j].kind != common_memory_breakdown_row::DEVICE) {
+                        throw std::runtime_error("the breakdown has no row per device");
+                    }
+                    const std::pair<size_t, size_t> pairs[3] = {
+                        { rows[j].model, rows_est[j].model }, { rows[j].context, rows_est[j].context }, { rows[j].compute, rows_est[j].compute } };
+                    for (const auto & [real, est] : pairs) {
+                        const double err = std::fabs(double(real) - double(est)) / std::max<double>(double(real), MiB);
+                        worst = std::max(worst, err);
+                    }
+                }
+                if (worst > 0.02) {
+                    throw std::runtime_error(string_format("the estimate is %.1f%% off a loaded model", 100.0*worst));
+                }
+                detail = string_format("context %u of %u for a quarter of the room, model/device %zu/%zu MiB, estimate within %.2f%%",
+                    n_ctx_fit, n_ctx_train, size_t(dmd_max[0].model/MiB), size_t(dmd_max[1].model/MiB), 100.0*worst);
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            LOG("Tensor fit %s %s: %s (%s)\n", llama_arch_name(arch), mode, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+        std::filesystem::remove(path);
+    }
+    return all_ok ? 0 : 1;
+}
+
+// a DSpark draft reads the inputs of some target layers: from host copies, or from a device buffer of the target;
+// with a tensor split target both must work (the draft on its own GPU falls back to the host copies)
+static int test_tensor_layer_inp(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    std::vector<llm_arch> archs;
+    for (const llm_arch arch : { LLM_ARCH_QWEN35, LLM_ARCH_QWEN35MOE }) { // the archs that record layer inputs
+        if (arch_matches(arch_filter, arch)) {
+            archs.push_back(arch);
+        }
+    }
+    if (archs.empty()) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu  = get_gpu(target_backend, nullptr);
+    ggml_backend_dev_t gpu2 = target_backend == nullptr ? get_gpu(nullptr, gpu) : nullptr;
+    if (gpu == nullptr || gpu2 == nullptr) {
+        LOG("Tensor layer inputs: SKIP (needs two GPUs, GGML_METAL_DEVICES=2 gives two)\n");
+        return 0;
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(64, 128, seed);
+    const uint32_t lids[] = { 0, 1 };
+    bool all_ok = true;
+    for (const llm_arch arch : archs) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, arch == LLM_ARCH_QWEN35MOE, 0, 256);
+        // returns the logits, and the layer inputs from the host copies unless dev
+        auto run = [&](const std::vector<ggml_backend_dev_t> & devs, llama_split_mode split_mode, bool dev,
+                std::vector<std::vector<float>> & inps) {
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, devs, split_mode);
+            llama_context * lctx = model_and_ctx.second.get();
+            for (const uint32_t lid : lids) {
+                llama_set_embeddings_layer_inp(lctx, lid, true);
+            }
+            if (dev) {
+                llama_set_embeddings_layer_inp_dev(lctx, true);
+            }
+            std::vector<float> logits = get_logits(model_and_ctx.first.get(), lctx, tokens);
+            inps.clear();
+            if (!dev) {
+                const size_t n = (size_t) llama_model_n_embd(model_and_ctx.first.get())*tokens.size();
+                for (const uint32_t lid : lids) {
+                    const float * inp = llama_get_embeddings_layer_inp(lctx, lid);
+                    if (inp == nullptr) {
+                        throw std::runtime_error("layer input " + std::to_string(lid) + " not extracted");
+                    }
+                    inps.emplace_back(inp, inp + n);
+                }
+            }
+            return logits;
+        };
+        bool ok = true;
+        std::string detail;
+        try {
+            std::vector<std::vector<float>> inps_ref;
+            std::vector<std::vector<float>> inps_meta;
+            std::vector<std::vector<float>> inps_dev;
+            const std::vector<float> logits_ref  = run({ gpu },       LLAMA_SPLIT_MODE_LAYER,  false, inps_ref);
+            const std::vector<float> logits_meta = run({ gpu, gpu2 }, LLAMA_SPLIT_MODE_TENSOR, false, inps_meta);
+            const std::vector<float> logits_dev  = run({ gpu, gpu2 }, LLAMA_SPLIT_MODE_TENSOR, true,  inps_dev);
+            double worst = std::max(nmse(logits_ref, logits_meta), nmse(logits_ref, logits_dev));
+            for (size_t k = 0; k < inps_ref.size(); k++) {
+                worst = std::max(worst, nmse(inps_ref[k], inps_meta[k]));
+            }
+            char buf[48];
+            snprintf(buf, sizeof(buf), "worst NMSE %.2e", worst);
+            detail = buf;
+            ok = worst <= 1e-6;
+        } catch (const std::exception & err) {
+            ok = false;
+            detail = err.what();
+        }
+        LOG("Tensor layer inputs %s: %s (%s)\n", llama_arch_name(arch), ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
     }
     return all_ok ? 0 : 1;
 }
@@ -2586,6 +3979,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool kv_shift = false;
+    bool rpc      = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2655,6 +4049,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--kv-shift") == 0) {
             kv_shift = true;
+        } else if (strcmp(argv[i], "--rpc") == 0) {
+            rpc = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2676,8 +4072,16 @@ int main(int argc, char ** argv) {
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
         }
+        if (rpc) {
+            int ret = test_longhaul_rpc(arch_filter, seed, stdev, target_backend);
+            ret = test_tensor_rpc(arch_filter, seed, stdev, target_backend, argv[0]) != 0 ? 1 : ret;
+            return test_kv_remote_rpc(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        }
         int ret = test_backends(arch_filter, seed, stdev, verbosity, target_backend);
         ret = test_rope_type(arch_filter, seed, stdev) != 0 ? 1 : ret;
+        ret = test_tensor_syncs(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        ret = test_tensor_layer_inp(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        ret = test_tensor_fit(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_longhaul(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_longhaul_bailingmoe3(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_longhaul_kolibri1(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;

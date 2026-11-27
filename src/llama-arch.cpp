@@ -571,6 +571,31 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     }
 }
 
+// archs whose tensors llama_meta_device_get_split_state knows how to split
+bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool llm_arch_sm_tensor_splits_attn(const llm_arch & arch) {
+    switch (arch) {
+        // a layer keeps the K/V conv channels (split by heads) and the post conv channels (full vectors)
+        // in one recurrent state tensor, which the meta backend cannot split in part
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
+            return false;
+        default:
+            return llm_arch_supports_sm_tensor(arch);
+    }
+}
+
 bool llm_arch_mmid_down_bf16(const llm_arch & arch) {
     switch (arch) {
         default:
@@ -605,4 +630,12 @@ std::string llama_arch_kv_name(llm_arch arch, llm_kv key) {
 
 bool llama_arch_supports_mixed_batch(llm_arch arch) {
     return llm_arch_supports_mixed_batch(arch);
+}
+
+bool llama_arch_supports_sm_tensor(llm_arch arch) {
+    return llm_arch_supports_sm_tensor(arch);
+}
+
+bool llama_arch_sm_tensor_splits_attn(llm_arch arch) {
+    return llm_arch_sm_tensor_splits_attn(arch);
 }

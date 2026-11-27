@@ -14,6 +14,7 @@
 #include "preset.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -693,6 +694,307 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     }
 }
 
+// the devices of the model as llama_model_load picks them when none are given: the RPC servers first, then the GPUs
+// (one per device id), then the integrated GPUs if there is no other GPU, see llama_prepare_model_devices
+static std::vector<ggml_backend_dev_t> common_default_devices() {
+    std::vector<ggml_backend_dev_t> rpc;
+    std::vector<ggml_backend_dev_t> gpus;
+    std::vector<ggml_backend_dev_t> igpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        switch (ggml_backend_dev_type(dev)) {
+            case GGML_BACKEND_DEVICE_TYPE_GPU: {
+                if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "RPC") == 0) {
+                    rpc.push_back(dev);
+                    break;
+                }
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                const bool dup = std::any_of(gpus.begin(), gpus.end(), [&](ggml_backend_dev_t d) {
+                    ggml_backend_dev_props d_props;
+                    ggml_backend_dev_get_props(d, &d_props);
+                    return props.device_id && d_props.device_id && strcmp(props.device_id, d_props.device_id) == 0;
+                });
+                if (!dup) {
+                    gpus.push_back(dev);
+                }
+            } break;
+            case GGML_BACKEND_DEVICE_TYPE_IGPU:
+                if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back())) {
+                    igpus.push_back(dev);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    std::vector<ggml_backend_dev_t> res = rpc;
+    res.insert(res.end(), gpus.begin(), gpus.end());
+    if (gpus.empty()) {
+        res.insert(res.end(), igpus.begin(), igpus.end());
+    }
+    return res;
+}
+
+static bool common_dev_is_rpc(ggml_backend_dev_t dev) {
+    return strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "RPC") == 0;
+}
+
+// the index of a device in devs by its name (as --list-devices prints it), a prefix of its name, or its description (the endpoint of an RPC server)
+static size_t common_find_device(const std::vector<ggml_backend_dev_t> & devs, const std::string & name) {
+    for (size_t i = 0; i < devs.size(); ++i) {
+        if (name == ggml_backend_dev_name(devs[i]) || name == ggml_backend_dev_description(devs[i])) {
+            return i;
+        }
+    }
+    size_t res = devs.size();
+    for (size_t i = 0; i < devs.size(); ++i) {
+        if (string_starts_with(ggml_backend_dev_name(devs[i]), name)) {
+            if (res != devs.size()) {
+                throw std::invalid_argument(string_format("device name %s matches several devices", name.c_str()));
+            }
+            res = i;
+        }
+    }
+    if (res == devs.size()) {
+        std::string names;
+        for (ggml_backend_dev_t dev : devs) {
+            names += std::string(names.empty() ? "" : ", ") + ggml_backend_dev_name(dev) + " (" + ggml_backend_dev_description(dev) + ")";
+        }
+        throw std::invalid_argument(string_format("unknown device %s, the model uses: %s", name.c_str(), names.c_str()));
+    }
+    return res;
+}
+
+// the shares of -es in percent, per device of devs:
+// - "60": the RPC devices together get 60%, split evenly, the other devices the rest
+// - "60,40": per device, in the order of the devices
+// - "RPC0=60,MTL0=40": per named device, the devices not named split the rest evenly
+static std::vector<float> common_parse_expert_share(const std::vector<ggml_backend_dev_t> & devs, const std::string & value) {
+    auto parse_pct = [](const std::string & s) {
+        size_t pos = 0;
+        float v = 0.0f;
+        try {
+            v = std::stof(s, &pos);
+        } catch (const std::exception &) {
+            throw std::invalid_argument("invalid share: " + s);
+        }
+        if (pos != s.size() && !(pos + 1 == s.size() && s[pos] == '%')) {
+            throw std::invalid_argument("invalid share: " + s);
+        }
+        if (!(v >= 0.0f && v <= 100.0f)) {
+            throw std::invalid_argument("a share must be in 0..100: " + s);
+        }
+        return v;
+    };
+    std::vector<float> res(devs.size(), 0.0f);
+    const auto items = string_split<std::string>(value, ',');
+    if (items.empty()) {
+        throw std::invalid_argument("no expert share given");
+    }
+
+    // the devices that get the rest of 100%
+    std::vector<bool> rest(devs.size(), false);
+    float sum = 0.0f;
+    if (items.size() == 1 && items[0].find('=') == std::string::npos) {
+        const float v = parse_pct(items[0]);
+        size_t n_rpc = 0;
+        for (ggml_backend_dev_t dev : devs) {
+            n_rpc += common_dev_is_rpc(dev);
+        }
+        if (n_rpc == 0 || n_rpc == devs.size()) {
+            throw std::invalid_argument("a single expert share is the share of the RPC devices, it needs both RPC and local devices (or name the devices, e.g. MTL0=60,MTL1=40)");
+        }
+        for (size_t i = 0; i < devs.size(); ++i) {
+            if (common_dev_is_rpc(devs[i])) {
+                res[i] = v/n_rpc;
+            } else {
+                rest[i] = true;
+            }
+        }
+        sum = v;
+    } else if (items[0].find('=') == std::string::npos) {
+        if (items.size() != devs.size()) {
+            throw std::invalid_argument(string_format("%zu expert shares for %zu devices", items.size(), devs.size()));
+        }
+        for (size_t i = 0; i < devs.size(); ++i) {
+            res[i] = parse_pct(items[i]);
+            sum   += res[i];
+        }
+        if (std::fabs(sum - 100.0f) > 0.01f) {
+            throw std::invalid_argument(string_format("the expert shares sum to %g%%, not 100%%", sum));
+        }
+        return res;
+    } else {
+        std::vector<bool> named(devs.size(), false);
+        for (const auto & item : items) {
+            const size_t eq = item.find('=');
+            if (eq == std::string::npos) {
+                throw std::invalid_argument("expected DEVICE=SHARE: " + item);
+            }
+            const size_t i = common_find_device(devs, item.substr(0, eq));
+            if (named[i]) {
+                throw std::invalid_argument(string_format("device %s is named twice", ggml_backend_dev_name(devs[i])));
+            }
+            named[i] = true;
+            res[i]   = parse_pct(item.substr(eq + 1));
+            sum     += res[i];
+        }
+        for (size_t i = 0; i < devs.size(); ++i) {
+            rest[i] = !named[i];
+        }
+    }
+    const size_t n_rest = std::count(rest.begin(), rest.end(), true);
+    if (sum > 100.01f) {
+        throw std::invalid_argument(string_format("the expert shares sum to %g%%, more than 100%%", sum));
+    }
+    if (n_rest == 0 && std::fabs(sum - 100.0f) > 0.01f) {
+        throw std::invalid_argument(string_format("the expert shares sum to %g%%, not 100%%", sum));
+    }
+    for (size_t i = 0; i < devs.size(); ++i) {
+        if (rest[i]) {
+            res[i] = std::max(0.0f, 100.0f - sum)/n_rest;
+        }
+    }
+    return res;
+}
+
+static void common_params_start_tp_host(common_params & params);
+
+// --kv-remote: resolve the device against the devices of the model, which needs the RPC servers of --rpc
+static void common_params_resolve_kv_remote(common_params & params) {
+    if (params.kv_remote.empty()) {
+        return;
+    }
+    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER && params.split_mode != LLAMA_SPLIT_MODE_NONE) {
+        throw std::invalid_argument("--kv-remote needs --split-mode layer or none (it cannot be combined with -sm tensor, row or expert)");
+    }
+    if (!params.expert_share.empty() || !params.kv_device.empty()) {
+        throw std::invalid_argument("--kv-remote cannot be combined with --expert-share or --kv-device");
+    }
+    if (params.no_kv_offload) {
+        throw std::invalid_argument("--kv-remote puts the KV cache on the remote device, do not give --no-kv-offload");
+    }
+
+    // the devices of the model, given explicitly so that the index below matches them
+    std::vector<ggml_backend_dev_t> devs;
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr) {
+            devs.push_back(dev);
+        }
+    }
+    if (params.devices.empty()) {
+        devs = common_default_devices();
+    }
+    const size_t i = common_find_device(devs, params.kv_remote);
+    if (!common_dev_is_rpc(devs[i])) {
+        throw std::invalid_argument(string_format("--kv-remote needs an RPC device (see --rpc), %s is not one", ggml_backend_dev_name(devs[i])));
+    }
+    if (devs.size() < 2) {
+        throw std::invalid_argument("--kv-remote needs a device for the layers besides the remote one");
+    }
+    if (devs.size() > llama_max_devices()) {
+        throw std::invalid_argument(string_format("%zu devices, at most %zu are supported", devs.size(), llama_max_devices()));
+    }
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && params.main_gpu == (int32_t) i) {
+        throw std::invalid_argument("--kv-remote: the main GPU (--main-gpu) holds the layers, it cannot be the remote device");
+    }
+    params.devices = devs;
+    params.devices.push_back(nullptr);
+    params.kv_gpu = (int32_t) i;
+    LOG_INF("--kv-remote: the KV cache and the attention of the full-attention layers on %s, which also tokenizes; the layers on the other devices\n",
+        ggml_backend_dev_name(devs[i]));
+}
+
+// resolve -es, -kvd and -lhcd against the devices of the model, which needs the RPC servers of --rpc
+static void common_params_resolve_expert_split(common_params & params) {
+    const bool split_expert = !params.expert_share.empty() || params.split_mode == LLAMA_SPLIT_MODE_EXPERT;
+    if (params.expert_share.empty() && params.kv_device.empty() && params.longhaul_cache_devices.empty()) {
+        return;
+    }
+    if (!params.longhaul_cache_devices.empty() && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::invalid_argument("--longhaul-cache-device does not apply to --split-mode tensor, which keeps all experts in memory");
+    }
+    if (!params.kv_device.empty() && !split_expert) {
+        throw std::invalid_argument("--kv-device needs --expert-share (with the layer split the KV cache follows the layers, see --tensor-split)");
+    }
+    if (!params.expert_share.empty()) {
+        if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+            throw std::invalid_argument("--expert-share sets the split mode, do not give --split-mode");
+        }
+        if (std::any_of(params.tensor_split, params.tensor_split + llama_max_devices(), [](float x) { return x != 0.0f; })) {
+            throw std::invalid_argument("--expert-share and --tensor-split both set the split, give one of them");
+        }
+    }
+
+    // the devices of the model, given explicitly so that the indices below match them
+    std::vector<ggml_backend_dev_t> devs;
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr) {
+            devs.push_back(dev);
+        }
+    }
+    if (params.devices.empty()) {
+        devs = common_default_devices();
+    }
+    if (devs.empty()) {
+        throw std::invalid_argument("the LongHaul expert split and cache sizes per device need a GPU");
+    }
+    if (devs.size() > llama_max_devices()) {
+        throw std::invalid_argument(string_format("%zu devices, at most %zu are supported", devs.size(), llama_max_devices()));
+    }
+    params.devices = devs;
+    params.devices.push_back(nullptr);
+
+    if (!params.expert_share.empty()) {
+        const std::vector<float> shares = common_parse_expert_share(devs, params.expert_share);
+        params.split_mode = LLAMA_SPLIT_MODE_EXPERT;
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            params.tensor_split[i] = i < shares.size() ? shares[i] : 0.0f;
+        }
+        // the KV cache and the layers on the local GPU by default
+        params.main_gpu = -1;
+        for (size_t i = 0; i < devs.size() && params.main_gpu < 0; ++i) {
+            if (!common_dev_is_rpc(devs[i])) {
+                params.main_gpu = (int32_t) i;
+            }
+        }
+        if (params.main_gpu < 0) {
+            params.main_gpu = 0;
+        }
+    }
+    if (!params.kv_device.empty()) {
+        params.main_gpu = (int32_t) common_find_device(devs, params.kv_device);
+    }
+
+    if (!params.longhaul_cache_devices.empty()) {
+        params.longhaul_cache_sizes.assign(llama_max_devices(), 0);
+        for (const auto & item : string_split<std::string>(params.longhaul_cache_devices, ',')) {
+            const size_t eq = item.find('=');
+            if (eq == std::string::npos) {
+                throw std::invalid_argument("expected DEVICE=SIZE: " + item);
+            }
+            const size_t i = common_find_device(devs, item.substr(0, eq));
+            const size_t size = string_parse_mem_size(item.substr(eq + 1));
+            if (size == 0) {
+                throw std::invalid_argument("a cache size must be > 0: " + item);
+            }
+            params.longhaul_cache_sizes[i] = size;
+        }
+    }
+
+    if (params.split_mode == LLAMA_SPLIT_MODE_EXPERT) {
+        std::string desc;
+        for (size_t i = 0; i < devs.size(); ++i) {
+            desc += string_format("%s%s %.1f%%", desc.empty() ? "" : ", ", ggml_backend_dev_name(devs[i]), params.tensor_split[i]);
+        }
+        LOG_INF("expert split: %s, layers and KV cache on %s\n", desc.c_str(), ggml_backend_dev_name(devs[params.main_gpu]));
+        if (devs.size() == 1) {
+            LOG_WRN("expert split with one device: it works, but it only adds work (use --rpc or several GPUs)\n");
+        }
+    }
+}
+
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
 
@@ -822,6 +1124,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.mmproj_device = params.devices.front();
         params.mmproj_use_gpu = params.mmproj_device != nullptr;
     }
+
+    // after the mmproj default, so that a device list set here does not move the mmproj to an RPC server
+    common_params_resolve_expert_split(params);
+    common_params_resolve_kv_remote(params);
+
+    if (params.tp_attn != LLAMA_TP_ATTN_SPLIT && params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::invalid_argument("--tp-attn applies only to --split-mode tensor");
+    }
+    common_params_start_tp_host(params);
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -1088,6 +1399,120 @@ void common_print_available_devices() {
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
         printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / MiB, free / MiB);
+    }
+}
+
+// --tp-host: run rank 0 of the tensor split as an RPC server thread on the local GPU, in front of the --rpc servers
+static void common_params_start_tp_host(common_params & params) {
+    if (params.tp_host.empty()) {
+        return;
+    }
+    if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::invalid_argument("--tp-host applies only to --split-mode tensor");
+    }
+    if (!params.devices.empty()) {
+        throw std::invalid_argument("--tp-host sets the devices, do not give --device");
+    }
+    std::string host = params.tp_host;
+    int port = 50052;
+    const size_t colon = host.rfind(':');
+    if (colon != std::string::npos) {
+        const std::string port_str = host.substr(colon + 1);
+        char * end = nullptr;
+        const long v = std::strtol(port_str.c_str(), &end, 10);
+        if (port_str.empty() || *end != '\0' || v <= 0 || v > 65535) {
+            throw std::invalid_argument("--tp-host: invalid port '" + port_str + "'");
+        }
+        port = (int) v;
+        host = host.substr(0, colon);
+    }
+    if (host.empty()) {
+        throw std::invalid_argument("--tp-host: give the address the other laptops reach this one on, e.g. 10.0.0.1");
+    }
+    if (host == "127.0.0.1" || host == "localhost") {
+        LOG_WRN("%s: --tp-host %s cannot be reached from another machine, use it only with servers on this machine\n", __func__, host.c_str());
+    }
+
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("--tp-host: failed to find RPC backend");
+    }
+    // the other ranks, from --rpc
+    std::vector<ggml_backend_dev_t> remotes;
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        if (ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) == std::string("RPC")) {
+            remotes.push_back(dev);
+        } else if (gpu == nullptr) {
+            gpu = dev;
+        }
+    }
+    if (gpu == nullptr) {
+        throw std::invalid_argument("--tp-host: no local GPU to serve");
+    }
+    if (remotes.empty()) {
+        throw std::invalid_argument("--tp-host: give the other laptops with --rpc");
+    }
+
+    typedef void (*start_server_t)(const char * endpoint, const char * cache_dir, size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+    typedef ggml_backend_reg_t (*add_server_t)(const char * endpoint);
+    auto start_server_fn = (start_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_start_server");
+    auto add_server_fn   = (add_server_t)   ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    if (!start_server_fn || !add_server_fn) {
+        throw std::invalid_argument("--tp-host: failed to find the RPC server functions");
+    }
+    const std::string endpoint = host + ":" + std::to_string(port);
+    LOG_INF("%s: rank 0 on %s (%s), the comm port is %d unless GGML_RPC_COMM_PORT is set\n", __func__,
+            endpoint.c_str(), ggml_backend_dev_description(gpu), port + 1000);
+    // the server runs until the process exits
+    std::thread([start_server_fn, endpoint, gpu]() mutable {
+        start_server_fn(endpoint.c_str(), nullptr, 1, 1, &gpu);
+    }).detach();
+    ggml_backend_reg_t reg = nullptr;
+    for (int i = 0; i < 400 && reg == nullptr; i++) {
+        reg = add_server_fn(endpoint.c_str());
+        if (reg == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    if (reg == nullptr) {
+        throw std::invalid_argument("--tp-host: the RPC server on " + endpoint + " did not start (is the address of this machine and the port free?)");
+    }
+    ggml_backend_register(reg);
+
+    // rank 0 first: it listens for the comm of the other ranks
+    params.devices.clear();
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        params.devices.push_back(ggml_backend_reg_dev_get(reg, i));
+    }
+    params.devices.insert(params.devices.end(), remotes.begin(), remotes.end());
+    params.devices.push_back(nullptr);
+}
+
+static void add_rpc_devices(const std::string & servers) {
+    auto rpc_servers = string_split<std::string>(servers, ',');
+    if (rpc_servers.empty()) {
+        throw std::invalid_argument("no RPC servers specified");
+    }
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("failed to find RPC backend");
+    }
+    typedef ggml_backend_reg_t (*ggml_backend_rpc_add_server_t)(const char * endpoint);
+    ggml_backend_rpc_add_server_t ggml_backend_rpc_add_server_fn = (ggml_backend_rpc_add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    if (!ggml_backend_rpc_add_server_fn) {
+        throw std::invalid_argument("failed to find RPC add server function");
+    }
+    for (const auto & server : rpc_servers) {
+        auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
+        ggml_backend_register(reg);
     }
 }
 
@@ -2452,6 +2877,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",
@@ -2521,6 +2947,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.video_ffmpeg_bin_dir = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FFMPEG_DIR"));
+    add_opt(common_arg(
+        {"--rpc"}, "SERVERS",
+        "comma-separated list of RPC servers (host:port)",
+        [](common_params & params, const std::string & value) {
+            if (!llama_supports_rpc()) {
+                throw std::invalid_argument("RPC not supported in this build");
+            }
+            add_rpc_devices(value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_RPC"));
     add_opt(common_arg(
         {"-lm", "--load-mode"}, "MODE",
         "model loading mode (default: auto)\n"
@@ -2599,6 +3036,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LONGHAUL_CACHE"));
     add_opt(common_arg(
+        {"-lhcd", "--longhaul-cache-device"}, "DEV=SIZE,...",
+        "LongHaul: expert cache size of a device, e.g. RPC0=12G,MTL0=4G; --longhaul-cache is then the total of the devices not named",
+        [](common_params & params, const std::string & value) {
+            params.longhaul_cache_devices = value;
+        }
+    ).set_env("LLAMA_ARG_LONGHAUL_CACHE_DEVICE"));
+    add_opt(common_arg(
+        {"-es", "--expert-share"}, "SHARE",
+        "LongHaul: split the experts of every MoE layer over the devices, which compute them at the same time\n"
+        "the percentage of the selected experts that each device computes: 60 gives the RPC devices 60% and the local GPU the rest,\n"
+        "RPC0=60,MTL0=40 names devices (as --list-devices prints them), 60,40 follows the order of the devices",
+        [](common_params & params, const std::string & value) {
+            params.expert_share = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_SHARE"));
+    add_opt(common_arg(
+        {"--kv-remote"}, "DEV",
+        "use the RPC device DEV only for the KV cache and the tokenizer: it holds the KV cache of the full-attention layers\n"
+        "and runs their attention, and llama_tokenize runs on it; the weights and the rest of the model stay on the other devices\n"
+        "(DEV as --list-devices prints it, or the address of the server; the server needs --model-dir with a copy of the model file)",
+        [](common_params & params, const std::string & value) {
+            params.kv_remote = value;
+        }
+    ).set_env("LLAMA_ARG_KV_REMOTE"));
+    add_opt(common_arg(
+        {"-kvd", "--kv-device"}, "DEV",
+        "LongHaul expert split: the device of the layers and the KV cache (default: the local GPU)",
+        [](common_params & params, const std::string & value) {
+            params.kv_device = value;
+        }
+    ).set_env("LLAMA_ARG_KV_DEVICE"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; MoE experts always stay on disk, see --longhaul-cache)",
@@ -2629,11 +3098,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row}",
+        {"-sm", "--split-mode"}, "{none,layer,row,expert,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
-        "- row: split weight across GPUs by rows (parallelized)",
+        "- row: split weight across GPUs by rows (parallelized)\n"
+        "- expert: LongHaul only, layers and KV on --main-gpu, the experts of each layer split by --tensor-split (see --expert-share)\n"
+        "- tensor: every layer split over all GPUs at once (tensor parallelism, qwen35, qwen35moe, inkling2 and inkling2_loop, needs flash attention)",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -2641,6 +3112,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_LAYER;
             } else if (value == "row") {
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
+            } else if (value == "expert") {
+                params.split_mode = LLAMA_SPLIT_MODE_EXPERT;
+            } else if (value == "tensor") {
+                params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
             } else {
                 throw std::invalid_argument("invalid value");
             }
@@ -2649,6 +3124,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
+    add_opt(common_arg(
+        {"--tp-attn"}, "{split,mirror}",
+        "attention with --split-mode tensor, one of:\n"
+        "- split (default): heads, KV cache and recurrent state split over the GPUs, two syncs per layer\n"
+        "- mirror: every GPU holds and computes all of the attention, one sync per layer;\n"
+        "  faster when a sync costs more than about 100 us, for example between laptops",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "split")  { params.tp_attn = LLAMA_TP_ATTN_SPLIT;  }
+            else if (value == "mirror") { params.tp_attn = LLAMA_TP_ATTN_MIRROR; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_TP_ATTN"));
+    add_opt(common_arg(
+        {"--tp-host"}, "ADDR[:PORT]",
+        "with --split-mode tensor, run rank 0 in this process as an RPC server for the local GPU on ADDR:PORT\n"
+        "(default port 50052), the address the --rpc servers reach this machine on, e.g. 10.0.0.1;\n"
+        "the devices become this server and then the --rpc servers",
+        [](common_params & params, const std::string & value) {
+            if (!llama_supports_rpc()) {
+                throw std::invalid_argument("RPC not supported in this build");
+            }
+            params.tp_host = value;
+        }
+    ).set_env("LLAMA_ARG_TP_HOST"));
     add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",

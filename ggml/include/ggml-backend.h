@@ -132,6 +132,17 @@ extern "C" {
     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
 
+    // (optional) events reached from the host, for example by a thread that moves data between devices
+    // an event armed for the host must only be reached by the host, never recorded by a backend
+    // arm:    the next reach of the event comes from the host, a later ggml_backend_event_wait waits for it
+    //         returns false if the device does not support it
+    // signal: the host reaches the oldest armed value, the backends that wait for it go on
+    // query:  whether the event reached its last recorded or armed value, without waiting
+    //         (a device without it waits, then returns true)
+    GGML_API bool                 ggml_backend_event_arm_host(ggml_backend_event_t event);
+    GGML_API void                 ggml_backend_event_signal_host(ggml_backend_event_t event);
+    GGML_API bool                 ggml_backend_event_query(ggml_backend_event_t event);
+
     //
     // Backend device
     //
@@ -225,6 +236,9 @@ extern "C" {
 
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // optional ("ggml_backend_comm_allreduce_tensor_check"): as above, and the ranks compare checks[i], one I32 tensor per rank
+    // that must hold the same values on every rank (the expert ids of the layer); a mismatch fails the computation
+    typedef bool   (*ggml_backend_comm_allreduce_tensor_check_t)(void * comm_ctx, struct ggml_tensor ** tensors, struct ggml_tensor ** checks);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
@@ -240,6 +254,9 @@ extern "C" {
         const char * value;
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+    // Keep the device awake for the next us microseconds, so that it starts quickly after a short wait on an event
+    // (a GPU that sleeps between the steps of a tensor parallel all-reduce loses about 100 us per step)
+    typedef void                         (*ggml_backend_dev_keep_awake_t)(ggml_backend_dev_t device, int64_t us);
 
     //
     // Backend registry
@@ -370,6 +387,11 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // Start a new split at node, also when it runs on the same backend as the node before it
+    // The inputs of a split are copied before the split starts: a node that reads the result of another backend can start a split,
+    // so that the nodes before it are queued before the copy waits for that result
+    GGML_API void                 ggml_backend_sched_set_split_start(ggml_backend_sched_t sched, struct ggml_tensor * node);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
@@ -444,6 +466,15 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // the simple devices of a meta device
+    GGML_API size_t             ggml_backend_meta_dev_n_simple  (ggml_backend_dev_t meta_dev);
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_get_simple(ggml_backend_dev_t meta_dev, size_t index);
+
+    // the bytes that the tensors of ctx take on simple device index when they are allocated in a meta buffer, without allocating them
+    GGML_API size_t ggml_backend_meta_buft_ctx_size(ggml_backend_buffer_type_t meta_buft, struct ggml_context * ctx, size_t index);
+    // the size of the part of a meta buffer that is on simple device index
+    GGML_API size_t ggml_backend_meta_buffer_simple_size(ggml_backend_buffer_t meta_buf, size_t index);
 
     //
     // Utils

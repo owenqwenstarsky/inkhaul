@@ -202,7 +202,8 @@ extern "C" {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
         LLAMA_SPLIT_MODE_ROW    = 2, // split layers and KV across GPUs, use tensor parallelism if supported
-        LLAMA_SPLIT_MODE_TENSOR = 3, // not supported, model loading fails
+        LLAMA_SPLIT_MODE_TENSOR = 3, // split the tensors of every layer over the devices (tensor parallelism, qwen35, qwen35moe, inkling2*)
+        LLAMA_SPLIT_MODE_EXPERT = 4, // LongHaul only: every layer and the KV on main_gpu, the routed experts of each MoE layer split over the devices by tensor_split
     };
 
     enum llama_load_mode {
@@ -221,6 +222,12 @@ extern "C" {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+    };
+
+    // attention with LLAMA_SPLIT_MODE_TENSOR
+    enum llama_tp_attn {
+        LLAMA_TP_ATTN_SPLIT  = 0, // heads, KV cache and recurrent state split over the devices: two syncs per layer
+        LLAMA_TP_ATTN_MIRROR = 1, // every device holds and computes all of the attention: one sync per layer
     };
 
     enum llama_context_type {
@@ -337,10 +344,18 @@ extern "C" {
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
+        enum llama_tp_attn tp_attn; // attention with LLAMA_SPLIT_MODE_TENSOR
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
+        // with LLAMA_SPLIT_MODE_EXPERT: the device of every layer and of the KV cache (an index into the devices of the model)
         int32_t main_gpu;
 
+        // the device that holds the KV cache of the full-attention layers and runs their attention, and holds no layers
+        // (an index into the devices of the model), -1: the KV cache of each layer is on the device of the layer
+        int32_t kv_gpu;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
+        // with LLAMA_SPLIT_MODE_EXPERT: the share of the experts of each MoE layer that each device computes
         const float * tensor_split;
 
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
@@ -360,6 +375,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool tokenize_on_kv_gpu; // llama_tokenize runs on the RPC server of kv_gpu, with its copy of the model file
     };
 
     struct llama_sampler_seq_config {
@@ -402,6 +418,9 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t longhaul_cache_size; // LongHaul: device cache in bytes for the experts kept on disk (default: 512 MiB, must be > 0 for such models)
+        // LongHaul: cache size in bytes per device of the model, size: llama_max_devices(), 0 = not set (NULL: none set)
+        // longhaul_cache_size is then the total of the devices that are not set
+        const size_t * longhaul_cache_sizes;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1232,6 +1251,11 @@ extern "C" {
     //
     // The API is thread-safe.
     //
+
+    /// @details For a program that runs ggml_backend_rpc_start_server: clients may run llama_tokenize on it
+    ///          (llama_model_params.tokenize_on_kv_gpu), with the vocabulary of its model files (ggml_backend_rpc_server_set_model_dir).
+    ///          Call before the server starts. Returns false if there is no RPC backend.
+    LLAMA_API bool llama_rpc_server_enable_tokenizer(void);
 
     /// @details Convert the provided text into tokens.
     /// @param tokens The tokens pointer must be large enough to hold the resulting tokens.

@@ -919,6 +919,10 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // see ggml_metal_device_keep_awake, made on the first call
+    struct ggml_metal_keep_awake * awake;
+    dispatch_once_t                awake_once;
 };
 
 //
@@ -1050,6 +1054,149 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
     [rsets->lock release];
 
     free(rsets);
+}
+
+//
+// keep awake
+//
+// An Apple GPU that waits on an event for more than about 50 us goes to sleep, and starts the next work about
+// 100-200 us after the event is reached. The tensor parallel all-reduce waits like that once per step, for the
+// peer's partial. While a keep awake is active, a second queue runs a kernel of one thread back to back, which
+// keeps the GPU awake and costs the other work nothing measurable.
+//
+
+struct ggml_metal_keep_awake {
+    id<MTLCommandQueue>         queue;
+    id<MTLComputePipelineState> pipeline;
+    id<MTLBuffer>               sink;
+
+    atomic_llong deadline_us; // keep running until then
+    atomic_bool  running;     // a loop is on the dispatch queue
+    atomic_bool  stop;
+
+    dispatch_group_t d_group;
+};
+
+static int64_t ggml_metal_time_us(void) {
+    return (int64_t) (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000);
+}
+
+static struct ggml_metal_keep_awake * ggml_metal_keep_awake_init(ggml_metal_device_t dev) {
+    if (dev->library == NULL || getenv("GGML_METAL_NO_KEEP_AWAKE") != NULL) {
+        return NULL;
+    }
+
+    struct ggml_metal_pipeline_with_params ppl = ggml_metal_library_get_pipeline(dev->library, "kernel_keep_awake");
+    if (!ppl.pipeline) {
+        ppl = ggml_metal_library_compile_pipeline(dev->library, "kernel_keep_awake", "kernel_keep_awake", NULL);
+    }
+    if (!ppl.pipeline) {
+        return NULL;
+    }
+
+    struct ggml_metal_keep_awake * res = calloc(1, sizeof(struct ggml_metal_keep_awake));
+
+    res->queue    = [dev->mtl_device newCommandQueue];
+    res->pipeline = ppl.pipeline->obj; // owned by the library, which outlives this
+    res->sink     = [dev->mtl_device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModePrivate];
+    res->d_group  = dispatch_group_create();
+
+    atomic_init(&res->deadline_us, 0);
+    atomic_init(&res->running, false);
+    atomic_init(&res->stop, false);
+
+    if (res->queue == nil || res->sink == nil) {
+        [res->queue release];
+        [res->sink release];
+        dispatch_release(res->d_group);
+        free(res);
+        return NULL;
+    }
+
+    return res;
+}
+
+static void ggml_metal_keep_awake_loop(struct ggml_metal_keep_awake * ka) {
+    // about 250 us per kernel on an M5, so a stop never waits long
+    const uint32_t n_iter = 16384;
+
+    while (true) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> prev = nil;
+            while (!atomic_load_explicit(&ka->stop, memory_order_relaxed) &&
+                   ggml_metal_time_us() < atomic_load_explicit(&ka->deadline_us, memory_order_relaxed)) {
+                // two command buffers in flight, so the GPU never sees a gap
+                id<MTLCommandBuffer> cmd_buf = [ka->queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
+                [enc setComputePipelineState:ka->pipeline];
+                [enc setBytes:&n_iter length:sizeof(n_iter) atIndex:0];
+                [enc setBuffer:ka->sink offset:0 atIndex:1];
+                [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                [enc endEncoding];
+                [cmd_buf commit];
+                [cmd_buf retain];
+
+                if (prev != nil) {
+                    [prev waitUntilCompleted];
+                    [prev release];
+                }
+                prev = cmd_buf;
+            }
+            if (prev != nil) {
+                [prev waitUntilCompleted];
+                [prev release];
+            }
+        }
+
+        atomic_store_explicit(&ka->running, false, memory_order_seq_cst);
+
+        // a keep awake that came while this loop was ending saw running and did not start a new one
+        bool expected = false;
+        if (atomic_load_explicit(&ka->stop, memory_order_relaxed) ||
+            ggml_metal_time_us() >= atomic_load_explicit(&ka->deadline_us, memory_order_seq_cst) ||
+            !atomic_compare_exchange_strong(&ka->running, &expected, true)) {
+            return;
+        }
+    }
+}
+
+static void ggml_metal_keep_awake_free(struct ggml_metal_keep_awake * ka) {
+    if (ka == NULL) {
+        return;
+    }
+
+    atomic_store_explicit(&ka->stop, true, memory_order_relaxed);
+    dispatch_group_wait(ka->d_group, DISPATCH_TIME_FOREVER);
+    dispatch_release(ka->d_group);
+
+    [ka->queue release];
+    [ka->sink release];
+
+    free(ka);
+}
+
+void ggml_metal_device_keep_awake(ggml_metal_device_t dev, int64_t us) {
+    dispatch_once(&dev->awake_once, ^{
+        dev->awake = ggml_metal_keep_awake_init(dev);
+    });
+
+    struct ggml_metal_keep_awake * ka = dev->awake;
+    if (ka == NULL || us <= 0) {
+        return;
+    }
+
+    const int64_t deadline = ggml_metal_time_us() + us;
+
+    int64_t cur = atomic_load_explicit(&ka->deadline_us, memory_order_relaxed);
+    while (cur < deadline && !atomic_compare_exchange_weak(&ka->deadline_us, &cur, deadline)) {
+    }
+
+    bool expected = false;
+    if (atomic_compare_exchange_strong(&ka->running, &expected, true)) {
+        dispatch_group_async(ka->d_group, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            ggml_metal_keep_awake_loop(ka);
+        });
+    }
 }
 
 static const struct {
@@ -1378,6 +1525,9 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
     @autoreleasepool {
         ggml_metal_fusion_info_free(dev->finfo);
 
+        ggml_metal_keep_awake_free(dev->awake);
+        dev->awake = NULL;
+
         ggml_metal_rsets_free(dev->rsets);
 
         ggml_metal_library_free(dev->library);
@@ -1448,7 +1598,8 @@ void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev) {
 struct ggml_metal_event {
     void * obj; // id<MTLSharedEvent>
 
-    atomic_int value;
+    atomic_ullong value;        // the last value signaled or armed
+    atomic_ullong host_reached; // the last value the host reached, see signal_host
 };
 
 void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw) {
@@ -1473,7 +1624,8 @@ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
     ggml_metal_event_t ev = calloc(1, sizeof(struct ggml_metal_event));
 
     ev->obj = (__bridge void *)event;
-    ev->value = 0;
+    atomic_init(&ev->value, 0);
+    atomic_init(&ev->host_reached, 0);
 
     return ev;
 }
@@ -1495,6 +1647,31 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
     if (!res) {
         GGML_ABORT("%s: failed to wait for event\n", __func__);
     }
+
+    GGML_UNUSED(dev);
+}
+
+void ggml_metal_device_event_arm_host(ggml_metal_device_t dev, ggml_metal_event_t ev) {
+    // a following encode_wait waits for this value
+    atomic_fetch_add_explicit(&ev->value, 1, memory_order_relaxed);
+
+    GGML_UNUSED(dev);
+}
+
+void ggml_metal_device_event_signal_host(ggml_metal_device_t dev, ggml_metal_event_t ev) {
+    // only the host reaches an armed event, so the values are reached one by one in order; the host keeps its
+    // own count, because reading signaledValue back is slow
+    const uint64_t v = atomic_fetch_add_explicit(&ev->host_reached, 1, memory_order_relaxed) + 1;
+
+    id<MTLSharedEvent> event = ev->obj;
+    event.signaledValue = v;
+
+    GGML_UNUSED(dev);
+}
+
+bool ggml_metal_device_event_query(ggml_metal_device_t dev, ggml_metal_event_t ev) {
+    id<MTLSharedEvent> event = ev->obj;
+    return event.signaledValue >= atomic_load_explicit(&ev->value, memory_order_relaxed);
 
     GGML_UNUSED(dev);
 }

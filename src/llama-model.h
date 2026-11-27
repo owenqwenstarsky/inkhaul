@@ -178,6 +178,14 @@ struct llama_device {
     ggml_backend_dev_t dev;
 };
 
+// tensor parallelism (LLAMA_SPLIT_MODE_TENSOR): how each tensor is split over the devices of the meta device
+struct llama_meta_device_get_split_state_userdata {
+    size_t                     n_devices;
+    const struct llama_model * model;
+};
+
+struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
+
 struct llama_prec_policy {
     // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op
     std::unordered_map<const ggml_tensor *, ggml_prec> prec_acc;
@@ -292,6 +300,12 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    // kv_gpu: the device of the KV cache and the attention of the full-attention layers, it holds no layers; nullptr if not used
+    ggml_backend_dev_t kv_dev = nullptr;
+
+    // for the meta device of LLAMA_SPLIT_MODE_TENSOR
+    struct llama_meta_device_get_split_state_userdata get_split_state_ud = {};
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
@@ -318,6 +332,7 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    llama_tp_attn    tp_attn() const;
     bool no_alloc() const;
 
     // LongHaul: expert tensors kept on disk (TENSOR_LONGHAUL), read by the expert cache
@@ -325,6 +340,10 @@ struct llama_model {
     bool is_longhaul(const ggml_tensor * t) const;
     // read size bytes of t at byte offs of its data, from the model file
     void longhaul_read(const ggml_tensor * t, void * dst, size_t offs, size_t size) const;
+    // the model file and the file offset of the data of t, false if not known
+    bool longhaul_src(const ggml_tensor * t, size_t & file, size_t & offs) const;
+    // the path of a model file, empty if it was opened from a FILE pointer
+    const std::string & longhaul_path(size_t file) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -333,8 +352,16 @@ struct llama_model {
 
     void print_info() const;
 
+    // with LLAMA_SPLIT_MODE_TENSOR: the share of each device per tensor class, after rounding
+    void log_tensor_split() const;
+
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
+
+    // true if the KV cache and the attention of layer il are on kv_dev
+    bool kv_remote(int il) const;
+    // the device of the KV cache of layer il
+    ggml_backend_dev_t dev_kv(int il) const;
 
     bool has_tensor_overrides() const;
 
@@ -355,6 +382,14 @@ struct llama_model {
 
     // graph size budget: max graph nodes per model tensor
     virtual uint32_t graph_nodes_per_tensor() const { return 8; }
+
+    // the layer whose weights cache slot il uses
+    // looped architectures run some layers more than once and give each later pass its own cache slot
+    virtual int layer_phys(int il) const { return il; }
+
+    // number of layers that hold weights, the unit of n_gpu_layers and tensor_split
+    // cache slots that alias another layer follow the device of that layer
+    int n_layer_offload() const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

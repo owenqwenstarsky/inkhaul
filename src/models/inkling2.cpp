@@ -416,17 +416,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         // the table is [n_head*n_tokens, n_extent + 1], so the heads of one distance and token are a contiguous row for get_rows
+        // with kv_gpu the bias is built on the KV device (pin_kv), from the small Rcur and sinks, so it does not cross the link
         ggml_tensor *& rel_bias = rel_biases[layer.attn_rel_bias];
         if (!rel_bias) {
             rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+            pin_kv(rel_bias, il);
         }
         ggml_tensor * table = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head*n_tokens), rel_bias);
+        pin_kv(table, il);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_2d(ctx0, sinks, n_head*n_tokens, 1));
+        pin_kv(table, il);
         table = ggml_view_3d(ctx0, table, n_head, table->ne[1], n_tokens, table->nb[1], n_head*ggml_element_size(table), 0);
 
         ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+        pin_kv(kq_b, il);
         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
         kq_b = ggml_permute(ctx0, kq_b, 2, 0, 1, 3); // [n_kv, n_tokens/n_stream, n_head, n_stream], build_attn makes it contiguous
 

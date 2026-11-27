@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -135,7 +136,25 @@ struct llama_vocab {
 
     void print_info() const;
 
+    // llama_tokenize: by the remote tokenizer if one is set, else as tokenize() above
+    // other uses of the tokenizer in this library (grammars, samplers) stay local
+    using remote_tokenize_t = std::function<int32_t(const char * text, int32_t text_len, llama_token * tokens, int32_t n_tokens_max,
+                                                    bool add_special, bool parse_special)>;
+    void set_remote_tokenize(remote_tokenize_t fn);
+    int32_t tokenize_api(
+                   const char * text,
+                      int32_t   text_len,
+                  llama_token * tokens,
+                      int32_t   n_tokens_max,
+                         bool   add_special,
+                         bool   parse_special) const;
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+    remote_tokenize_t remote_tokenize;
 };
+
+// llama_tokenize of vocab runs on the RPC server of dev, with its copy of the model file at path (see ggml-rpc-server --model-dir)
+// throws if the server cannot, or if it tokenizes a probe text differently
+void llama_vocab_set_remote(llama_vocab & vocab, ggml_backend_dev_t dev, const std::string & path);

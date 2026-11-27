@@ -506,6 +506,7 @@ endif()
 ggml_add_backend(BLAS)
 ggml_add_backend(CUDA)
 ggml_add_backend(METAL)
+ggml_add_backend(RPC)
 
 foreach (target ggml-base ggml)
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)

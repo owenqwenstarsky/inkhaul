@@ -1009,6 +1009,17 @@ typedef decltype(kernel_top_k_mask<float>) kernel_top_k_mask_f_t;
 template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_h_t kernel_top_k_mask<half>;
 template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t kernel_top_k_mask<float>;
 
+// one thread busy for a bounded time, see ggml_metal_device_keep_awake
+kernel void kernel_keep_awake(
+        constant uint & n_iter,
+        device   uint * sink) {
+    uint x = 1;
+    for (uint i = 0; i < n_iter; ++i) {
+        x = x*1664525u + 1013904223u;
+    }
+    sink[0] = x;
+}
+
 // nearest E4M3 value of x > 0, ties to even, saturated at 448
 static inline float round_nvfp4_e4m3(float x) {
     int e;

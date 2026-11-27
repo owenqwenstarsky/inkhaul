@@ -4,10 +4,14 @@
 #include "llama.h"
 #include "llama-arch.h"
 
+#include <cstdint>
 #include <vector>
 
 struct llama_model_saver {
     struct gguf_context * gguf_ctx = nullptr;
+
+    // host copies of the tensors of a meta (tensor parallel) buffer, which finds its tensors by pointer, not by a copy
+    std::vector<std::vector<uint8_t>> host_data;
     const struct llama_model * model;
     const struct LLM_KV llm_kv;
 

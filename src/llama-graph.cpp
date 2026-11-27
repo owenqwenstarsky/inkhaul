@@ -1105,6 +1105,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     rope_type        (hparams.rope_type),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    backend_kv       (params.backend_kv),
     loras            (params.loras),
     mctx             (params.mctx),
     moe_cache        (params.moe_cache),
@@ -1234,12 +1235,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * slots) const {
+          ggml_tensor * slots,
+              int32_t   cache_dev) const {
     ggml_tensor * w_s = model.get_w_scale(w);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w, cache_dev), cur, slots);
 
     if (w->type == GGML_TYPE_NVFP4) {
         ggml_prec_set_acc(res, GGML_PREC_BF16);
@@ -1249,7 +1251,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     prec_policy.apply(res, w);
 
     if (slots != nullptr) {
-        moe_cache->check_op(w, res);
+        moe_cache->check_op(w, res, cache_dev);
     }
 
     if (w_s) {
@@ -1802,14 +1804,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
-    // the experts selected by mm_ids, up to the down projection, from the MoE cache if mm_ids are slots
+    // the experts selected by mm_ids, up to the down projection, from the MoE cache of device cache_dev if mm_ids are slots
     // ids are the selected experts, for the biases and scales
-    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids) {
+    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, int32_t cache_dev) {
         ggml_tensor * up = nullptr;
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cache_dev); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (gate_up_exps_b) {
@@ -1824,7 +1826,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up", il);
         } else {
             // separate gate and up path
-            up = build_lora_mm_id(up_exps, cur, ids, mm_ids); // [n_ff, n_expert_used, n_tokens]
+            up = build_lora_mm_id(up_exps, cur, ids, mm_ids, cache_dev); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
             if (up_exps_b) {
@@ -1833,7 +1835,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (gate_exps) {
-                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids); // [n_ff, n_expert_used, n_tokens]
+                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids, cache_dev); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
@@ -1930,7 +1932,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cache_dev); // [n_embd, n_expert_used, n_tokens]
         cb(experts, "ffn_moe_down", il);
 
         if (amax_src1.scale_s) {
@@ -1940,52 +1942,99 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
-    ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots);
+    // the weighted sum of the outputs of the selected experts, [n_embd, n_tokens]
+    auto sum_experts = [&](ggml_tensor * experts) {
+        // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
+        if (post_exp_norm) {
+            experts = ggml_mul(ctx0, experts, post_exp_norm);
+            experts = ggml_rms_norm(ctx0, experts, post_exp_norm_eps);
+            cb(experts, "ffn_moe_post_exp_norm", il);
+        }
 
-    if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
-        cb(experts, "ffn_moe_down_biased", il);
-    }
+        experts = ggml_mul(ctx0, experts, weights);
+        cb(experts, "ffn_moe_weighted", il);
 
-    // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
-    if (post_exp_norm) {
-        experts = ggml_mul(ctx0, experts, post_exp_norm);
-        experts = ggml_rms_norm(ctx0, experts, post_exp_norm_eps);
-        cb(experts, "ffn_moe_post_exp_norm", il);
-    }
+        ggml_build_forward_expand(gf, experts);
 
-    experts = ggml_mul(ctx0, experts, weights);
-    cb(experts, "ffn_moe_weighted", il);
+        ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
-    ggml_build_forward_expand(gf, experts);
+        assert(n_expert_used > 0);
 
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+        // order the views before the adds
+        // Use per-layer n_expert_used to bound the graph even during warmup (avoids
+        // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
+        // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
+        const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+        for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
-    assert(n_expert_used > 0);
+            ggml_build_forward_expand(gf, cur_experts[i]);
+        }
 
-    // order the views before the adds
-    // Use per-layer n_expert_used to bound the graph even during warmup (avoids
-    // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
-    // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
-    for (uint32_t i = 0; i < n_expert_used_il; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        // aggregate experts
+        ggml_tensor * moe_out = cur_experts[0];
 
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
+        for (uint32_t i = 1; i < n_expert_used_il; ++i) {
+            moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
-    // aggregate experts
-    ggml_tensor * moe_out = cur_experts[0];
+            ggml_build_forward_expand(gf, moe_out);
+        }
 
-    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        if (n_expert_used_il == 1) {
+            // avoid returning a non-contiguous tensor
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
+        return moe_out;
+    };
 
-        ggml_build_forward_expand(gf, moe_out);
-    }
+    ggml_tensor * moe_out = nullptr;
 
-    if (n_expert_used_il == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx0, moe_out);
+    if (cache.parts.size() <= 1) {
+        const llama_moe_cache_part part = cache.parts.empty() ? llama_moe_cache_part{} : cache.parts[0];
+        ggml_tensor * experts = build_experts(cur, selected_experts, part.slots, part.dev);
+
+        if (down_exps_b) {
+            experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+            cb(experts, "ffn_moe_down_biased", il);
+        }
+
+        moe_out = sum_experts(experts);
+    } else {
+        // expert split: each device computes the selected experts it owns (the others have a slot of -1 and give zeros) and sums
+        // them, so that only [n_embd, n_tokens] crosses to the home backend, which adds the sums of the devices
+        // per-expert scales keep a skipped row at zero, a bias would not
+        // the devices other than the home device come first, so that their work is queued before the home device computes its part
+        GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && "the expert split does not support expert biases");
+        std::vector<ggml_tensor *> part_outs;
+        for (const llama_moe_cache_part & part : cache.parts) {
+            const int n_nodes_prev = ggml_graph_n_nodes(gf);
+
+            ggml_tensor * part_out = sum_experts(build_experts(cur, selected_experts, part.slots, part.dev));
+            ggml_build_forward_expand(gf, part_out);
+
+            // the new nodes run on the device of the part, except the slot lookup, which is already on the home backend
+            ggml_backend_t backend = moe_cache->backend(part.dev);
+            for (int i = n_nodes_prev; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node->view_src == nullptr && ggml_backend_sched_get_tensor_backend(sched, node) == nullptr) {
+                    ggml_backend_sched_set_tensor_backend(sched, node, backend);
+                }
+            }
+
+            part_outs.push_back(part_out);
+        }
+
+        // the home backend adds the sums after all parts, in a split of its own: the inputs of a split are copied when it starts,
+        // so the home device queues its part before it waits for the sums of the other devices
+        moe_out = part_outs[0];
+        for (size_t ip = 1; ip < part_outs.size(); ++ip) {
+            moe_out = ggml_add(ctx0, moe_out, part_outs[ip]);
+            ggml_backend_sched_set_tensor_backend(sched, moe_out, moe_cache->home());
+            if (ip == 1) {
+                ggml_backend_sched_set_split_start(sched, moe_out);
+            }
+            ggml_build_forward_expand(gf, moe_out);
+        }
     }
 
     cb(moe_out, "ffn_moe_out", il);
@@ -2248,6 +2297,12 @@ ggml_tensor * llm_graph_context::build_inp_moe_ids(int64_t n_used, int64_t n_row
 
 
 
+void llm_graph_context::pin_kv(ggml_tensor * t, int il) const {
+    if (backend_kv != nullptr && il >= 0 && model.kv_remote(il)) {
+        ggml_backend_sched_set_tensor_backend(sched, t, backend_kv);
+    }
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2274,6 +2329,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
+    // kv_gpu: the nodes from the KV cache to the attention output run on the KV device, before the MLA weights
+    auto pin = [&](ggml_tensor * t) {
+        pin_kv(t, il);
+        return t;
+    };
+
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
@@ -2287,11 +2348,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
         if (k->type == GGML_TYPE_F32) {
-            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+            k = pin(ggml_cast(ctx0, k, GGML_TYPE_F16));
         }
 
         if (v->type == GGML_TYPE_F32) {
-            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            v = pin(ggml_cast(ctx0, v, GGML_TYPE_F16));
         }
 
         if (kv_rows) {
@@ -2299,6 +2360,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         } else {
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f);
         }
+        pin(cur);
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -2325,27 +2387,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        ggml_tensor * kq = pin(ggml_mul_mat(ctx0, k, q));
         cb(kq, "kq", il);
 
         ggml_prec_set_acc(kq, GGML_PREC_BF16);
 
         if (kq_b) {
-            kq = ggml_add(ctx0, kq, kq_b);
+            kq = pin(ggml_add(ctx0, kq, kq_b));
             cb(kq, "kq_plus_kq_b", il);
         }
 
-        kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, 0.0f);
+        kq = pin(ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, 0.0f));
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
 
         if (!v_trans) {
             // note: avoid this branch
-            v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+            v = pin(ggml_cont(ctx0, ggml_transpose(ctx0, v)));
             cb(v, "v_cont", il);
         }
 
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        ggml_tensor * kqv = pin(ggml_mul_mat(ctx0, v, kq));
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
@@ -2358,6 +2420,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        if (!v_mla) {
+            pin(cur);
+        }
 
         if (!cparams.offload_kqv) {
             // all nodes between the KV store and the attention output are run on the CPU
@@ -3034,16 +3099,20 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(attn_mask.rows == nullptr);
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    // kq_b can be a permuted view
+    // kq_b can be a permuted view, with kv_gpu it is made contiguous on the KV device
     ggml_tensor * kq_mask = attn_mask.raw;
     if (cparams.flash_attn && kq_mask->type == GGML_TYPE_F16) {
         // the mask holds only 0 and -inf, so an F16 add gives the same result as an F32 add and a cast
-        kq_mask = ggml_add(ctx0, ggml_cast(ctx0, kq_b, GGML_TYPE_F16), kq_mask);
+        kq_b = ggml_cast(ctx0, kq_b, GGML_TYPE_F16);
+        pin_kv(kq_b, il);
+        kq_mask = ggml_add(ctx0, kq_b, kq_mask);
     } else {
         if (kq_mask->type != GGML_TYPE_F32) {
             kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
         }
-        kq_mask = ggml_add(ctx0, ggml_cont(ctx0, kq_b), kq_mask);
+        kq_b = ggml_cont(ctx0, kq_b);
+        pin_kv(kq_b, il);
+        kq_mask = ggml_add(ctx0, kq_b, kq_mask);
         if (cparams.flash_attn) {
             kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
         }

@@ -64,13 +64,14 @@ struct ggml_backend_meta_device_context {
             simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
         name        = std::string("Meta(");
         description = std::string("Meta(");
-        for (size_t i = 0; i < simple_devs.size(); i++) {
+        // the parameter was moved from, so read the member
+        for (size_t i = 0; i < this->simple_devs.size(); i++) {
             if (i > 0) {
                 name        += ",";
                 description += ",";
             }
-            name        += ggml_backend_dev_name       (simple_devs[i]);
-            description += ggml_backend_dev_description(simple_devs[i]);
+            name        += ggml_backend_dev_name       (this->simple_devs[i]);
+            description += ggml_backend_dev_description(this->simple_devs[i]);
         }
         name        += ")";
         description += ")";
@@ -197,6 +198,9 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
+    /* .event_arm_host       = */ nullptr,
+    /* .event_signal_host    = */ nullptr,
+    /* .event_query          = */ nullptr,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -214,6 +218,14 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
     return meta_dev_ctx->simple_devs[index];
+}
+
+size_t ggml_backend_meta_dev_n_simple(ggml_backend_dev_t meta_dev) {
+    return ggml_backend_meta_dev_n_devs(meta_dev);
+}
+
+ggml_backend_dev_t ggml_backend_meta_dev_get_simple(ggml_backend_dev_t meta_dev, size_t index) {
+    return ggml_backend_meta_dev_simple_dev(meta_dev, index);
 }
 
 ggml_backend_dev_t ggml_backend_meta_device(
@@ -1887,6 +1899,7 @@ struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
         int           offset      = 0; // Node offset vs. original graph
+        ggml_tensor * check       = nullptr; // the expert ids of the last MUL_MAT_ID, compared between the ranks at the all-reduce
 
         std::vector<ggml_cgraph *> cgraphs_aux;
     };
@@ -1915,6 +1928,8 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_allreduce_tensor_check_t comm_allreduce_check = nullptr; // optional
+    bool                                 comm_warned    = false; // the fallback was logged once
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1946,6 +1961,9 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            comm_allreduce_check = (ggml_backend_comm_allreduce_tensor_check_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor_check");
         }
     }
 
@@ -2342,6 +2360,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             GGML_ASSERT(i_start == cgraph->n_nodes);
         }
 
+        if (n_subgraphs != backend_ctx->n_subgraphs) {
+            // each sub-graph but the last ends in an all-reduce
+            GGML_LOG_DEBUG("%s: %d nodes in %zu sub-graphs, %zu all-reduces\n", __func__, cgraph->n_nodes, n_subgraphs, n_subgraphs - 1);
+        }
         backend_ctx->uid         = cgraph->uid;
         backend_ctx->n_subgraphs = n_subgraphs;
 
@@ -2391,6 +2413,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
                 cgraph_ij->n_nodes = i_node_stop - i_node_start;
+                // ranks that pick different experts would sum wrong partials without noticing, so the comm compares the ids;
+                // the graph keeps them as outputs until the end, see llama_model::build_graph
+                bcj.cgraphs[i_graph].check = nullptr;
+                for (size_t i_node = i_node_stop; i_node > i_node_start; i_node--) {
+                    if (cgraph->nodes[i_node - 1]->op == GGML_OP_MUL_MAT_ID) {
+                        bcj.cgraphs[i_graph].check = bcj.nodes[i_node - 1]->src[2];
+                        break;
+                    }
+                }
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
                     ggml_tensor * node_ij = bcj.nodes[i_node];
@@ -2571,10 +2602,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                if (backend_ctx->comm_allreduce_check != nullptr && backend_ctx->backend_configs[0].cgraphs[i].check != nullptr) {
+                    std::vector<ggml_tensor *> checks;
+                    checks.reserve(n_backends);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        checks.push_back(backend_ctx->backend_configs[j].cgraphs[i].check);
+                    }
+                    backend_allreduce_success = backend_ctx->comm_allreduce_check(backend_ctx->comm_ctx, nodes.data(), checks.data());
+                } else {
+                    backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                }
             }
 
             if (!backend_allreduce_success) {
+                if (backend_ctx->comm_ctx && !backend_ctx->comm_warned) {
+                    // the sums now go through this process, which is slower
+                    const ggml_tensor * node = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->nodes[
+                        backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
+                    GGML_LOG_WARN("%s: the backend all-reduce refused %s (%s), using the fallback\n",
+                        __func__, node->name, ggml_type_name(node->type));
+                    backend_ctx->comm_warned = true;
+                }
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
@@ -2629,4 +2677,49 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
+}
+
+size_t ggml_backend_meta_buft_ctx_size(ggml_backend_buffer_type_t meta_buft, struct ggml_context * ctx, size_t index) {
+    GGML_ASSERT(ggml_backend_buft_is_meta(meta_buft));
+    ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(meta_buft);
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+    const size_t n_devs = dev_ctx->simple_devs.size();
+    GGML_ASSERT(index < n_devs);
+    ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(meta_buft, index);
+    const size_t alignment = ggml_backend_buft_get_alignment(simple_buft);
+
+    size_t size = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr || ggml_nelements(t) == 0) {
+            continue;
+        }
+        // the slice of this device, shaped as in ggml_backend_meta_buffer_init_tensor_impl
+        const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(t, dev_ctx->get_split_state_ud);
+        ggml_tensor slice = *t;
+        slice.buffer = nullptr;
+        slice.data   = nullptr;
+        if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+            const int d = ss.axis;
+            int64_t ne_d = 0;
+            for (uint32_t s = 0; s < ss.n_segments; s++) {
+                ne_d += ss.ne[s*n_devs + index] * ss.nr[s];
+            }
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                if (t->nb[i] > t->nb[d]) {
+                    slice.nb[i] = t->nb[i] * ne_d/t->ne[d];
+                }
+            }
+            slice.ne[d] = ne_d;
+        }
+        if (ggml_nelements(&slice) == 0) {
+            continue;
+        }
+        size += GGML_PAD(ggml_backend_buft_get_alloc_size(simple_buft, &slice), alignment);
+    }
+    return size;
+}
+
+size_t ggml_backend_meta_buffer_simple_size(ggml_backend_buffer_t meta_buf, size_t index) {
+    ggml_backend_buffer_t simple_buf = ggml_backend_meta_buffer_simple_buffer(meta_buf, index);
+    return simple_buf != nullptr ? ggml_backend_buffer_get_size(simple_buf) : 0;
 }

@@ -215,6 +215,9 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.longhaul_cache_size = params.longhaul_cache_size;
+    if (params.longhaul_cache_sizes != nullptr) {
+        cparams.longhaul_cache_sizes.assign(params.longhaul_cache_sizes, params.longhaul_cache_sizes + model.n_devices());
+    }
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -342,6 +345,31 @@ llama_context::llama_context(
             }
         }
 
+        // kv_gpu: the backend that runs the attention over the KV cache of the full-attention layers
+        if (model.kv_dev != nullptr) {
+            if (!cparams.offload_kqv) {
+                throw std::runtime_error("the KV device of the model (kv_gpu) needs offload_kqv");
+            }
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == model.kv_dev) {
+                    backend_kv = backend.get();
+                }
+            }
+            GGML_ASSERT(backend_kv != nullptr);
+
+            // each GPU waits for the other at every full-attention layer, and an Apple GPU that waits more than
+            // about 50 us sleeps and starts again 100-200 us late, so keep the GPUs awake while graphs come
+            const char * env = getenv("LLAMA_KV_REMOTE_KEEP_AWAKE_MS");
+            keep_awake_us = (env != nullptr ? (int64_t) atoll(env) : 100)*1000;
+            for (const auto & dev : model.devices) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
+                auto fn = reg ? (ggml_backend_dev_keep_awake_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_keep_awake") : nullptr;
+                if (fn != nullptr && keep_awake_us > 0) {
+                    keep_awake_fns.emplace_back(dev.dev, fn);
+                }
+            }
+        }
+
         // add CPU backend
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (backend_cpu == nullptr) {
@@ -421,11 +449,12 @@ llama_context::llama_context(
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
             model.n_devices() > 1 &&
-            model.n_gpu_layers() > model.hparams.n_layer_all &&
+            model.n_gpu_layers() > (uint32_t) model.n_layer_offload() &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            !model.has_longhaul(); // not supported by the LongHaul cache
+            !model.has_longhaul() && // not supported by the LongHaul cache
+            model.kv_dev == nullptr; // the KV device holds no layers, so there is no pipeline to fill
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -455,7 +484,7 @@ llama_context::llama_context(
 
         if (model.has_longhaul()) {
             if (cparams.longhaul_cache_size > 0) {
-                moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.longhaul_cache_size);
+                moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.longhaul_cache_size, cparams.longhaul_cache_sizes);
 
                 // the experts on disk have no other path, so every ubatch must fit in the cache
                 const int64_t max_ubatch = moe_cache->max_ubatch();
@@ -540,9 +569,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
-            // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
+            // TODO: make this descriptor-specific; model.dev_kv() preserves the current behavior,
             // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            // the attention runs where the KV cache is, which is not the device of the layer with kv_gpu
+            ggml_backend_dev_t device_layer = model.dev_kv(node.il);
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -1393,8 +1423,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
+    // the logits of tensor parallelism are split by vocab over the devices, backend sampling cannot see all of them
     const bool can_offload =
         sampler &&
+        model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
         sampler->iface->backend_init &&
         sampler->iface->backend_apply &&
         llama_sampler_chain_n(sampler) > 0;
@@ -2654,6 +2686,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
+        /*.backend_kv  =*/ backend_kv,
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.moe_cache   =*/ moe_cache.get(),
@@ -2708,6 +2741,13 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    if (moe_cache) {
+        moe_cache->begin_graph();
+    }
+
+    for (const auto & [dev, fn] : keep_awake_fns) {
+        fn(dev, keep_awake_us);
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2812,7 +2852,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
-        const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
+        const bool full_offload = model.n_gpu_layers() > (uint32_t) model.n_layer_offload();
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
@@ -3717,18 +3757,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (model.no_alloc()) {
-        for (size_t i = 0; i < backends.size(); ++i) {
-            ggml_backend_t             backend = backends[i].get();
-            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
-        }
-    } else {
-        for (const auto & backend_ptr : backends) {
-            ggml_backend_t             backend = backend_ptr.get();
-            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
-        }
+    std::map<ggml_backend_buffer_type_t, size_t> compute;
+    for (size_t i = 0; i < backends.size(); ++i) {
+        ggml_backend_t             backend = backends[i].get();
+        ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+        const size_t size = model.no_alloc() ? backend_buf_exp_size[i] : ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        llama_memory_bufs::add_breakdown_size(compute, buft, size);
+    }
+    for (const auto & [buft, size] : compute) {
+        ret[buft].compute += size;
     }
     return ret;
 }
@@ -3997,6 +4034,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.longhaul_cache_size         =*/ 512ull*1024*1024,
+        /*.longhaul_cache_sizes        =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4056,6 +4094,20 @@ llama_context * llama_init_from_model(
                     return nullptr;
                 }
             }
+        }
+    }
+
+    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
+            return nullptr;
+        }
+        if (model->get_split_state_ud.n_devices == 1) {
+            LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
         }
     }
 

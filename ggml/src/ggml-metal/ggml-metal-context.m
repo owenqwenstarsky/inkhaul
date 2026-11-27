@@ -75,6 +75,10 @@ struct ggml_metal {
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
 
+    // event waits not committed yet: the next graph (or event record) is encoded into this command buffer after
+    // the waits, because a GPU that wakes from a wait and then starts a new command buffer loses about 150 us
+    id<MTLCommandBuffer> cmd_buf_wait;
+
     // abort ggml_metal_graph_compute if callback returns true
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
@@ -185,6 +189,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->buf_refs     = [[NSMutableArray alloc] init];
 
         res->cmd_buf_last = nil;
+        res->cmd_buf_wait = nil;
 
         res->pipelines_ext = ggml_metal_pipelines_init();
 
@@ -192,8 +197,26 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 }
 
+// commit the pending event waits on their own, before any other work that goes to the queue
+static void ggml_metal_flush_wait(ggml_metal_t ctx) {
+    if (ctx->cmd_buf_wait == nil) {
+        return;
+    }
+
+    id<MTLCommandBuffer> cmd_buf = ctx->cmd_buf_wait;
+    ctx->cmd_buf_wait = nil;
+
+    [cmd_buf commit];
+
+    // already retained once, like the other extra command buffers
+    [ctx->cmd_bufs_ext addObject:cmd_buf];
+    ctx->cmd_buf_last = cmd_buf;
+}
+
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    ggml_metal_flush_wait(ctx);
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -252,6 +275,8 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 }
 
 void ggml_metal_synchronize(ggml_metal_t ctx) {
+    ggml_metal_flush_wait(ctx);
+
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
@@ -342,6 +367,8 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
+        ggml_metal_flush_wait(ctx);
+
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -388,6 +415,8 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
+        ggml_metal_flush_wait(ctx);
+
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -423,6 +452,9 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
         if (bid_src.metal == nil || bid_dst.metal == nil) {
             return false;
         }
+
+        ggml_metal_flush_wait(ctx_src);
+        ggml_metal_flush_wait(ctx_dst);
 
         id<MTLCommandQueue> dst_queue = ggml_metal_device_get_queue(ctx_dst->dev);
         id<MTLCommandBuffer> sync_cmd_buf = [dst_queue commandBuffer];
@@ -473,6 +505,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
+        ggml_metal_flush_wait(ctx);
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
     }
@@ -524,6 +557,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         const bool use_capture = ctx->capture_compute == 0;
         if (use_capture) {
+            ggml_metal_flush_wait(ctx);
+
             // make sure all previous computations have finished before starting the capture
             if (ctx->cmd_buf_last) {
                 [ctx->cmd_buf_last waitUntilCompleted];
@@ -566,8 +601,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
-            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
-            [cmd_buf retain];
+            // after the pending event waits, if any (that command buffer is already retained)
+            id<MTLCommandBuffer> cmd_buf = ctx->cmd_buf_wait;
+            ctx->cmd_buf_wait = nil;
+            if (cmd_buf == nil) {
+                cmd_buf = [queue commandBufferWithUnretainedReferences];
+                [cmd_buf retain];
+            }
 
             if (ctx->cmd_bufs[n_cb].obj) {
                 [ctx->cmd_bufs[n_cb].obj release];
@@ -582,9 +622,21 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // remember the command buffer for the next iteration
         ctx->cmd_buf_last = ctx->cmd_bufs[n_cb].obj;
 
+        // a small graph fits in the main command buffer: do not submit empty ones, each costs the GPU
+        // time between command buffers (the all-reduce of -sm tensor runs several tiny graphs per sync)
+        const bool use_extra = ctx->cb_start[0] < gf->n_nodes;
+        if (!use_extra) {
+            for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+                if (ctx->cmd_bufs[cb_idx].obj) {
+                    [ctx->cmd_bufs[cb_idx].obj release];
+                    ctx->cmd_bufs[cb_idx].obj = nil;
+                }
+            }
+        }
+
         // prepare the rest of the command buffers asynchronously (optional)
         // cmd_buf[0.. n_cb)
-        for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+        for (int cb_idx = 0; use_extra && cb_idx < n_cb; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
 
@@ -604,7 +656,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
         }
 
-        dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        if (use_extra) {
+            dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -633,6 +687,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
             for (int i = 0; i < n_cb && res == GGML_STATUS_SUCCESS; ++i) {
                 id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[i].obj;
+                if (!cmd_buf) {
+                    continue; // not used by this graph
+                }
                 [cmd_buf waitUntilCompleted];
 
                 MTLCommandBufferStatus status = [cmd_buf status];
@@ -693,6 +750,13 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
+        if (ctx->cmd_buf_wait != nil) {
+            // signal in the same command buffer as the pending waits
+            ggml_metal_event_encode_signal(ev, ctx->cmd_buf_wait);
+            ggml_metal_flush_wait(ctx);
+            return;
+        }
+
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 
@@ -709,17 +773,14 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        // not committed yet: the next graph goes into the same command buffer, see cmd_buf_wait
+        if (ctx->cmd_buf_wait == nil) {
+            id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+            ctx->cmd_buf_wait = [queue commandBufferWithUnretainedReferences];
+            [ctx->cmd_buf_wait retain];
+        }
 
-        ggml_metal_event_encode_wait(ev, cmd_buf);
-
-        [cmd_buf commit];
-
-        [ctx->cmd_bufs_ext addObject:cmd_buf];
-        ctx->cmd_buf_last = cmd_buf;
-
-        [cmd_buf retain];
+        ggml_metal_event_encode_wait(ev, ctx->cmd_buf_wait);
     }
 }
 

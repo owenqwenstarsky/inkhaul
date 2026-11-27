@@ -24,10 +24,10 @@ Set with `--split-mode` / `-sm`.
 | `none` | Use a single GPU only. Pick which one with `--main-gpu`. | You explicitly want to confine the model to one GPU even though more are visible. |
 | `layer` (**default**) | Pipeline parallelism. Each GPU holds a contiguous slice of layers. The KV cache for layer *l* lives on the GPU that owns layer *l*. | Default and most compatible multi-GPU choice. You want more memory than a single GPU provides and your priority is a fast prefill. Can tolerate slow interconnect speeds between GPUs. |
 | `row` | **Deprecated.** Older row-split tensor-parallel path with comparatively poor performance. Splits only dense weights across GPUs. | Avoid in new deployments. |
+| `expert` | LongHaul only. The layers and the KV cache are on `--main-gpu`, the experts of every MoE layer are split over the GPUs by `--tensor-split`, and all GPUs compute their experts at the same time. `--expert-share` sets this mode with percentages. | One LongHaul model over several Macs. See [longhaul.md](longhaul.md#expert-split). |
+| `tensor` | Tensor parallelism through a "meta device": every large matrix of every layer is split over the GPUs by `--tensor-split`, and the partial results are summed after each split part of a layer. Only `qwen35`, `qwen35moe`, `inkling2` and `inkling2_loop`. LongHaul is off, all experts are in memory. | One Qwen 3.5 or Inkling 2 model over two Macs, when the link is fast enough. See [tensor-parallel.md](tensor-parallel.md). |
 
-> The experimental `tensor` split mode (tensor parallelism through a "meta device") is removed from this fork. `LLAMA_SPLIT_MODE_TENSOR` stays in `llama.h`, but loading a model with it fails.
-
-> LongHaul (Inkling 2 models) supports one GPU only: it needs all layers on one Metal or CUDA GPU and turns pipeline parallelism off. On a machine with several GPUs, select one with `-dev CUDA0` or `-sm none -mg N` (see [longhaul.md](longhaul.md)). The rest of this guide applies to models without experts on disk.
+> LongHaul (models with experts on disk) uses the `layer` split: each GPU caches the experts of its own layers, and `-lhc` is split over the GPUs like the layers (by `-ts`, otherwise by free memory). Pipeline parallelism stays off. `-lhcd` gives a device its own cache size. To run one model over several Macs connected with Thunderbolt, see [longhaul.md](longhaul.md#several-laptops), and for the `expert` split, which runs the GPUs at the same time, see [longhaul.md](longhaul.md#expert-split).
 
 ---
 
@@ -35,9 +35,11 @@ Set with `--split-mode` / `-sm`.
 
 | Short | Long | Value | Default | Notes |
 |---|---|---|---|---|
-| `-sm` | `--split-mode` | `none` \| `layer` \| `row` | `layer` | See modes above. |
+| `-sm` | `--split-mode` | `none` \| `layer` \| `row` \| `expert` \| `tensor` | `layer` | See modes above. |
 | `-ts` | `--tensor-split` | comma-separated proportions, e.g. `3,1` | mode-dependent | How much of the model goes to each GPU. If omitted, `layer`/`row` use automatic splitting proportional to memory. With `3,1` on two GPUs, GPU 0 gets 75 %, GPU 1 gets 25 %. The values follow the order in `--device`. |
 | `-mg` | `--main-gpu` | integer device index | `0` | The single GPU used in `--split-mode none`. |
+| | `--tp-attn` | `split` \| `mirror` | `split` | `--split-mode tensor` only: split attention over the GPUs (two syncs per layer), or compute it on every GPU (one sync per layer). See [tensor-parallel.md](tensor-parallel.md). |
+| | `--tp-host` | `ADDR[:PORT]` | - | `--split-mode tensor` only: run the RPC server of the local GPU in this process as rank 0, in front of the `--rpc` servers. |
 | `-ngl` | `--n-gpu-layers` / `--gpu-layers` | integer \| `auto` \| `all` | `auto` | Maximum number of layers to keep in VRAM. Use `999` or `all` to push everything possible to the GPUs. |
 | `-dev` | `--device` | comma-separated device names, or `none` | auto | Restrict which devices llama.cpp may use. See `--list-devices` for names. |
 | | `--list-devices` | - | - | Print the available devices and their memory. Run this first to learn the names you'd pass to `--device`. |

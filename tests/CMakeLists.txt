@@ -165,6 +165,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-parser.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-grammar-integration.cpp  LABEL behavior)
     llama_build_and_test(test-llama-grammar.cpp  LABEL behavior  LINK llama)
+    llama_build_and_test(test-expert-share.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-batch-alloc.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-kv-cache.cpp LABEL behavior)
     target_include_directories(test-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -200,6 +201,16 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_test(test-fp8 NAME test-fp8-requantize LABEL "main behavior backend"
         ARGS --models "${FP8_MODEL_DIR}")
     set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
+endif()
+
+# LongHaul over an RPC server on a thread of the test (127.0.0.1 only)
+if (GGML_RPC)
+    llama_test(test-llama-archs NAME test-llama-archs-rpc LABEL rpc ARGS --rpc -s 1)
+    # the all-reduce between two RPC servers on threads of the test, and the host events
+    llama_build_and_test(test-tp-comm.cpp LABEL rpc LINK ggml)
+    # one Metal device per server: the async all-reduce needs a queue per rank
+    set_tests_properties(test-tp-comm PROPERTIES TIMEOUT 300 ENVIRONMENT "GGML_METAL_DEVICES=2")
+    set_tests_properties(test-llama-archs-rpc PROPERTIES ENVIRONMENT "GGML_METAL_DEVICES=2")
 endif()
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
@@ -298,6 +309,9 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED generate-models)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+llama_build_and_test(test-arg-expert-split.cpp  LABEL behavior)
+# two Metal devices on one Mac, so that the split checks run (other backends ignore it)
+set_tests_properties(test-arg-expert-split PROPERTIES ENVIRONMENT "GGML_METAL_DEVICES=2")
 llama_build_and_test(test-quantize-target.cpp  LABEL "main behavior backend"  LINK llama  ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-quantize-target PROPERTIES FIXTURES_REQUIRED generate-models)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)

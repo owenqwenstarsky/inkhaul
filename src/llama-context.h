@@ -410,6 +410,11 @@ private:
     int32_t n_reallocs_diff = 0;
 
     ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t backend_kv  = nullptr; // kv_gpu: the attention of the full-attention layers, owned by backends
+
+    // kv_gpu: keeps the GPUs awake during each graph and keep_awake_us after it (LLAMA_KV_REMOTE_KEEP_AWAKE_MS)
+    std::vector<std::pair<ggml_backend_dev_t, ggml_backend_dev_keep_awake_t>> keep_awake_fns;
+    int64_t keep_awake_us = 0;
     std::vector<ggml_backend_ptr> backends;
 
     // training

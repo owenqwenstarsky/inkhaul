@@ -97,17 +97,41 @@ ggml_backend_buffer_t llama_memory_bufs::emplace(ggml_context_ptr ctx, ggml_back
     return bufs.back().second.get();
 }
 
+static ggml_backend_dev_t llama_meta_dev_of(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META ? dev : nullptr;
+}
+
+void llama_memory_bufs::add_breakdown(std::map<ggml_backend_buffer_type_t, size_t> & mb, ggml_context * ctx, ggml_backend_buffer_t buf, bool no_alloc) {
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    if (no_alloc) {
+        GGML_ASSERT(ggml_backend_buffer_get_base(buf) == nullptr);
+    }
+    // a meta buffer type sizes every tensor whole, but each device holds only its slice
+    if (ggml_backend_dev_t meta_dev = llama_meta_dev_of(buft)) {
+        for (size_t j = 0; j < ggml_backend_meta_dev_n_simple(meta_dev); j++) {
+            ggml_backend_buffer_type_t simple_buft = ggml_backend_dev_buffer_type(ggml_backend_meta_dev_get_simple(meta_dev, j));
+            mb[simple_buft] += no_alloc ? ggml_backend_meta_buft_ctx_size(buft, ctx, j) : ggml_backend_meta_buffer_simple_size(buf, j);
+        }
+        return;
+    }
+    mb[buft] += no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft) : ggml_backend_buffer_get_size(buf);
+}
+
+void llama_memory_bufs::add_breakdown_size(std::map<ggml_backend_buffer_type_t, size_t> & mb, ggml_backend_buffer_type_t buft, size_t size) {
+    if (ggml_backend_dev_t meta_dev = llama_meta_dev_of(buft)) {
+        for (size_t j = 0; j < ggml_backend_meta_dev_n_simple(meta_dev); j++) {
+            mb[ggml_backend_dev_buffer_type(ggml_backend_meta_dev_get_simple(meta_dev, j))] += size;
+        }
+        return;
+    }
+    mb[buft] += size;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_bufs::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : bufs) {
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
-
-        if (no_alloc) {
-            GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
-        } else {
-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
-        }
+        add_breakdown(ret, ctx.get(), buf.get(), no_alloc);
     }
     return ret;
 }

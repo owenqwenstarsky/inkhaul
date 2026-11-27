@@ -43,6 +43,13 @@ struct llama_memory_bufs {
     // the memory used by the tensors: the buffer sizes, or the simulated sizes if no_alloc is set
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // add the memory of the tensors of ctx in buf to mb, the simulated size if no_alloc is set
+    // a meta buffer (-sm tensor) is counted per device, under the buffer type of each device
+    static void add_breakdown(std::map<ggml_backend_buffer_type_t, size_t> & mb, ggml_context * ctx, ggml_backend_buffer_t buf, bool no_alloc);
+
+    // add size bytes on buft to mb, on every device for a meta buffer type: a meta compute buffer has that size on each device
+    static void add_breakdown_size(std::map<ggml_backend_buffer_type_t, size_t> & mb, ggml_backend_buffer_type_t buft, size_t size);
+
     // allocate a single ctx buffer - for the memory instances that keep their own buffer layout
     static ggml_backend_buffer_ptr alloc_buf(ggml_context * ctx, ggml_backend_buffer_type_t buft, bool no_alloc, const char * name);
 

@@ -11,6 +11,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <climits>
 #include <set>
 #include <string>
 #include <vector>
@@ -55,6 +56,22 @@ private:
     ggml_log_level min_level;
 };
 
+// the devices that hold the model memory: with -sm tensor the devices behind the meta device, each holds its share
+static std::vector<ggml_backend_dev_t> common_model_memory_devices(const llama_model * model) {
+    std::vector<ggml_backend_dev_t> devs;
+    for (int i = 0; i < llama_model_n_devices(model); i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
+            for (size_t j = 0; j < ggml_backend_meta_dev_n_simple(dev); j++) {
+                devs.push_back(ggml_backend_meta_dev_get_simple(dev, j));
+            }
+        } else {
+            devs.push_back(dev);
+        }
+    }
+    return devs;
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const std::vector<std::string> & paths_model,
         const llama_model_params * mparams,
@@ -82,7 +99,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to create llama_context from model");
     }
 
-    const size_t nd = llama_model_n_devices(model);
+    const std::vector<ggml_backend_dev_t> model_devs = common_model_memory_devices(model);
+    const size_t nd = model_devs.size();
     std::vector<llama_device_memory_data> ret(nd + 1);
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
@@ -100,7 +118,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             continue;
         }
         for (size_t i = 0; i < nd; i++) {
-            if (dev == llama_model_get_device(model, i)) {
+            if (dev == model_devs[i]) {
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
@@ -121,7 +139,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret.back().total = total;
     }
     for (size_t i = 0; i < nd; i++) {
-        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        ggml_backend_dev_t dev = model_devs[i];
 
         size_t free;
         size_t total;
@@ -144,12 +162,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret[i].total = total;
     }
 
-    devs.clear();
-    for (int i = 0; i < llama_model_n_devices(model); i++) {
-        devs.push_back(llama_model_get_device(model, i));
-    }
+    devs = model_devs;
 
-    hp_ngl         = llama_model_n_layer(model);
+    hp_ngl         = llama_model_n_layer_offload(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
     if (hp_longhaul != nullptr) {
@@ -443,6 +458,61 @@ static void common_params_fit_impl(
                 return;
             }
         }
+    }
+
+    // -sm tensor: every device holds its share of every layer, so only the context size can change
+    // --kv-remote (kv_gpu): the layers stay on their devices and the KV device holds none, the same applies
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR || mparams->kv_gpu >= 0) {
+        const char * mode = mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR ? "-sm tensor" : "--kv-remote";
+        // the memory that the device with the largest deficit still misses at a measurement
+        auto worst_deficit = [&](const dmds_t & dmds, size_t & id_worst) {
+            int64_t worst = INT64_MIN;
+            for (size_t id = 0; id < nd; id++) {
+                const int64_t deficit = margins[id] - (int64_t(dmds[id].free) - int64_t(dmds[id].mb.total()));
+                if (deficit > worst) {
+                    worst    = deficit;
+                    id_worst = id;
+                }
+            }
+            return worst;
+        };
+        size_t id_worst = 0;
+        if (!n_ctx_auto || n_ctx_max <= n_ctx_min_total) {
+            const int64_t deficit = worst_deficit(dmds_full, id_worst);
+            throw common_params_fit_exception(string_format(
+                "with %s only the context size can change, %s needs %" PRId64 " MiB more at a context size of %" PRIu32
+                "; lower -c, change -ts or quantize the KV cache (-ctk, -ctv)",
+                mode, ggml_backend_dev_name(devs[id_worst]), deficit/MiB, cparams->n_ctx));
+        }
+
+        cparams->n_ctx = n_ctx_min_total;
+        dmds_t dmds_min_ctx = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmds_min_ctx);
+        const int64_t deficit_min = worst_deficit(dmds_min_ctx, id_worst);
+        if (deficit_min > 0) {
+            throw common_params_fit_exception(string_format(
+                "with %s the model does not fit even at a context size of %" PRIu32 ", %s needs %" PRId64 " MiB more"
+                "; change -ts or add a device",
+                mode, cparams->n_ctx, ggml_backend_dev_name(devs[id_worst]), deficit_min/MiB));
+        }
+
+        // the memory of each device grows linearly with the context, each device allows the context at which it reaches its target
+        double n_ctx = n_ctx_max;
+        for (size_t id = 0; id < nd; id++) {
+            const int64_t used_min = dmds_min_ctx[id].mb.total();
+            const int64_t used_max = dmds_full[id].mb.total();
+            const int64_t target   = int64_t(dmds_full[id].free) - margins[id];
+            if (used_max <= target || used_max <= used_min) {
+                continue;
+            }
+            n_ctx = std::min(n_ctx, n_ctx_min_total + double(n_ctx_max - n_ctx_min_total) * double(target - used_min) / double(used_max - used_min));
+        }
+        // keep it divisible by the number of streams, see step 2
+        const uint32_t align = 256 * n_streams;
+        cparams->n_ctx = std::max((uint32_t) n_ctx - (uint32_t) n_ctx % align, n_ctx_min_total);
+        LOG_INF("%s: %s: context size reduced from %" PRIu32 " to %" PRIu32 " to fit the free memory of every device\n",
+            __func__, mode, n_ctx_max, cparams->n_ctx);
+        return;
     }
 
     // step 2: try reducing memory use by reducing the context size
@@ -985,10 +1055,7 @@ enum common_params_fit_status common_fit_params(
 std::vector<common_memory_breakdown_row> common_memory_breakdown_rows(const struct llama_context * ctx) {
     const auto * model = llama_get_model(ctx);
 
-    std::vector<ggml_backend_dev_t> devices;
-    for (int i = 0; i < llama_model_n_devices(model); i++) {
-        devices.push_back(llama_model_get_device(model, i));
-    }
+    const std::vector<ggml_backend_dev_t> devices = common_model_memory_devices(model);
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
