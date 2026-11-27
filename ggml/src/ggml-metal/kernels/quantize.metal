@@ -19,12 +19,20 @@ kernel void kernel_cpy_t_t(
         return;
     }
 
-    const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+    int32_t i3 = i03;
+    int32_t i2 = i02;
+    int32_t i1 = i01;
+    int32_t i0 = 0;
 
-    const int32_t i3 = n/(args.ne2*args.ne1*args.ne0);
-    const int32_t i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
-    const int32_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
-    const int32_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+    // the 64-bit divisions are slow, a copy between tensors of the same shape does not need them
+    if (args.ne0 != args.ne00 || args.ne1 != args.ne01 || args.ne2 != args.ne02) {
+        const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
+
+        i3 = n/(args.ne2*args.ne1*args.ne0);
+        i2 = (n - i3*args.ne2*args.ne1*args.ne0)/(args.ne1*args.ne0);
+        i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
+        i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
+    }
 
     device char * dst_data = dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0;
 
@@ -364,12 +372,17 @@ kernel void kernel_get_rows_f(
         device const void * src1,
         device       void * dst,
         uint3               tgpig[[threadgroup_position_in_grid]],
-        ushort              tiitg[[thread_index_in_threadgroup]],
+        ushort3             tpitg[[thread_position_in_threadgroup]],
         ushort3             ntg [[threads_per_threadgroup]]) {
-    const int32_t iw0 = tgpig.x/args.ne10;
-    const int32_t i10 = tgpig.x%args.ne10;
+    // short rows: a threadgroup copies ntg.y rows
+    const int32_t iw0 = ntg.y == 1 ? tgpig.x/args.ne10 : 0;
+    const int32_t i10 = ntg.y == 1 ? tgpig.x%args.ne10 : tgpig.x*ntg.y + tpitg.y;
     const int32_t i11 = tgpig.y;
     const int32_t i12 = tgpig.z;
+
+    if (i10 >= args.ne10) {
+        return;
+    }
 
     const int32_t r = ((const device int32_t *) ((const device char *) src1 + i12*args.nb12 + i11*args.nb11 + i10*args.nb10))[0];
 
@@ -379,7 +392,7 @@ kernel void kernel_get_rows_f(
     auto psrc = (const device T0 *) ((const device char *) src0 + i03*args.nb03 + i02*args.nb02 +   r*args.nb01);
     auto pdst = (      device T  *) ((      device char *)  dst + i12*args.nb3  + i11*args.nb2  + i10*args.nb1);
 
-    for (int ind = iw0*ntg.x + tiitg; ind < args.ne00t;) {
+    for (int ind = iw0*ntg.x + tpitg.x; ind < args.ne00t;) {
         pdst[ind] = psrc[ind];
 
         break;
