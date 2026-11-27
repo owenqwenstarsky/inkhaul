@@ -1262,13 +1262,23 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
 
     const int nw0 = (args.ne00t + nth - 1)/nth;
 
+    // short rows of the non-quantized types: several rows per threadgroup
+    int nrptg = 1;
+    if (!ggml_is_quantized(op->src[0]->type) && nth < 32) {
+        nrptg = std::min(256/nth, ne10);
+    }
+
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, nw0*ne10, ne11, ne12, nth, 1, 1);
+    if (nrptg > 1) {
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne10 + nrptg - 1)/nrptg, ne11, ne12, nth, nrptg, 1);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, nw0*ne10, ne11, ne12, nth, 1, 1);
+    }
 
     return 1;
 }

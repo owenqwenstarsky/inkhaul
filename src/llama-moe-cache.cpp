@@ -894,9 +894,10 @@ struct llama_moe_cache::impl {
         const int32_t n_used = (int32_t) sel->src[0]->ne[0];
 
         // this also waits for the earlier splits, so the slots they read can be refilled
-        ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+        // the backend is idle after this, so the plain get and set below need no extra command (a memcpy for unified memory)
         ggml_backend_synchronize(backend);
+        ids.resize(ggml_nelements(sel));
+        ggml_backend_tensor_get(sel, ids.data(), 0, ggml_nbytes(sel));
 
         if (trace != nullptr) {
             write_trace(il, n_used);
@@ -940,8 +941,7 @@ struct llama_moe_cache::impl {
         st.bytes   += bytes;
         st.read_us += ggml_time_us() - t_start_us;
 
-        // the next copy synchronizes the backend before it changes the slot map again
-        ggml_backend_tensor_set_async(backend, dst, g.lru.slot_map[l.owner], 0, ggml_nbytes(l.slot_map));
+        ggml_backend_tensor_set(dst, g.lru.slot_map[l.owner], 0, ggml_nbytes(l.slot_map));
 
         return true;
     }

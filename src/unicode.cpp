@@ -1221,6 +1221,160 @@ static std::vector<size_t> unicode_regex_split_custom_newlines(const std::string
     return bpe_offsets;
 }
 
+// GPT4O regex as matched by the std::regex fallback on collapsed text (marks and non-ASCII letters count as both upper and lower case):
+// [^\r\n\p{L}\p{N}]?[U]*[W]+C?|[^\r\n\p{L}\p{N}]?[U]+[W]*C?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+static std::vector<size_t> unicode_regex_split_custom_gpt4o(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    // same classes as the collapsed text of the std::regex fallback
+    enum : uint8_t { C_SPACE = 1, C_LETTER = 2, C_NUMBER = 4, C_UPPER = 8, C_LOWER = 16, C_CRLF = 32 };
+    std::vector<uint8_t> cls(cpts.size());
+    for (size_t i = 0; i < cpts.size(); ++i) {
+        const uint32_t cpt = cpts[i];
+        uint8_t c = 0;
+        if (cpt < 128) {
+            if (cpt == ' ' || (cpt >= '\t' && cpt <= '\r')) c |= C_SPACE;
+            if (cpt == '\r' || cpt == '\n')                 c |= C_CRLF;
+            if (cpt >= '0' && cpt <= '9')                   c |= C_NUMBER;
+            if (cpt >= 'A' && cpt <= 'Z')                   c |= C_LETTER | C_UPPER;
+            if (cpt >= 'a' && cpt <= 'z')                   c |= C_LETTER | C_LOWER;
+        } else {
+            const auto flags = unicode_cpt_flags_from_cpt(cpt);
+            if (flags.is_whitespace) {
+                c = C_SPACE;
+            } else if (flags.category_flag() == unicode_cpt_flags::LETTER) {
+                c = C_LETTER | C_UPPER | C_LOWER;
+            } else if (flags.category_flag() == unicode_cpt_flags::ACCENT_MARK) {
+                c = C_UPPER | C_LOWER;
+            } else if (flags.category_flag() == unicode_cpt_flags::NUMBER) {
+                c = C_NUMBER;
+            }
+        }
+        cls[i] = c;
+    }
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t offset_ini = start;
+        const size_t offset_end = start + offset;
+        assert(offset_end <= cpts.size());
+        start = offset_end;
+
+        auto _has = [&] (const size_t pos, const uint8_t mask) -> bool {
+            return pos < offset_end && (cls[pos] & mask);
+        };
+
+        auto _run = [&] (size_t pos, const uint8_t mask) -> size_t {
+            while (_has(pos, mask)) {
+                pos++;
+            }
+            return pos;
+        };
+
+        auto _is_prefix = [&] (const size_t pos) -> bool {
+            return pos < offset_end && !(cls[pos] & (C_CRLF | C_LETTER | C_NUMBER));
+        };
+
+        // (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?
+        auto _contraction = [&] (const size_t pos) -> size_t {
+            if (pos + 1 >= offset_end || cpts[pos] != '\'') {
+                return pos;
+            }
+            const uint32_t c1 = cpts[pos + 1] | 0x20;
+            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+                return pos + 2;
+            }
+            if (pos + 2 < offset_end) {
+                const uint32_t c2 = cpts[pos + 2] | 0x20;
+                if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
+                    return pos + 3;
+                }
+            }
+            return pos;
+        };
+
+        // U*W+C? with backtracking of the greedy U*, 0 on failure
+        auto _word_lower = [&] (const size_t pos) -> size_t {
+            const size_t end_u = _run(pos, C_UPPER);
+            for (size_t p = end_u + 1; p-- > pos; ) {
+                if (_has(p, C_LOWER)) {
+                    return _contraction(_run(p, C_LOWER));
+                }
+            }
+            return 0;
+        };
+
+        // U+W*C?, 0 on failure
+        auto _word_upper = [&] (const size_t pos) -> size_t {
+            const size_t end_u = _run(pos, C_UPPER);
+            return end_u > pos ? _contraction(_run(end_u, C_LOWER)) : 0;
+        };
+
+        auto _match = [&] (const size_t pos) -> size_t {
+            const bool prefix = _is_prefix(pos);
+            size_t end;
+            if ((prefix && (end = _word_lower(pos + 1))) || (end = _word_lower(pos))) {
+                return end;
+            }
+            if ((prefix && (end = _word_upper(pos + 1))) || (end = _word_upper(pos))) {
+                return end;
+            }
+            if (_has(pos, C_NUMBER)) {
+                end = pos + 1;
+                while (end < pos + 3 && _has(end, C_NUMBER)) {
+                    end++;
+                }
+                return end;
+            }
+            {
+                const size_t p = pos + (cpts[pos] == ' ');
+                if (p < offset_end && !(cls[p] & (C_SPACE | C_LETTER | C_NUMBER))) {
+                    end = p;
+                    while (end < offset_end && !(cls[end] & (C_SPACE | C_LETTER | C_NUMBER))) {
+                        end++;
+                    }
+                    while (end < offset_end && (cls[end] & C_CRLF || cpts[end] == '/')) {
+                        end++;
+                    }
+                    return end;
+                }
+            }
+            const size_t end_s = _run(pos, C_SPACE);
+            for (size_t p = end_s; p > pos; p--) {
+                if (cls[p - 1] & C_CRLF) {
+                    return p;
+                }
+            }
+            if (end_s == offset_end || end_s > pos + 1) {
+                return end_s == offset_end ? end_s : end_s - 1;
+            }
+            return end_s;
+        };
+
+        size_t gap = offset_ini;
+        for (size_t pos = offset_ini; pos < offset_end; ) {
+            const size_t end = _match(pos);
+            if (end <= pos) {
+                pos++;
+                continue;
+            }
+            if (pos > gap) {
+                bpe_offsets.push_back(pos - gap);
+            }
+            bpe_offsets.push_back(end - pos);
+            pos = gap = end;
+        }
+        if (offset_end > gap) {
+            bpe_offsets.push_back(offset_end - gap);
+        }
+    }
+
+    return bpe_offsets;
+}
+
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
@@ -1241,6 +1395,9 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
         // K2-Horizon: llama3 splitter with marks + ZWNJ/ZWJ inside letter runs
         // (the generic std::regex fallback cannot parse \p{..} on MSVC)
         bpe_offsets = unicode_regex_split_custom_k2_horizon(text, offsets);
+    } else if (
+            regex_expr == "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))*((?=[\\p{L}\\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))+((?=[\\p{L}\\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_gpt4o(text, offsets);
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
         bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);

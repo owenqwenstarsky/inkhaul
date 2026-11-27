@@ -128,7 +128,7 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl, ggml_tensor * normed = nullptr);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -137,7 +137,7 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [LOOP_CTRL_COUNT, n_embd, n_tokens] are mixed into its inputs
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
@@ -148,6 +148,28 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // the normed blocks, newest first: s [n_embd, n_blocks, n_tokens] and its transpose t [n_blocks, n_embd, n_tokens]
+        struct block_stack {
+            ggml_tensor * s;
+            ggml_tensor * t;
+        };
+        std::map<std::vector<ggml_tensor *>, block_stack> stacks;
+
+        // built once per list of blocks, from the stack of the list without its last block
+        const block_stack & stack(const std::vector<ggml_tensor *> & blocks);
+
+        // query j of a mix output, as a [n_embd, n_tokens] view with contiguous rows
+        ggml_tensor * mix_query(ggml_tensor * mixed, int64_t j);
+
+        // the conv weights with the residual and the scale folded in, built once per weight and scale
+        std::map<std::pair<const ggml_tensor *, float>, ggml_tensor *> conv_weights;
+        ggml_tensor * conv_last = nullptr; // [n_conv] 1 at the last tap, 0 elsewhere
+        ggml_tensor * conv_weight(ggml_tensor * weight, float scale);
+
+        // per graph: the bias tables padded with the zero row of the far distance, and the zero sinks per head count
+        std::map<const ggml_tensor *, ggml_tensor *> rel_biases;
+        std::map<int64_t, ggml_tensor *> zero_sinks_of;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

@@ -11335,6 +11335,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    // short rows, several per threadgroup on Metal, with partial groups
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I32}) {
+        for (int n : {1, 8, 31}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 17, 1537, 3, 2, false));
+            test_cases.emplace_back(new test_get_rows(type, n, 17, 301, 3, 1, true, true, 2));
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
