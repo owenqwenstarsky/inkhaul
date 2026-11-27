@@ -2458,6 +2458,7 @@ static void test_role_markers_all_templates(testing & t) {
         { "GLM-4.6.jinja",                                   "<|user|>",               "<|assistant|>"              },
         { "unsloth-Apriel-1.5.jinja",                        "<|user|>",               "<|assistant|>"              },
         { "GLM-4.7-Flash.jinja",                             "<|user|>",                 "<|assistant|>"                },
+        { "GLM-5.3-Flash.jinja",                             "<|user|>",               "<|assistant|>"              },
 
         // Gemma 2: <start_of_turn>{user|model}
         { "google-gemma-2-2b-it.jinja",                      "<start_of_turn>user",    "<start_of_turn>model"       },

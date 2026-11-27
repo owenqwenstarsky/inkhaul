@@ -42,6 +42,10 @@ enum llm_graph_type {
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
+    LLM_FUSED_OP_DSV4_HC_PRE,
+    LLM_FUSED_OP_DSV4_HC_COMB,
+    LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_TOP_K_MASK,
 };
 
 enum llm_ffn_op_type : int {
@@ -65,6 +69,7 @@ enum llm_ffn_gate_type {
 };
 
 enum llm_norm_type {
+    LLM_NORM,     // LayerNorm (glm5-next indexer keys)
     LLM_NORM_RMS,
 };
 

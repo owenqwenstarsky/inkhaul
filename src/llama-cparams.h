@@ -38,6 +38,12 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool fused_dsv4_hc_pre;  // mHC residual streams (glm5-next): fused collapse of the streams
+    bool fused_dsv4_hc_comb; // fused Sinkhorn of the stream mix
+    bool fused_dsv4_hc_post; // fused expansion back to the streams
+    bool auto_fhc;
+    bool fused_top_k_mask;   // k-pool indexer (glm5-next): fused top-k sparse attention mask
+    bool auto_ftkm;
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
     bool no_perf;

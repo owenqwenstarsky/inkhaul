@@ -770,18 +770,21 @@ class TensorNameMap:
             "model.layers.{bid}.linear_attn.dt_proj",  # qwen3next
             "layers.{bid}.linear_attn.dt_proj",        # qwen3.5 text
             "model.layers.{bid}.attention.dt_proj",    # bailingmoe3
+            "model.layers.{bid}.self_attn.dt_proj",    # glm5-next
         ),
 
         MODEL_TENSOR.SSM_A: (
             "model.layers.{bid}.linear_attn.A_log",  # qwen3next
             "layers.{bid}.linear_attn.A_log",        # qwen3.5 text
             "model.layers.{bid}.attention.A_log",    # bailingmoe3
+            "model.layers.{bid}.self_attn.A_log",    # glm5-next
         ),
 
         MODEL_TENSOR.SSM_NORM: (
             "model.layers.{bid}.linear_attn.norm",  # qwen3next
             "layers.{bid}.linear_attn.norm",        # qwen3.5 text
             "model.layers.{bid}.attention.o_norm",  # bailingmoe3
+            "model.layers.{bid}.self_attn.o_norm",  # glm5-next
         ),
 
         MODEL_TENSOR.SSM_OUT: (
@@ -798,32 +801,89 @@ class TensorNameMap:
             "model.layers.{bid}.linear_attn.in_proj_b",  # qwen3.5
             "layers.{bid}.linear_attn.in_proj_b",        # qwen3.5 text
             "model.layers.{bid}.attention.b_proj",       # bailingmoe3
+            "model.layers.{bid}.self_attn.b_proj",       # glm5-next
         ),
 
         # Kimi Linear KDA (using SSM_ prefix for consistency)
         MODEL_TENSOR.SSM_CONV1D_Q: (
             "model.layers.{bid}.attention.q_conv1d",
+            "model.layers.{bid}.self_attn.q_conv1d",  # glm5-next
         ),
         MODEL_TENSOR.SSM_CONV1D_K: (
             "model.layers.{bid}.attention.k_conv1d",
+            "model.layers.{bid}.self_attn.k_conv1d",  # glm5-next
         ),
         MODEL_TENSOR.SSM_CONV1D_V: (
             "model.layers.{bid}.attention.v_conv1d",
+            "model.layers.{bid}.self_attn.v_conv1d",  # glm5-next
         ),
         # bailingmoe3 f_proj and g_proj are renamed in the converter
-        MODEL_TENSOR.SSM_F_A: (),
-        MODEL_TENSOR.SSM_G_A: (),
+        MODEL_TENSOR.SSM_F_A: (
+            "model.layers.{bid}.self_attn.f_a_proj",  # glm5-next
+        ),
+        MODEL_TENSOR.SSM_F_B: (
+            "model.layers.{bid}.self_attn.f_b_proj",  # glm5-next
+        ),
+        MODEL_TENSOR.SSM_G_A: (
+            "model.layers.{bid}.self_attn.g_a_proj",  # glm5-next
+        ),
+        MODEL_TENSOR.SSM_G_B: (
+            "model.layers.{bid}.self_attn.g_b_proj",  # glm5-next
+        ),
+
+        # glm5-next mHC, the checkpoint names carry no .weight suffix
+        MODEL_TENSOR.HC_ATTN_FN: (
+            "model.layers.{bid}.hc_attn_fn",
+        ),
+        MODEL_TENSOR.HC_ATTN_BASE: (
+            "model.layers.{bid}.hc_attn_base",
+        ),
+        MODEL_TENSOR.HC_ATTN_SCALE: (
+            "model.layers.{bid}.hc_attn_scale",
+        ),
+        MODEL_TENSOR.HC_FFN_FN: (
+            "model.layers.{bid}.hc_ffn_fn",
+        ),
+        MODEL_TENSOR.HC_FFN_BASE: (
+            "model.layers.{bid}.hc_ffn_base",
+        ),
+        MODEL_TENSOR.HC_FFN_SCALE: (
+            "model.layers.{bid}.hc_ffn_scale",
+        ),
+
+        # glm5-next k-pool indexer
+        MODEL_TENSOR.INDEXER_K_NORM: (
+            "model.layers.{bid}.self_attn.indexer.k_norm",
+        ),
+        MODEL_TENSOR.INDEXER_PROJ: (
+            "model.layers.{bid}.self_attn.indexer.weights_proj",
+        ),
+        MODEL_TENSOR.INDEXER_ATTN_K: (
+            "model.layers.{bid}.self_attn.indexer.wk",
+        ),
+        MODEL_TENSOR.INDEXER_ATTN_Q_B: (
+            "model.layers.{bid}.self_attn.indexer.wq_b",
+        ),
+        MODEL_TENSOR.INDEXER_KPOOL_GATE: (
+            "model.layers.{bid}.self_attn.indexer.index_kpool_compress_gate",
+        ),
+        MODEL_TENSOR.INDEXER_KPOOL_APE: (
+            "model.layers.{bid}.self_attn.indexer.index_kpool_compress_ape",
+        ),
 
         MODEL_TENSOR.ATTN_Q_A: (
             "model.layers.{bid}.attention.q_a_proj",  # bailingmoe3 (Ling-3.0-tiny)
+            "model.layers.{bid}.self_attn.q_a_proj",  # glm5-next
         ),
 
         MODEL_TENSOR.ATTN_Q_B: (
             "model.layers.{bid}.attention.q_b_proj",  # bailingmoe3 (Ling-3.0-tiny)
+            "model.layers.{bid}.self_attn.q_b_proj",  # glm5-next
         ),
 
         MODEL_TENSOR.ATTN_KV_A_MQA: (
             "model.layers.{bid}.attention.kv_a_proj_with_mqa", # bailingmoe3
+            "model.layers.{bid}.self_attn.kv_a_proj_with_mqa", # glm5-next
         ),
 
         MODEL_TENSOR.ATTN_K_B: (
@@ -836,10 +896,12 @@ class TensorNameMap:
 
         MODEL_TENSOR.ATTN_Q_A_NORM: (
             "model.layers.{bid}.attention.q_a_layernorm", # bailingmoe3 (Ling-3.0-tiny)
+            "model.layers.{bid}.self_attn.q_a_layernorm", # glm5-next
         ),
 
         MODEL_TENSOR.ATTN_KV_A_NORM: (
             "model.layers.{bid}.attention.kv_a_layernorm", # bailingmoe3
+            "model.layers.{bid}.self_attn.kv_a_layernorm", # glm5-next
         ),
 
         # NextN/MTP tensors
@@ -853,6 +915,18 @@ class TensorNameMap:
 
         MODEL_TENSOR.NEXTN_HNORM: (
             "model.layers.{bid}.hnorm",
+        ),
+
+        MODEL_TENSOR.NEXTN_EMBED_TOKENS: (
+            "model.layers.{bid}.embed_tokens",
+        ),
+
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD: (
+            "model.layers.{bid}.shared_head.head",
+        ),
+
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
+            "model.layers.{bid}.shared_head.norm",
         ),
         ############################################################################
         # TODO: these do not belong to block_mappings_cfg - move them to mappings_cfg

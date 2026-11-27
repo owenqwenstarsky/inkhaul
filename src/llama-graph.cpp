@@ -1292,6 +1292,7 @@ ggml_tensor * llm_graph_context::build_norm(
        llm_norm_type   type,
                  int   il) const {
     switch (type) {
+        case LLM_NORM:       cur = ggml_norm    (ctx0, cur, hparams.f_norm_eps);     break;
         case LLM_NORM_RMS:   cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps); break;
     }
 
@@ -1475,7 +1476,12 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     switch (type_op) {
         case LLM_FFN_SILU:
-            if (gate && type_gate == LLM_FFN_PAR && il >= 0 && hparams.swiglu_clamp_shexp[il] > 1e-6f) {
+            if (gate && type_gate == LLM_FFN_PAR && il >= 0 && hparams.swiglu_clamp_shexp[il] > 1e-6f && model.arch == LLM_ARCH_GLM5_NEXT) {
+                // clamped swiglu (glm5-next): the gate is clamped from above before silu, up on both sides
+                cur = ggml_swiglu_clamp(ctx0, cur, tmp, hparams.swiglu_clamp_shexp[il]);
+                cb(cur, "ffn_swiglu_limited", il);
+                type_gate = LLM_FFN_SEQ;
+            } else if (gate && type_gate == LLM_FFN_PAR && il >= 0 && hparams.swiglu_clamp_shexp[il] > 1e-6f) {
                 // clamped swiglu (bailingmoe3): silu(gate) is clamped from above, up on both sides
                 const float limit = hparams.swiglu_clamp_shexp[il];
                 tmp = ggml_clamp(ctx0, tmp, -limit, limit);
@@ -1851,7 +1857,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         switch (type_op) {
             case LLM_FFN_SILU:
-                if (has_gate && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
+                if (has_gate && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f && model.arch == LLM_ARCH_GLM5_NEXT) {
+                    // clamped swiglu (glm5-next), see build_ffn
+                    cur = ggml_swiglu_clamp(ctx0, cur, up, hparams.swiglu_clamp_exp[il]);
+                    cb(cur, "ffn_moe_swiglu_limited", il);
+                } else if (has_gate && il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
                     // clamped swiglu (bailingmoe3), see build_ffn
                     const float limit = hparams.swiglu_clamp_exp[il];
                     up = ggml_clamp(ctx0, up, -limit, limit);

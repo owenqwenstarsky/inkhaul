@@ -19,6 +19,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "BailingMoeV3VLForConditionalGeneration": "bailingmoe3",
     "DSparkDraftModel": "dspark",
     "DSparkSpeculator": "dspark",
+    "Glm5NextForConditionalGeneration": "glm",
     "Inkling2ForCausalLM": "inkling2",
     "Inkling2ForConditionalGeneration": "inkling2",
     "Inkling2LoopForCausalLM": "inkling2",

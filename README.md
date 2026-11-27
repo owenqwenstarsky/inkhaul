@@ -1,7 +1,7 @@
-# llama.cpp (Inkling 2 Mini, Qwen 3.5 / 3.6, Ling-3.2-air and Kolibri 1.1 + LongHaul fork)
+# llama.cpp (Inkling 2 Mini, Qwen 3.5 / 3.6, Ling-3.2-air, Kolibri 1.1 and GLM-5.3-Flash + LongHaul fork)
 
 > [!NOTE]
-> This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) trimmed to run [Inkling 2 Mini](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF) (arch `inkling2_loop`), Qwen 3.5 / 3.6 (archs `qwen35` and `qwen35moe`, text and images), [Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air) (arch `bailingmoe3`, text only) and [Kolibri 1.1](https://huggingface.co/Aleph-Alpha/Kolibri-1.1) (arch `kolibri1`, also Kolibri 1, text only) with LongHaul on Apple Silicon Macs (Metal) and on NVIDIA GPUs (CUDA, Linux and Windows on x86_64).
+> This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) trimmed to run [Inkling 2 Mini](https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF) (arch `inkling2_loop`), Qwen 3.5 / 3.6 (archs `qwen35` and `qwen35moe`, text and images), [Ling-3.2-air](https://huggingface.co/inclusionAI/Ling-3.2-air) (arch `bailingmoe3`, text only), [Kolibri 1.1](https://huggingface.co/Aleph-Alpha/Kolibri-1.1) (arch `kolibri1`, also Kolibri 1, text only) and [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (arch `glm5-next`, text only) with LongHaul on Apple Silicon Macs (Metal) and on NVIDIA GPUs (CUDA, Linux and Windows on x86_64).
 > LongHaul keeps the MoE experts on disk and holds the recently used ones in a fixed-size GPU memory cache, so the model runs with less memory than the model file needs.
 > Set the cache size with `-lhc, --longhaul-cache` (default: `512M`). See [docs/longhaul.md](docs/longhaul.md) for how it works and how to size the cache.
 >
@@ -42,6 +42,9 @@ The binaries are in `build/bin`. Then:
 
 # Kolibri 1.1 (78B, 384 experts per layer, sparse attention) with a 2 GiB expert cache
 ./build/bin/llama-cli -hf Aleph-Alpha/Kolibri-1.1-GGUF:Q4_K_M -lhc 2G
+
+# GLM-5.3-Flash (320B, 288 experts per layer) with an 8 GiB expert cache and a 128K context
+./build/bin/llama-cli -hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL -lhc 8G -c 131072
 ```
 
 The Qwen MTP (multi-token prediction) block is not run, and `mtp-*.gguf` files are not downloaded. Files with the block in the main GGUF load and skip it.
@@ -49,6 +52,8 @@ The Qwen MTP (multi-token prediction) block is not run, and `mtp-*.gguf` files a
 Ling-3.2-air reads about 1 GB from disk per generated token when no expert is cached, so a fast SSD and a larger cache help more than for Inkling. See [docs/longhaul.md](docs/longhaul.md#sizing-for-ling-32-air) for the cache sizes.
 
 Kolibri 1.1 reads about 650 MiB per generated token when no expert is cached. Its IQ1 / IQ2 files have many expert layouts, which makes prompt processing slow with LongHaul, so prefer the Q4_K_M file. With several parallel sequences, pass `--kv-unified`. See [docs/longhaul.md](docs/longhaul.md#sizing-for-kolibri-11) for the cache sizes.
+
+GLM-5.3-Flash reads about 4.8 GiB per generated token at UD-Q4_K_XL (2.4 GiB at UD-IQ2_XXS) when no expert is cached, the most of the models here. Use at least `-lhc 8G` (`-lhc 4G` for UD-IQ2_XXS), and set `-c`: the default 1M context needs about 19 GiB for the cache. See [docs/longhaul.md](docs/longhaul.md#sizing-for-glm-53-flash) for the cache sizes and limits.
 
 On Linux or Windows with an NVIDIA GPU, build with CUDA (needs the [CUDA toolkit](https://developer.nvidia.com/cuda-toolkit)) and run the same commands:
 

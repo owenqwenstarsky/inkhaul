@@ -118,6 +118,40 @@ int main() {
         }
     }
 
+    // LLAMA_VOCAB_PRE_TYPE_CHATGLM4 (GLM-4.7-Flash, GLM-5.3-Flash), the expected splits come from the Split step of the GLM-5.3-Flash HF tokenizer
+    // only the 3-digit number groups differ from the Ling regex above
+    const std::vector<std::string> regex_chatglm4 = {
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    };
+    const struct {
+        std::string text;
+        std::vector<std::string> expected;
+    } chatglm4_tests[] = {
+        { "Hello world", { "Hello", " world" } },
+        { " Hello  world ", { " Hello", " ", " world", " " } },
+        { "I've been 'told he's there, 'RE you sure? 'M not sure I'll make it, 'D you like some tea? We'Ve a'lL", { "I", "'ve", " been", " '", "told", " he", "'s", " there", ",", " '", "RE", " you", " sure", "?", " '", "M", " not", " sure", " I", "'ll", " make", " it", ",", " '", "D", " you", " like", " some", " tea", "?", " We", "'Ve", " a", "'lL" } },
+        { "3 33 333 3333 33333 3.14 1,000,000", { "3", " ", "33", " ", "333", " ", "333", "3", " ", "333", "33", " ", "3", ".", "14", " ", "1", ",", "000", ",", "000" } },
+        { "line one\nline two\r\n\n  indented\ttab", { "line", " one", "\n", "line", " two", "\r\n\n", " ", " indented", "\ttab" } },
+        { "foo!!! bar??? (baz) [qux] {x}", { "foo", "!!!", " bar", "???", " (", "baz", ")", " [", "qux", "]", " {", "x", "}" } },
+        { "\346\210\221\346\203\263\345\234\250apple\345\267\245\344\275\2341314151\345\244\251\357\275\236", { "\346\210\221\346\203\263\345\234\250apple\345\267\245\344\275\234", "131", "415", "1", "\345\244\251", "\357\275\236" } },
+        { "\360\237\232\200 (normal) \360\237\230\266\342\200\215\360\237\214\253\357\270\217 \342\234\205 \360\237\246\231\360\237\246\231", { "\360\237\232\200", " (", "normal", ")", " \360\237\230\266\342\200\215\360\237\214\253\357\270\217", " \342\234\205", " \360\237\246\231\360\237\246\231" } },
+        { "   \n\n   x", { "   \n\n", "  ", " x" } },
+        { "def f(x):\n    return x**2  # comment\n", { "def", " f", "(x", "):\n", "   ", " return", " x", "**", "2", " ", " #", " comment", "\n" } },
+        { "<think>ok</think><tool_call>", { "<think", ">ok", "</", "think", "><", "tool", "_call", ">" } },
+        { "\303\204\303\226\303\234 \303\244\303\266\303\274 \303\237 caf\303\251", { "\303\204\303\226\303\234", " \303\244\303\266\303\274", " \303\237", " caf\303\251" } },
+    };
+    for (const auto & test : chatglm4_tests) {
+        const auto pieces = unicode_regex_split(test.text, regex_chatglm4, false);
+        if (pieces != test.expected) {
+            fprintf(stderr, "unexpected chatglm4 split of \"%s\":", test.text.c_str());
+            for (const auto & piece : pieces) {
+                fprintf(stderr, " [%s]", piece.c_str());
+            }
+            fprintf(stderr, "\n");
+            success = false;
+        }
+    }
+
     // LLAMA_VOCAB_PRE_TYPE_GPT4O has a custom splitter, wrapping the regex in a group makes it use the std::regex fallback instead
     const std::string regex_gpt4o = "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))*((?=[\\p{L}\\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))+((?=[\\p{L}\\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     const std::string gpt4o_tests[] = {

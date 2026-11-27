@@ -320,6 +320,24 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find(".position_embd") == std::string::npos;
     quantize &= name.find(".patch_embd")    == std::string::npos;
 
+    // glm5-next: the mHC mix, the indexer (it picks the attended cells), the KDA gates and the MLA latent projections stay exact
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        quantize &= name.find("hc_")                     == std::string::npos;
+        quantize &= name.find("indexer.attn_q_b")        == std::string::npos;
+        quantize &= name.find("indexer.attn_k")          == std::string::npos;
+        quantize &= name.find("indexer.proj")            == std::string::npos;
+        quantize &= name.find("indexer_compressor_gate") == std::string::npos;
+        quantize &= name.find("indexer_compressor_ape")  == std::string::npos;
+        quantize &= name.find("ssm_f_a.weight")          == std::string::npos;
+        quantize &= name.find("ssm_f_b.weight")          == std::string::npos;
+        quantize &= name.find("ssm_g_a.weight")          == std::string::npos;
+        quantize &= name.find("ssm_g_b.weight")          == std::string::npos;
+        quantize &= name.find("ssm_beta.weight")         == std::string::npos;
+        quantize &= name.find("attn_kv_a_mqa.weight")    == std::string::npos;
+        quantize &= name.find("attn_k_b.weight")         == std::string::npos;
+        quantize &= name.find("attn_v_b.weight")         == std::string::npos;
+    }
+
     return quantize;
 }
 
@@ -395,6 +413,21 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
         return std::make_pair(i_layer, n_layer);
     };
+
+    // glm5-next: the query projections and the MTP input projection stay at Q8_0 or above
+    if (qs.model.arch == LLM_ARCH_GLM5_NEXT && (
+        name.find("attn_q_a")      != std::string::npos ||
+        name.find("attn_q_b")      != std::string::npos ||
+        name.find("nextn.eh_proj") != std::string::npos)) {
+        switch (new_type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_BF16:
+            case GGML_TYPE_F16:
+                break;
+            default:
+                return GGML_TYPE_Q8_0;
+        }
+    }
 
     // for arches that share the same tensor between the token embeddings and the output,
     // we quantize the token embeddings with the quantization of the output tensor

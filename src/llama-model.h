@@ -25,6 +25,7 @@ enum llm_type {
     LLM_TYPE_7_9B_A1_3B,
     LLM_TYPE_124B_A5_1B,
     LLM_TYPE_78B_A3_5B,  // Kolibri1
+    LLM_TYPE_320B_A18B,  // GLM-5.3-Flash
 };
 
 std::string llama_rope_scaling_type_name(llama_rope_scaling_type rope_scaling_type);
@@ -94,6 +95,26 @@ struct llama_layer {
     struct ggml_tensor * ssm_dt_b   = nullptr;
     struct ggml_tensor * ssm_g_a    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
+    // glm5-next: low rank decay and output gates
+    struct ggml_tensor * ssm_f_b    = nullptr;
+    struct ggml_tensor * ssm_g_b    = nullptr;
+
+    // mHC (glm5-next)
+    struct ggml_tensor * hc_attn_fn    = nullptr;
+    struct ggml_tensor * hc_attn_base  = nullptr;
+    struct ggml_tensor * hc_attn_scale = nullptr;
+    struct ggml_tensor * hc_ffn_fn     = nullptr;
+    struct ggml_tensor * hc_ffn_base   = nullptr;
+    struct ggml_tensor * hc_ffn_scale  = nullptr;
+
+    // k-pool DSA indexer (glm5-next)
+    struct ggml_tensor * indexer_k_norm     = nullptr;
+    struct ggml_tensor * indexer_k_norm_b   = nullptr;
+    struct ggml_tensor * indexer_proj       = nullptr;
+    struct ggml_tensor * indexer_attn_k     = nullptr;
+    struct ggml_tensor * indexer_attn_q_b   = nullptr;
+    struct ggml_tensor * indexer_kpool_gate = nullptr;
+    struct ggml_tensor * indexer_kpool_ape  = nullptr;
 
     // rope frequency factors
     struct ggml_tensor * rope_freqs = nullptr;

@@ -11,6 +11,7 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -42,6 +43,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_bailingmoe3(params);
         case LLM_ARCH_CLIP:
             return new llama_model_clip(params);
+        case LLM_ARCH_GLM5_NEXT:
+            return new llama_model_glm5_next(params);
         case LLM_ARCH_INKLING2:
             return new llama_model_inkling2(params);
         case LLM_ARCH_INKLING2_LOOP:
@@ -496,6 +499,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_7_9B_A1_3B: return "7.9B.A1.3B";
         case LLM_TYPE_124B_A5_1B: return "124B.A5.1B";
         case LLM_TYPE_78B_A3_5B:  return "78B.A3.5B";
+        case LLM_TYPE_320B_A18B:  return "320B.A18B";
         default:                  return "?B"; // the size is not detected for the Inkling models
     }
 }
@@ -868,8 +872,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all);
-    // Qwen 3.5 and bailingmoe3 load their MTP block and skip it, the other archs have none
-    if (hparams.n_layer_nextn > 0 && arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_BAILINGMOE3) {
+    // Qwen 3.5, bailingmoe3 and glm5-next load their MTP block and skip it, the other archs have none
+    if (hparams.n_layer_nextn > 0 && arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_BAILINGMOE3 &&
+            arch != LLM_ARCH_GLM5_NEXT) {
         throw std::runtime_error("NextN/MTP layers are not supported");
     }
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
@@ -1791,7 +1796,7 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: n_expert_used         = %u\n",     __func__, hparams.n_expert_used());
         LLAMA_LOG_INFO("%s: n_expert_groups       = %d\n",     __func__, hparams.n_expert_groups);
         LLAMA_LOG_INFO("%s: n_group_used          = %d\n",     __func__, hparams.n_group_used);
-        if (arch == LLM_ARCH_BAILINGMOE3) {
+        if (arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_GLM5_NEXT) {
             LLAMA_LOG_INFO("%s: n_layer_dense_lead    = %d\n",     __func__, hparams.n_layer_dense_lead);
             LLAMA_LOG_INFO("%s: n_ff_exp              = %d\n",     __func__, hparams.n_ff_exp());
             LLAMA_LOG_INFO("%s: n_ff_shexp            = %d\n",     __func__, hparams.n_ff_shexp);
@@ -1800,6 +1805,14 @@ void llama_model::print_info() const {
             LLAMA_LOG_INFO("%s: expert_weights_norm   = %d\n",     __func__, hparams.expert_weights_norm);
             LLAMA_LOG_INFO("%s: expert_gating_func    = %s\n",     __func__, llama_expert_gating_func_name((llama_expert_gating_func_type) hparams.expert_gating_func));
             LLAMA_LOG_INFO("%s: n_layer_nextn         = %d\n",     __func__, hparams.n_layer_nextn);
+        }
+        if (arch == LLM_ARCH_GLM5_NEXT) {
+            LLAMA_LOG_INFO("%s: indexer_n_head        = %u\n",     __func__, hparams.indexer_n_head);
+            LLAMA_LOG_INFO("%s: indexer_head_size     = %u\n",     __func__, hparams.indexer_head_size);
+            LLAMA_LOG_INFO("%s: indexer_top_k         = %u\n",     __func__, hparams.indexer_top_k);
+            LLAMA_LOG_INFO("%s: indexer_kpool         = %u\n",     __func__, hparams.indexer_kpool);
+            LLAMA_LOG_INFO("%s: hc_mult               = %u\n",     __func__, hparams.dsv4_hc_mult);
+            LLAMA_LOG_INFO("%s: hc_sinkhorn_iters     = %u\n",     __func__, hparams.dsv4_hc_sinkhorn_iters);
         }
         LLAMA_LOG_INFO("%s: causal attn           = %d\n",     __func__, hparams.causal_attn);
         LLAMA_LOG_INFO("%s: pooling type          = %d\n",     __func__, hparams.pooling_type);
@@ -2066,6 +2079,29 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             /* filter_attn       */ [&](uint32_t il) { return il < hparams.n_layer() && !hparams.is_recr(il); },
             /* filter_recr       */ [&](uint32_t il) { return il < hparams.n_layer() &&  hparams.is_recr(il); });
     }
+    // glm5-next: KDA layers keep recurrent state, the DSA layers a K-only MLA cache plus the indexer cache
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        return new llama_memory_hybrid_idx(
+            /* model             */ *this,
+            /* no_alloc          */ params.no_alloc,
+            /* attn_type_k       */ params.type_k,
+            /* attn_type_v       */ params.type_v,
+            /* attn_v_trans      */ !cparams.flash_attn,
+            /* attn_kv_size      */ cparams.n_ctx_seq,
+            /* attn_n_swa        */ hparams.n_swa,
+            /* attn_swa_type     */ hparams.swa_type,
+            /* recurrent_type_r  */ GGML_TYPE_F32,
+            /* recurrent_type_s  */ GGML_TYPE_F32,
+            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+            /* n_seq_max         */ cparams.n_seq_max,
+            /* n_rs_seq          */ cparams.n_rs_seq,
+            /* rs_replay         */ cparams.rs_replay,
+            /* offload           */ cparams.offload_kqv,
+            /* unified           */ cparams.kv_unified,
+            /* filter_attn       */ [&](uint32_t il) { return il < hparams.n_layer() && !hparams.is_recr(il); },
+            /* filter_recr       */ [&](uint32_t il) { return il < hparams.n_layer() &&  hparams.is_recr(il); },
+            /* filter_idx        */ [&](uint32_t il) { return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il); });
+    }
     // Inkling 2: every layer has attention and short convolution state, some layers use a sliding window
     if (llm_arch_is_hybrid(arch)) {
         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
@@ -2301,6 +2337,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_CLIP:
         case LLM_ARCH_INKLING2:
         case LLM_ARCH_INKLING2_LOOP:
+        case LLM_ARCH_GLM5_NEXT:
             return LLAMA_ROPE_TYPE_NONE;
 
         // M-RoPE with interleaved sections

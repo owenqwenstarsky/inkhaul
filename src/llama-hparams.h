@@ -59,6 +59,17 @@ struct llama_hparams {
     // indexer layers (1) choose the key pool, the other sparse layers (0) select from the pool of the preceding indexer
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_indexer_full_impl;
 
+    // k-pool indexer (glm5-next): the indexer keys are pooled indexer_kpool tokens at a time and whole pools are selected
+    uint32_t indexer_n_head            = 0;
+    uint32_t indexer_head_size         = 0;
+    uint32_t indexer_kpool             = 0;
+    bool     indexer_kpool_select_tail = true; // also select the cells of the incomplete last pool
+
+    // mHC residual streams (glm5-next)
+    uint32_t dsv4_hc_mult           = 0;
+    uint32_t dsv4_hc_sinkhorn_iters = 0;
+    float    dsv4_hc_eps            = 0.0f;
+
     // different head size for full_attention and SWA layers
     uint32_t n_embd_head_k_full; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
     uint32_t n_embd_head_v_full; // dimension of values (d_v) aka n_embd_head
@@ -101,6 +112,7 @@ struct llama_hparams {
     bool     expert_router_f32    = false;   // compute the router logits in F32
 
     float f_norm_rms_eps;
+    float f_norm_eps = 0.0f; // LayerNorm, only the glm5-next indexer keys use it
 
     float f_final_logit_softcapping  = 30.0f;
 

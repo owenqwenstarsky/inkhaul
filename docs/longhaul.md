@@ -1,6 +1,6 @@
 # LongHaul
 
-LongHaul runs Inkling 2, Qwen 3.5 / 3.6 MoE (`qwen35moe`), Ling-3.2-air (`bailingmoe3`) and Kolibri 1 / 1.1 (`kolibri1`) MoE models on a Mac or an NVIDIA GPU with less memory than the model needs. The MoE experts stay in the GGUF file on disk. A fixed-size cache in GPU memory (unified memory on a Mac, VRAM with CUDA) keeps the experts that were used recently and often. Everything else (attention, router, norms, embeddings, output) is loaded as usual.
+LongHaul runs Inkling 2, Qwen 3.5 / 3.6 MoE (`qwen35moe`), Ling-3.2-air (`bailingmoe3`), Kolibri 1 / 1.1 (`kolibri1`) and GLM-5.3-Flash (`glm5-next`) MoE models on a Mac or an NVIDIA GPU with less memory than the model needs. The MoE experts stay in the GGUF file on disk. A fixed-size cache in GPU memory (unified memory on a Mac, VRAM with CUDA) keeps the experts that were used recently and often. Everything else (attention, router, norms, embeddings, output) is loaded as usual.
 
 LongHaul is always on for models with experts on disk. These options control it:
 
@@ -22,7 +22,7 @@ LongHaul is always on for models with experts on disk. These options control it:
 - With CUDA the staging buffers are pinned host memory, so the uploads to the GPU run at full PCIe speed.
 - The cache keeps experts by recency and frequency (`src/llama-moe-cache.cpp`). In `inkling2_loop` models the passes of the loop core share the slots of their physical layer, so an expert used in several passes is cached once.
 - Layers whose experts have the same types and shapes share one group of slots. When a file gives the experts of some layers other types (common in community quants), each layout is its own group. The budget is then split in two steps: first every group gets the slots for the largest ubatch `U` (`U * n_expert_used` slots, at most all its experts) that fits in half the budget, then the rest is split by the size of each group's experts. The startup log shows the slots of each group and `U`. A file with one layout gets the whole budget, as before. The smallest working cache is the one that gives every group `n_expert_used` slots; a smaller `-lhc` fails with an error that names it.
-- The shared experts of Qwen, Ling and Kolibri are small and stay in memory. The experts of a Qwen MTP block or a Ling MTP layer are not loaded, and the block is not run.
+- The shared experts of Qwen, Ling, Kolibri and GLM are small and stay in memory. The experts of a Qwen MTP block or a Ling or GLM MTP layer are not loaded, and the block is not run.
 - Prompt processing also reads through the cache. If the cache cannot hold the experts that one ubatch selects in a layer, `n_ubatch` is reduced at startup (logged as a warning). A larger cache gives larger ubatches and faster prompt processing.
 - A Metal or CUDA GPU is required, with all layers on GPUs (the default `-ngl`). The layers can be split over several GPUs, or over several laptops with RPC (see [Several laptops](#several-laptops)): each device caches the experts of its own layers in its own memory.
 - `--fit` reduces the context size if needed, but it does not offload fewer layers or move experts to the CPU. If the model does not fit, use a smaller `-lhc` or context.
@@ -248,6 +248,42 @@ The IQ1 / IQ2 files (for example `IQ2_XXS-GSQ-RCO-2.00bpw`, 17.6 GiB) mix IQ1_S,
 
 The sparse attention reads one KV stream. With several sequences (`-np` greater than 1) also pass `--kv-unified`, otherwise the context fails to load with an error that says so. `llama-server` with the default (auto) number of slots already uses a unified KV cache.
 
+## Sizing for GLM-5.3-Flash
+
+GLM-5.3-Flash (arch `glm5-next`, 320B parameters, 18B active) has 45 layers: layers 0-2 have a dense FFN, layers 3-44 have 288 experts each, 8 used per token, plus a shared expert. Its attention is hybrid: 34 KDA (linear attention) layers and 11 MLA layers with sparse attention, where each query attends to the 2048 keys an indexer selects from pools of 4 keys. There is no RoPE. The residual stream is 4 streams wide (mHC). The file also has an MTP layer (block 45), which this fork does not load. Only text input is supported.
+
+The numbers below are computed from the tensor types in the headers of unsloth's `UD-Q4_K_XL` (186 GiB) and `UD-IQ2_XXS` (95 GiB) files, not measured:
+
+| | UD-Q4_K_XL | UD-IQ2_XXS |
+|---|---|---|
+| Experts on disk | 176.8 GiB | 88.6 GiB |
+| Resident part (with the MTP layer's other weights) | 9.2 GiB | 6.2 GiB |
+| One expert (gate, up and down) | 14.5 MiB | 7.2 MiB |
+| Expert layouts | 3 | 3 |
+| No-hit read per token (42 x 8 experts) | 4.8 GiB | 2.4 GiB |
+| Smallest working cache | 381 MiB | 200 MiB |
+
+GLM reads the most per token of the models here, about 4 times Ling-3.2-air, and its experts are 4.4 times larger. Generation speed is bound by the SSD speed and the hit rate. The ubatch limit and the share of the experts that the cache holds:
+
+| Cache | UD-Q4_K_XL: max ubatch | UD-Q4_K_XL: experts cached | UD-IQ2_XXS: max ubatch | UD-IQ2_XXS: experts cached |
+|---|---|---|---|---|
+| 512M (default) | 1 | 0.3% | 1 | 0.6% |
+| 2G | 2 | 1.1% | 5 | 2.3% |
+| 4G | 5 | 2.3% | 10 | 4.6% |
+| 8G | 10 | 4.5% | 21 | 9.3% |
+| 16G | 22 | 9.0% | any | 18% |
+
+The model loads with the default 512M, but prompt processing then runs one token per ubatch and almost nothing is cached. Use at least `-lhc 4G` with the IQ2_XXS file and `-lhc 8G` with the Q4_K_XL file.
+
+The default context is the model's 1M tokens. The MLA latent and the indexer rows take about 19 KiB per token at F16, so 2.4 GiB at 128K and about 19 GiB at 1M. Set the context with `-c`, for example `-c 131072`. Without it, `--fit` lowers the context only if the default does not fit in memory. The KDA state is about 146 MiB per sequence.
+
+Other limits:
+
+- `-sm tensor` is not supported for this arch and fails with an error.
+- Speculative decoding with a draft model (`-md`) is not tested with GLM. The model has no recurrent rollback, so the server falls back to state checkpoints.
+- The model card recommends `--temp 1.0 --top-p 0.95`. The template turns reasoning on for every turn; `reasoning_effort` (`low`, `high`, default `max`) sets its length.
+- Long reasoning can turn into repeated words ("hmm hmm hmm"). This is a model issue, reported at [zai-org/GLM-5 #146](https://github.com/zai-org/GLM-5/issues/146), [#168](https://github.com/zai-org/GLM-5/issues/168) and [llama.cpp #31875](https://github.com/ggml-org/llama.cpp/issues/31875), not a bug in this fork.
+
 ## Reading the stats
 
 At exit the cache logs one line per batch class:
@@ -270,4 +306,4 @@ llama_moe_cache: RPC0: share target 60.0%, measured ...%, ... of 128 experts per
 
 ## Tests
 
-`LLAMA_LONGHAUL_RESIDENT=1` with a cache size of 0 keeps the experts in the mapped file without a RAM bound. It exists for tests that compare against the old behavior. `test-llama-archs` checks LongHaul against the same file with its experts in the mapped file, or against the model in memory, for caches from 2 slots to all experts. For `qwen35moe` it also checks files with separate gate and up experts, with two expert groups, and with an MTP block. For `bailingmoe3` it checks files with several expert layouts, split files and a file with an MTP layer. For `kolibri1` it checks F32, Q8_0 and NVFP4 experts, two expert groups, a Q8_0 KV cache and a Kolibri 1 file, with a 400-token prompt and decode steps, so that the sparse attention selects keys from the pool of blocks. With `GGML_METAL_DEVICES=2` (two emulated Metal devices) it also checks every LongHaul arch with its layers split over the two devices, and with the expert split at several shares, with the KV cache on either device, with cache sizes per device and with the rebalance moving experts at every graph. `test-expert-share` checks the expert ownership and the rebalance rule, and `test-arg-expert-split` checks how `-es`, `-kvd` and `-lhcd` are read. `test-llama-archs --rpc` (CTest label `rpc`) starts an RPC server on a thread of the test, on `127.0.0.1` only, and checks the experts read by the server and the experts sent from the client against the local GPU.
+`LLAMA_LONGHAUL_RESIDENT=1` with a cache size of 0 keeps the experts in the mapped file without a RAM bound. It exists for tests that compare against the old behavior. `test-llama-archs` checks LongHaul against the same file with its experts in the mapped file, or against the model in memory, for caches from 2 slots to all experts. For `qwen35moe` it also checks files with separate gate and up experts, with two expert groups, and with an MTP block. For `bailingmoe3` it checks files with several expert layouts, split files and a file with an MTP layer. For `kolibri1` it checks F32, Q8_0 and NVFP4 experts, two expert groups, a Q8_0 KV cache and a Kolibri 1 file, with a 400-token prompt and decode steps, so that the sparse attention selects keys from the pool of blocks. For `glm5-next` it checks files with an MTP layer, several expert layouts, split files and Q8_0 and NVFP4 experts, and the save, restore and copy of a sequence with its indexer cache. With `GGML_METAL_DEVICES=2` (two emulated Metal devices) it also checks every LongHaul arch with its layers split over the two devices, and with the expert split at several shares, with the KV cache on either device, with cache sizes per device and with the rebalance moving experts at every graph. `test-expert-share` checks the expert ownership and the rebalance rule, and `test-arg-expert-split` checks how `-es`, `-kvd` and `-lhcd` are read. `test-llama-archs --rpc` (CTest label `rpc`) starts an RPC server on a thread of the test, on `127.0.0.1` only, and checks the experts read by the server and the experts sent from the client against the local GPU.

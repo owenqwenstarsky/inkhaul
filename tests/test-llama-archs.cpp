@@ -285,6 +285,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_head  = 8;
         n_ff    = 192;
         n_layer = 8; // see the layer layout below
+    } else if (arch == LLM_ARCH_GLM5_NEXT) {
+        // several heads, so that the MLA flash attention has GQA > 1
+        n_embd  = 128;
+        n_head  = 16;
+        n_ff    = 192;
+        n_layer = 4; // see the layer layout below
     }
 
     uint32_t n_head_kv = n_head;
@@ -451,6 +457,44 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, false);
     }
 
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        // K = KDA, D = DSA with its own indexer, d = DSA on the selection of the last D, then one NextN (MTP) layer
+        // K D K d, extra layers repeat K D
+        const uint32_t n_block = n_layer + 1;
+        std::vector<uint32_t> n_head_kv_per_layer;
+        std::vector<uint8_t>  indexer;
+        std::vector<float>    clamp_exp;
+        std::vector<float>    clamp_shexp;
+        for (uint32_t il = 0; il < n_block; il++) {
+            n_head_kv_per_layer.push_back(il % 2 == 1 || il == n_layer ? 1 : 0);
+            if (il < n_layer) {
+                indexer.push_back(il == 3 ? 0 : 1);
+            }
+            // small limits, so that the clamps bite on the activations of the random weights, layer 2 is not clamped
+            clamp_exp  .push_back(il == 2 ? 0.0f : 0.05f);
+            clamp_shexp.push_back(il == 2 ? 0.0f : 0.07f);
+        }
+        ms.add_kv(LLM_KV_BLOCK_COUNT,                n_block);
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,       uint32_t(1));
+        // the KDA heads come from the uniform head count, the MLA cache holds one latent head
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,    n_head_kv_per_layer);
+        // nope-only MLA: the cache row is the latent alone
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(512));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(0));
+        ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,    1e-6f);
+        // the Metal lightning indexer needs a head size of 128
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(8));
+        gguf_set_arr_data(ret.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TYPES).c_str(), GGUF_TYPE_BOOL, indexer.data(), indexer.size());
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(20));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1e-6f);
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,           clamp_exp);
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP,         clamp_shexp);
+    }
+
     // dummy tokenizer: token ids are derived from fixed-size chunks and detokenized as hex ids
     {
         std::vector<std::string> tokenizer_list(n_vocab);
@@ -496,6 +540,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             ms.add_kv(LLM_KV_EXPERT_GROUP_USED_COUNT, uint32_t(2));
             ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,    2.5f);
             ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
+        }
+
+        if (arch == LLM_ARCH_GLM5_NEXT) {
+            // more experts than a token uses, as GLM-5.3-Flash (288 experts, 8 used)
+            ms.add_kv(LLM_KV_EXPERT_COUNT,         uint32_t(4));
+            ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE, 2.5f);
+            ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,  true);
         }
     }
 
@@ -792,6 +843,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KOLIBRI1:
+        case LLM_ARCH_GLM5_NEXT:
             return true;
         default:
             return false;
@@ -1748,9 +1800,11 @@ struct gguf_file {
     }
 };
 
-// adds a NextN (MTP) layer to a saved bailingmoe3 model, as the converter writes it: the weights of block il_src copied
+// adds a NextN (MTP) layer to a saved bailingmoe3 or glm5-next model, as the converter writes it: the weights of block il_src copied
 // to block il_dst, and the NextN tensors (the fixture skips the layer, the saved model only has its optional KV scales)
-static void add_nextn_layer(const std::string & path, uint32_t il_src, uint32_t il_dst, int64_t n_embd) {
+// the glm5-next NextN layer has no mHC tensors and ends with nextn.shared_head_norm
+static void add_nextn_layer(const std::string & path, uint32_t il_src, uint32_t il_dst, int64_t n_embd, llm_arch arch) {
+    const bool glm = arch == LLM_ARCH_GLM5_NEXT;
     gguf_file in(path);
     gguf_context_ptr out(gguf_init_empty());
     gguf_set_kv(out.get(), in.gguf.get());
@@ -1769,14 +1823,15 @@ static void add_nextn_layer(const std::string & path, uint32_t il_src, uint32_t 
         gguf_add_tensor(out.get(), t);
         const std::string name = ggml_get_name(t);
         const bool weight = name.size() > 7 && (name.compare(name.size() - 7, 7, ".weight") == 0 || name.compare(name.size() - 5, 5, ".bias") == 0);
-        if (name.rfind(prefix_src, 0) == 0 && weight) {
+        const bool hc = name.find(".hc_") != std::string::npos;
+        if (name.rfind(prefix_src, 0) == 0 && weight && !(glm && hc)) {
             ggml_tensor * copy = ggml_dup_tensor(ctx.get(), t);
             memcpy(copy->data, t->data, ggml_nbytes(t));
             ggml_set_name(copy, (prefix_dst + name.substr(prefix_src.size())).c_str());
             gguf_add_tensor(out.get(), copy);
         }
     }
-    for (const char * name : { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "layer_output_norm.weight" }) {
+    for (const char * name : { "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", glm ? "nextn.shared_head_norm.weight" : "layer_output_norm.weight" }) {
         const bool proj = strcmp(name, "nextn.eh_proj.weight") == 0;
         ggml_tensor * t = proj ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 2*n_embd, n_embd) : ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_embd);
         memset(t->data, 0, ggml_nbytes(t));
@@ -2008,8 +2063,8 @@ static bool test_longhaul_expert_split(const std::string & label, const std::str
     return all_ok;
 }
 
-static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
-    const llm_arch arch = LLM_ARCH_BAILINGMOE3;
+// LongHaul for the archs whose file carries a NextN (MTP) layer that the model loads and skips (bailingmoe3, glm5-next)
+static int test_longhaul_nextn(const llm_arch arch, const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
     if (!arch_matches(arch_filter, arch)) {
         return 0;
     }
@@ -2026,7 +2081,7 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
         uint32_t  n_layer_min;
         bool      mixed;       // the last layer keeps F32 experts, a group of its own in the cache
     };
-    // a dense lead layer and 3 MoE layers (MLA, KDA, MLA)
+    // a dense lead layer and 3 MoE layers (bailingmoe3: MLA, KDA, MLA, glm5-next: DSA, KDA, DSA on a shared selection)
     std::vector<variant> variants;
     for (const ggml_type type_exps : { GGML_TYPE_COUNT, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4 }) {
         variants.push_back({ type_exps, 4, type_exps != GGML_TYPE_COUNT });
@@ -2077,9 +2132,9 @@ static int test_longhaul_bailingmoe3(const std::string & arch_filter, const size
             llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
             llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path.c_str());
         }
-        // blk.1 is an MLA MoE layer, as the NextN layer of Ling 3
+        // blk.1 is an MLA (DSA) MoE layer, as the NextN layer of Ling 3 and GLM-5.3-Flash
         const uint32_t n_embd = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EMBEDDING_LENGTH).c_str()));
-        add_nextn_layer(path, 1, n_layer, n_embd);
+        add_nextn_layer(path, 1, n_layer, n_embd, arch);
 
         uint32_t n_expert_file = 0;
         const std::vector<expert_group> groups = get_expert_groups(path, arch, n_expert_file);
@@ -3962,6 +4017,129 @@ static int test_state_kolibri1(const std::string & arch_filter, const size_t see
     return all_ok ? 0 : 1;
 }
 
+// glm5-next: the k-pool indexer keeps pooled keys across batches, the sequence edits must keep them in step with the cells
+// each case must give the logits of a context that decoded the prefix in one go; a top-k of 4 pools makes the selection matter
+// the prefix of 203 tokens ends in a partial pool
+static int test_state_glm5_next(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    const llm_arch arch = LLM_ARCH_GLM5_NEXT;
+    if (!arch_matches(arch_filter, arch)) {
+        return 0;
+    }
+    const uint32_t n_prefix = 203;
+    const uint32_t n_probe  = 16;
+    const std::vector<llama_token> tokens = get_tokens(n_prefix + n_probe, 128, seed);
+    const std::vector<llama_token> other  = get_tokens(n_prefix, 128, seed + 1);
+
+    std::vector<std::pair<std::string, std::vector<ggml_backend_dev_t>>> configs = { { "CPU", {} } };
+    if (ggml_backend_dev_t gpu = get_gpu(target_backend, nullptr)) {
+        configs.push_back({ ggml_backend_dev_name(gpu), { gpu } });
+    }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true);
+    gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TOP_K).c_str(), 16);
+
+    bool all_ok = true;
+    for (const auto & [dev_name, devs] : configs) {
+        llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, devs);
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        auto probe_logits = [&](llama_context * lctx, llama_seq_id seq_id) {
+            decode_range(lctx, tokens.data() + n_prefix, n_probe, n_prefix, seq_id, true);
+            std::vector<float> ret;
+            for (uint32_t i = 0; i < n_probe; i++) {
+                const float * logits_ith = llama_get_logits_ith(lctx, i);
+                ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+            }
+            return ret;
+        };
+        auto new_ctx = [&](uint32_t n_seq_max, bool kv_unified) {
+            llama_context_ptr lctx = get_ctx(model.get(), 0, GGML_TYPE_F16, n_seq_max, kv_unified);
+            if (!lctx) {
+                throw std::runtime_error("failed to create llama context");
+            }
+            return lctx;
+        };
+        // the reference for a context shape: the prefix and the probe in seq 0
+        auto reference = [&](uint32_t n_seq_max, bool kv_unified) {
+            llama_context_ptr lctx = new_ctx(n_seq_max, kv_unified);
+            decode_range(lctx.get(), tokens.data(), n_prefix, 0, 0, false);
+            return probe_logits(lctx.get(), 0);
+        };
+
+        struct state_case {
+            std::string                                       name;
+            std::function<double(const std::vector<float> &)> run; // returns the NMSE against the reference
+            uint32_t                                          n_seq_max;
+            bool                                              kv_unified;
+        };
+        std::vector<state_case> cases;
+
+        // the state of the sequence restored in a new context
+        cases.push_back({ "save/load", [&](const std::vector<float> & ref) {
+            llama_context_ptr lctx  = new_ctx(1, false);
+            llama_context_ptr lctx2 = new_ctx(1, false);
+            decode_range(lctx.get(), tokens.data(), n_prefix, 0, 0, false);
+            std::vector<uint8_t> state(llama_state_seq_get_size(lctx.get(), 0));
+            if (llama_state_seq_get_data(lctx.get(), state.data(), state.size(), 0) != state.size()) {
+                throw std::runtime_error("failed to save the sequence state");
+            }
+            if (llama_state_seq_set_data(lctx2.get(), state.data(), state.size(), 0) != state.size()) {
+                throw std::runtime_error("failed to restore the sequence state");
+            }
+            return nmse(ref, probe_logits(lctx2.get(), 0));
+        }, 1, false });
+
+        // the recurrent state cannot roll back, so a removal inside a pool is refused and changes nothing
+        cases.push_back({ "seq_rm inside a pool", [&](const std::vector<float> & ref) {
+            llama_context_ptr lctx = new_ctx(1, false);
+            decode_range(lctx.get(), tokens.data(), n_prefix, 0, 0, false);
+            if (llama_memory_seq_rm(llama_get_memory(lctx.get()), 0, 101, -1)) {
+                throw std::runtime_error("seq_rm inside the sequence was not refused");
+            }
+            return nmse(ref, probe_logits(lctx.get(), 0));
+        }, 1, false });
+
+        // all pools of a cleared sequence are stale, the new prefix pools from scratch
+        cases.push_back({ "seq_rm all, new prefix", [&](const std::vector<float> & ref) {
+            llama_context_ptr lctx = new_ctx(1, false);
+            decode_range(lctx.get(), other.data(), n_prefix, 0, 0, false);
+            if (!llama_memory_seq_rm(llama_get_memory(lctx.get()), 0, -1, -1)) {
+                throw std::runtime_error("failed to clear the sequence");
+            }
+            decode_range(lctx.get(), tokens.data(), n_prefix, 0, 0, false);
+            return nmse(ref, probe_logits(lctx.get(), 0));
+        }, 1, false });
+
+        // a copy gets the pools of its source: the probe in the copy, then in the source, both match
+        for (const bool kv_unified : { false, true }) {
+            cases.push_back({ std::string("seq_cp") + (kv_unified ? ", unified" : ""), [&, kv_unified](const std::vector<float> & ref) {
+                llama_context_ptr lctx = new_ctx(2, kv_unified);
+                decode_range(lctx.get(), tokens.data(), n_prefix, 0, 0, false);
+                llama_memory_seq_cp(llama_get_memory(lctx.get()), 0, 1, -1, -1);
+                const double nmse_cp = nmse(ref, probe_logits(lctx.get(), 1));
+                return std::max(nmse_cp, nmse(ref, probe_logits(lctx.get(), 0)));
+            }, 2, kv_unified });
+        }
+
+        for (const state_case & sc : cases) {
+            bool ok = true;
+            std::string detail;
+            try {
+                const double nmse_val = sc.run(reference(sc.n_seq_max, sc.kv_unified));
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail = buf;
+                ok = nmse_val <= 1e-10;
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            LOG("State glm5-next %s (%s): %s (%s)\n", sc.name.c_str(), dev_name.c_str(), ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+    }
+    return all_ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -4083,9 +4261,11 @@ int main(int argc, char ** argv) {
         ret = test_tensor_layer_inp(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_tensor_fit(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_longhaul(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
-        ret = test_longhaul_bailingmoe3(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        ret = test_longhaul_nextn(LLM_ARCH_BAILINGMOE3, arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        ret = test_longhaul_nextn(LLM_ARCH_GLM5_NEXT,   arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_longhaul_kolibri1(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
-        return test_state_kolibri1(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        ret = test_state_kolibri1(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        return test_state_glm5_next(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

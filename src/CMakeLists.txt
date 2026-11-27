@@ -26,6 +26,7 @@ set(LLAMA_CORE_SOURCES
     llama-moe-cache.cpp
     llama-expert-share.cpp
     llama-memory-hybrid.cpp
+    llama-memory-hybrid-idx.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-recurrent.cpp
     llama-mmap.cpp

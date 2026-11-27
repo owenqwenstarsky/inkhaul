@@ -180,13 +180,19 @@ class Keys:
         LOG_SCALE_ALPHA              = "{arch}.attention.log_scale_alpha"
 
         class Indexer:
+            HEAD_COUNT             = "{arch}.attention.indexer.head_count"
+            KEY_LENGTH             = "{arch}.attention.indexer.key_length"
             TOP_K                  = "{arch}.attention.indexer.top_k"
             TYPES                  = "{arch}.attention.indexer.types"
+            KPOOL                  = "{arch}.attention.indexer.kpool"              # glm5-next
+            KPOOL_SELECT_TAIL      = "{arch}.attention.indexer.kpool_select_tail"  # glm5-next
             CANDIDATE_BLOCK_SIZE   = "{arch}.attention.indexer.candidate_block_size"
             CANDIDATE_TOP_K_BLOCKS = "{arch}.attention.indexer.candidate_top_k_blocks"
 
     class HyperConnection:
         COUNT                = "{arch}.hyper_connection.count"
+        SINKHORN_ITERATIONS  = "{arch}.hyper_connection.sinkhorn_iterations"  # glm5-next
+        EPSILON              = "{arch}.hyper_connection.epsilon"              # glm5-next
 
     class PerLayerEmbedding:
         LAYERS             = "{arch}.ple.layers"
@@ -394,6 +400,7 @@ class MODEL_ARCH(IntEnum):
     QWEN35           = auto()
     QWEN35MOE        = auto()
     KOLIBRI1         = auto()
+    GLM5_NEXT        = auto()
 
 
 class MODEL_TENSOR(IntEnum):
@@ -469,6 +476,20 @@ class MODEL_TENSOR(IntEnum):
     SSM_F_A              = auto() # Kimi Linear
     SSM_BETA             = auto() # Kimi Linear qwen3.5
     SSM_G_A              = auto() # Kimi Linear
+    SSM_F_B              = auto() # glm5-next
+    SSM_G_B              = auto() # glm5-next
+    HC_ATTN_FN           = auto() # glm5-next mHC
+    HC_ATTN_BASE         = auto() # glm5-next mHC
+    HC_ATTN_SCALE        = auto() # glm5-next mHC
+    HC_FFN_FN            = auto() # glm5-next mHC
+    HC_FFN_BASE          = auto() # glm5-next mHC
+    HC_FFN_SCALE         = auto() # glm5-next mHC
+    INDEXER_K_NORM       = auto() # glm5-next
+    INDEXER_PROJ         = auto() # glm5-next
+    INDEXER_ATTN_K       = auto() # glm5-next
+    INDEXER_ATTN_Q_B     = auto() # glm5-next
+    INDEXER_KPOOL_GATE   = auto() # glm5-next
+    INDEXER_KPOOL_APE    = auto() # glm5-next
     ATTN_Q_A             = auto()
     ATTN_Q_B             = auto()
     ATTN_KV_A_MQA        = auto()
@@ -536,6 +557,9 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_EH_PROJ          = auto()
     NEXTN_ENORM            = auto()
     NEXTN_HNORM            = auto()
+    NEXTN_EMBED_TOKENS     = auto()
+    NEXTN_SHARED_HEAD_HEAD = auto()
+    NEXTN_SHARED_HEAD_NORM = auto()
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
@@ -547,6 +571,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.QWEN35:           "qwen35",
     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
     MODEL_ARCH.KOLIBRI1:         "kolibri1",
+    MODEL_ARCH.GLM5_NEXT:        "glm5-next",
 }
 
 
@@ -623,6 +648,20 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_F_A:                   "blk.{bid}.ssm_f_a",              # Kimi Linear
     MODEL_TENSOR.SSM_BETA:                  "blk.{bid}.ssm_beta",             # Kimi Linear qwen3.5
     MODEL_TENSOR.SSM_G_A:                   "blk.{bid}.ssm_g_a",              # Kimi Linear
+    MODEL_TENSOR.SSM_F_B:                   "blk.{bid}.ssm_f_b",              # glm5-next
+    MODEL_TENSOR.SSM_G_B:                   "blk.{bid}.ssm_g_b",              # glm5-next
+    MODEL_TENSOR.HC_ATTN_FN:                "blk.{bid}.hc_attn_fn",
+    MODEL_TENSOR.HC_ATTN_BASE:              "blk.{bid}.hc_attn_base",
+    MODEL_TENSOR.HC_ATTN_SCALE:             "blk.{bid}.hc_attn_scale",
+    MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
+    MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
+    MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
+    MODEL_TENSOR.INDEXER_K_NORM:            "blk.{bid}.indexer.k_norm",
+    MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
+    MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.indexer.attn_k",
+    MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
+    MODEL_TENSOR.INDEXER_KPOOL_GATE:        "blk.{bid}.indexer_compressor_gate",
+    MODEL_TENSOR.INDEXER_KPOOL_APE:         "blk.{bid}.indexer_compressor_ape",
     MODEL_TENSOR.ATTN_Q_A:                  "blk.{bid}.attn_q_a",
     MODEL_TENSOR.ATTN_Q_B:                  "blk.{bid}.attn_q_b",
     MODEL_TENSOR.ATTN_KV_A_MQA:             "blk.{bid}.attn_kv_a_mqa",
@@ -690,6 +729,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_EH_PROJ:             "blk.{bid}.nextn.eh_proj",
     MODEL_TENSOR.NEXTN_ENORM:               "blk.{bid}.nextn.enorm",
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
+    MODEL_TENSOR.NEXTN_EMBED_TOKENS:        "blk.{bid}.nextn.embed_tokens",
+    MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
+    MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -977,6 +1019,69 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
+    ],
+    MODEL_ARCH.GLM5_NEXT: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        # mHC
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_SCALE,
+        # KDA (linear attention) layers
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.SSM_CONV1D_Q,
+        MODEL_TENSOR.SSM_CONV1D_K,
+        MODEL_TENSOR.SSM_CONV1D_V,
+        MODEL_TENSOR.SSM_F_A,
+        MODEL_TENSOR.SSM_F_B,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_G_A,
+        MODEL_TENSOR.SSM_G_B,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        # MLA (nope) + DSA layers
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_KV_A_MQA,
+        MODEL_TENSOR.ATTN_K_B,
+        MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.INDEXER_K_NORM,
+        MODEL_TENSOR.INDEXER_PROJ,
+        MODEL_TENSOR.INDEXER_ATTN_K,
+        MODEL_TENSOR.INDEXER_ATTN_Q_B,
+        MODEL_TENSOR.INDEXER_KPOOL_GATE,
+        MODEL_TENSOR.INDEXER_KPOOL_APE,
+        # FFN
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        # NextN/MTP tensors, kept in the file and skipped by the loader
+        MODEL_TENSOR.NEXTN_EH_PROJ,
+        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
 }
 

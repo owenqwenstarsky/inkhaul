@@ -94,6 +94,8 @@ pre_computed_hashes: list[dict] = [
     {"name": "qwen35",    "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/openbmb/MiniCPM-V-4_6", "chkhsh": "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f"},
     # Kolibri-1 and Kolibri-1.1 use a 128k vocabulary with the qwen2 pre-tokenizer regex
     {"name": "qwen2",     "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/Aleph-Alpha/Kolibri-1.1", "chkhsh": "6e040dfe72e4b85855588c53acf4909ac4e98e55bc3a33cd7db499180dc42a78"},
+    # GLM-5.3-Flash keeps the GLM-4 pre-tokenizer; its repo is FP8 and gated behind transformers >= 5
+    {"name": "glm4",      "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/zai-org/GLM-5.3-Flash", "chkhsh": "cdf5f35325780597efd76153d4d1c16778f766173908894c04afc20108536267"},
 ]
 
 

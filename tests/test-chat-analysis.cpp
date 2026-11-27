@@ -36,6 +36,7 @@ static const std::vector<std::string> ALL_TEMPLATE_PATHS = {
     "models/templates/CohereForAI-c4ai-command-r7b-12-2024-tool_use.jinja",
     "models/templates/GLM-4.6.jinja",
     "models/templates/GLM-4.7-Flash.jinja",
+    "models/templates/GLM-5.3-Flash.jinja",
     "models/templates/Kimi-K2-Instruct.jinja",
     "models/templates/Kimi-K2-Thinking.jinja",
     "models/templates/MiMo-VL.jinja",

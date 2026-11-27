@@ -252,16 +252,33 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,          hparams.n_embd_head_k_swa);
     add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,        hparams.n_embd_head_v_swa);
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-        if (hparams.kv_source(il) != il || hparams.indexer_top_k > 0) {
+        if (hparams.kv_source(il) != il || (hparams.indexer_top_k > 0 && hparams.indexer_kpool == 0)) {
             add_kv(LLM_KV_ATTENTION_KV_SOURCE_MAP, hparams.kv_source_impl, true);
             break;
         }
     }
-    if (hparams.indexer_top_k > 0) {
+    if (hparams.indexer_top_k > 0 && hparams.indexer_kpool > 0) {
+        // k-pool indexer (glm5-next): the types cover the trunk layers only, the MTP layer always has a full indexer
+        add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,             hparams.indexer_top_k);
+        add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,             std::vector<uint32_t>(
+                hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.begin() + hparams.n_layer()));
+        add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,        hparams.indexer_n_head);
+        add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,        hparams.indexer_head_size);
+        add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,             hparams.indexer_kpool);
+        add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, hparams.indexer_kpool_select_tail);
+    } else if (hparams.indexer_top_k > 0) {
         add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,                  hparams.indexer_top_k);
         add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,                  hparams.is_indexer_full_impl, true);
         add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   hparams.indexer_cand_block_size);
         add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, hparams.indexer_cand_top_k_blocks);
+    }
+    if (hparams.f_norm_eps > 0.0f) {
+        add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,           hparams.f_norm_eps);
+    }
+    if (hparams.dsv4_hc_mult > 0) {
+        add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
+        add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+        add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     }
     add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
     if (hparams.n_relative > 0) {

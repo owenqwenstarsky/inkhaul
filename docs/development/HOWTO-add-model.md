@@ -2,8 +2,9 @@
 
 > [!NOTE]
 >
-> This fork keeps only the Inkling 2 architectures (`inkling2`, `inkling2_loop`), the Qwen 3.5 / 3.6 architectures (`qwen35`, `qwen35moe`), the Ling 3 architecture (`bailingmoe3`, text only, used by Ling-3.2-air), the Kolibri architecture (`kolibri1`, text only, used by Kolibri 1 and Kolibri 1.1), the DSpark draft model (`dflash`), the `clip` stub for mmproj files and the `inkling2v` and `qwen3vl_merger` vision encoders.
+> This fork keeps only the Inkling 2 architectures (`inkling2`, `inkling2_loop`), the Qwen 3.5 / 3.6 architectures (`qwen35`, `qwen35moe`), the Ling 3 architecture (`bailingmoe3`, text only, used by Ling-3.2-air), the Kolibri architecture (`kolibri1`, text only, used by Kolibri 1 and Kolibri 1.1), the GLM-5.3 architecture (`glm5-next`, text only, used by GLM-5.3-Flash), the DSpark draft model (`dflash`), the `clip` stub for mmproj files and the `inkling2v` and `qwen3vl_merger` vision encoders.
 > The steps below describe where an architecture lives in the code. Use the Inkling 2 files as the reference: `conversion/inkling2.py`, `src/models/inkling2.cpp`, `src/models/inkling2-loop.cpp` and `tools/mtmd/models/inkling2v.cpp`.
+> `glm5-next` uses a memory class of its own, `src/llama-memory-hybrid-idx.{h,cpp}`: the hybrid memory (recurrent state plus the MLA cache) with a third cache that holds one indexer row per token for the sparse attention. A model with an indexer that pools its keys can reuse it.
 
 Adding a model requires few steps:
 

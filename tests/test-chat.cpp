@@ -3715,6 +3715,155 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // GLM-5.3-Flash: GLM-4.7 tool call format, the generation prompt always opens the think block (no enable_thinking switch)
+    {
+        const char * path = "models/templates/GLM-5.3-Flash.jinja";
+        auto tst = peg_tester(path, detailed_debug);
+
+        // the expected prompts are the HF template rendered by transformers (jinja2)
+        const auto render = [&](const std::vector<common_chat_msg> & messages, const std::map<std::string, std::string> & kwargs, bool thinking) {
+            auto tmpls = read_templates(path);
+            common_chat_templates_inputs inputs;
+            inputs.messages             = messages;
+            inputs.enable_thinking      = thinking;
+            inputs.chat_template_kwargs = kwargs;
+            return common_chat_templates_apply(tmpls.get(), inputs);
+        };
+        const std::string bos = "[gMASK]<sop><|system|>Reasoning Effort: ";
+
+        // enable_thinking does not change the prompt, the think block is always opened
+        for (const bool thinking : { true, false }) {
+            auto params = render({ message_user }, {}, thinking);
+            assert_equals(COMMON_CHAT_FORMAT_PEG_NATIVE, params.format);
+            assert_equals(std::string("<|assistant|><think>"), params.generation_prompt);
+            assert_equals(bos + "Max<|user|>Hey there!<|assistant|><think>", params.prompt.str());
+        }
+
+        // reasoning_effort low and high are honored, any other value renders the default Max
+        for (const auto & [effort, level] : std::vector<std::pair<std::string, std::string>>{
+                { "low", "Low" }, { "medium", "Max" }, { "high", "High" }, { "max", "Max" },
+            }) {
+            auto params = render({ message_user }, { { "reasoning_effort", "\"" + effort + "\"" } }, true);
+            assert_equals(bos + level + "<|user|>Hey there!<|assistant|><think>", params.prompt.str());
+        }
+
+        // a tool call with a number and a string arg, then the tool response turn
+        {
+            common_chat_msg tool_msg;
+            tool_msg.role         = "tool";
+            tool_msg.content      = "42";
+            tool_msg.tool_call_id = "call_1";
+            auto params = render({
+                    message_user,
+                    simple_assist_msg("", "Planning", "special_function", R"({"arg1": 1, "path": "a b"})", "call_1"),
+                    tool_msg,
+                }, {}, true);
+            assert_equals(bos + "Max<|user|>Hey there!<|assistant|><think>Planning</think>"
+                "<tool_call>special_function<arg_key>arg1</arg_key><arg_value>1</arg_value><arg_key>path</arg_key><arg_value>a b</arg_value></tool_call>"
+                "<|observation|><tool_response>42</tool_response><|assistant|><think>", params.prompt.str());
+        }
+
+        // clear_thinking drops the reasoning of turns before the last user message
+        {
+            common_chat_msg user2 = message_user;
+            user2.content = "Again";
+            const std::vector<common_chat_msg> history = { message_user, simple_assist_msg("Hello!", "R1"), user2 };
+            assert_equals(bos + "Max<|user|>Hey there!<|assistant|><think>R1</think>Hello!<|user|>Again<|assistant|><think>",
+                render(history, {}, true).prompt.str());
+            assert_equals(bos + "Max<|user|>Hey there!<|assistant|><think></think>Hello!<|user|>Again<|assistant|><think>",
+                render(history, { { "clear_thinking", "true" } }, true).prompt.str());
+        }
+
+        // a string arg and a JSON arg in one call
+        {
+            static common_chat_tool write_tool{
+                "write_file", "Writes a file",
+                R"({"type":"object","properties":{"path":{"type":"string"},"options":{"type":"object"}},"required":["path","options"]})",
+            };
+            tst.test(
+                   "I'm\nthinking</think>"
+                   "<tool_call>write_file"
+                   "<arg_key>path</arg_key><arg_value>notes/a b.txt</arg_value>"
+                   "<arg_key>options</arg_key><arg_value>{\"append\": true, \"mode\": 420}</arg_value>"
+                   "</tool_call>")
+                .enable_thinking(true)
+                .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+                .tools({ write_tool })
+                .expect_reasoning("I'm\nthinking")
+                .expect_tool_calls({{ "write_file", R"({"path": "notes/a b.txt", "options": {"append": true, "mode": 420}})", {} }})
+                .expect_reconstruction()
+                .run();
+        }
+
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        // an empty think block still splits off the content
+        tst.test("</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .run();
+
+        tst.test(
+               "I'm\nthinking</think>"
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               "I'm\nthinking</think>"
+               "<tool_call>special_function"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "</tool_call>"
+               "<tool_call>special_function_with_opt"
+               "<arg_key>arg1</arg_key><arg_value>1</arg_value>"
+               "<arg_key>arg2</arg_key><arg_value>2</arg_value>"
+               "</tool_call>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({
+                special_function_tool, special_function_tool_with_optional_param
+        })
+            .expect_reasoning("I'm\nthinking")
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // a tool with no required args, the model emits no arg tags
+        {
+            static common_chat_tool no_args_tool{
+                "read_file_diff_md", "Reads a file diff",
+                R"({"type":"object","properties":{"review_id":{"type":"string"},"file_id":{"type":"string"}}})",
+            };
+            tst.test(
+                   "Let me read the diff content."
+                   "</think>"
+                   "<tool_call>read_file_diff_md</tool_call>")
+                .enable_thinking(true)
+                .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+                .tools({ no_args_tool })
+                .expect_reasoning("Let me read the diff content.")
+                .expect_tool_calls({{ "read_file_diff_md", "{}", {} }})
+                .expect_reconstruction()
+                .run();
+        }
+    }
+
     // Spark2.5 uses tagged arguments with forced-open thinking.
     {
         auto tst = peg_tester("models/templates/Spark2.5.jinja", detailed_debug);
@@ -5666,6 +5815,7 @@ static void test_reasoning_effort_caps() {
     assert_supports_effort("models/templates/tencent-Hy3.jinja", true);
     assert_supports_effort("models/templates/upstage-Solar-Open-100B.jinja", true);
     assert_supports_effort("models/templates/Aleph-Alpha-Kolibri-1.1.jinja", true);
+    assert_supports_effort("models/templates/GLM-5.3-Flash.jinja", true);
     assert_supports_effort("models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja", false);
     assert_supports_effort("models/templates/Qwen-Qwen3-0.6B.jinja", false);
 
@@ -5680,6 +5830,8 @@ static void test_reasoning_effort_caps() {
     assert_effort_levels("models/templates/Qwen-Qwen3-0.6B.jinja", {});
     // Kolibri-1.1 falls back to high, so high, xhigh and max render as an unknown level; minimal is an alias of low
     assert_effort_levels("models/templates/Aleph-Alpha-Kolibri-1.1.jinja", { "none", "low", "medium" });
+    // GLM-5.3-Flash falls back to max, so max renders as an unknown level
+    assert_effort_levels("models/templates/GLM-5.3-Flash.jinja", { "low", "high" });
 
     auto assert_effort_rejected = [](const std::string & path, const std::vector<std::string> & expected) {
         auto tmpls = read_templates(path);
@@ -5688,6 +5840,7 @@ static void test_reasoning_effort_caps() {
 
     assert_effort_rejected("models/templates/tencent-Hy3.jinja", { "minimal", "medium", "xhigh", "max" });
     assert_effort_rejected("models/templates/Aleph-Alpha-Kolibri-1.1.jinja", {});
+    assert_effort_rejected("models/templates/GLM-5.3-Flash.jinja", {});
 }
 
 static void test_msg_diffs_compute() {
