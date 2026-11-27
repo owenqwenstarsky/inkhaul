@@ -3099,13 +3099,23 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(attn_mask.rows == nullptr);
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
+    // kq_b can be a permuted view, with kv_gpu it is made contiguous on the KV device
     ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-    }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
-    if (cparams.flash_attn) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+    if (cparams.flash_attn && kq_mask->type == GGML_TYPE_F16) {
+        // the mask holds only 0 and -inf, so an F16 add gives the same result as an F32 add and a cast
+        kq_b = ggml_cast(ctx0, kq_b, GGML_TYPE_F16);
+        pin_kv(kq_b, il);
+        kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+    } else {
+        if (kq_mask->type != GGML_TYPE_F32) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_b = ggml_cont(ctx0, kq_b);
+        pin_kv(kq_b, il);
+        kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+        if (cparams.flash_attn) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        }
     }
     cb(kq_mask, "kq_mask_rel_pos", il);
 

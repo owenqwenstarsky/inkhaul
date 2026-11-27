@@ -118,6 +118,30 @@ int main() {
         }
     }
 
+    // LLAMA_VOCAB_PRE_TYPE_GPT4O has a custom splitter, wrapping the regex in a group makes it use the std::regex fallback instead
+    const std::string regex_gpt4o = "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))*((?=[\\p{L}\\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))+((?=[\\p{L}\\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    const std::string gpt4o_tests[] = {
+        "Hello World HELLO wORLD helloWorld HTTPServer xmlHTTPRequest",
+        "I've been 'told he's there, 'RE you sure? 'M not sure I'll make it, 'D you like some tea? We'Ve a'lL A'S",
+        "3 33 333 3333 3.14 1,000,000 \331\241\331\242\331\243\331\244 \342\205\247\302\262",
+        "line one\nline two\r\n\n  indented\ttab   \n\n   x  \v\f end  ",
+        "foo!!! bar??? (baz) [qux] {x} a/b//\n c// \r\n -- \342\200\224 \302\277qu\303\251?",
+        "\346\210\221\346\203\263\345\234\250apple\345\267\245\344\275\234 \320\221\321\212\320\273\320\263\320\260\321\200\321\201\320\272\320\270 \303\204\303\226\303\234 caf\303\251 cafe\314\201 Cafe\314\201S \314\201x .\314\201a",
+        "\360\237\232\200 (normal) \360\237\230\266\342\200\215\360\237\214\253\357\270\217 \342\202\254100 \302\240x\343\200\200y\342\200\250z\302\205w \x01\x7f\xff",
+        "def f(x):\n    return x**2  # comment\n<think>ok</think><tool_call>\"k\": [1, 2]}",
+    };
+    for (const auto & text : gpt4o_tests) {
+        const auto pieces = unicode_regex_split(text, { regex_gpt4o }, false);
+        if (pieces != unicode_regex_split(text, { "(?:" + regex_gpt4o + ")" }, false)) {
+            fprintf(stderr, "unexpected gpt4o split of \"%s\":", text.c_str());
+            for (const auto & piece : pieces) {
+                fprintf(stderr, " [%s]", piece.c_str());
+            }
+            fprintf(stderr, "\n");
+            success = false;
+        }
+    }
+
     // LLAMA_VOCAB_PRE_TYPE_QWEN2 (Kolibri), the expected splits come from the pre-tokenizer of the Kolibri-1.1 HF tokenizer
     const std::vector<std::string> regex_qwen2 = {
         "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
