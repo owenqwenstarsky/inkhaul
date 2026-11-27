@@ -46,6 +46,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_inkling2(params);
         case LLM_ARCH_INKLING2_LOOP:
             return new llama_model_inkling2_loop(params);
+        case LLM_ARCH_KOLIBRI1:
+            return new llama_model_kolibri1(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
         case LLM_ARCH_QWEN35:
@@ -493,6 +495,7 @@ const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_7_9B_A1_3B: return "7.9B.A1.3B";
         case LLM_TYPE_124B_A5_1B: return "124B.A5.1B";
+        case LLM_TYPE_78B_A3_5B:  return "78B.A3.5B";
         default:                  return "?B"; // the size is not detected for the Inkling models
     }
 }
@@ -905,6 +908,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
     std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
     std::iota(hparams.kv_source_impl.begin(), hparams.kv_source_impl.end(), 0);
+    std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
 
     ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer_all, false);
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer_all, false);
@@ -2086,6 +2090,31 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             /* filter_recr       */ [](uint32_t) { return true; });
     }
 
+    // Kolibri: sliding-window and full-attention layers, Kolibri-1.1 layers can read the K/V of an earlier layer
+    if (arch == LLM_ARCH_KOLIBRI1) {
+        // the Kolibri-1.1 sparse attention inputs hold the cells of a single stream
+        if (hparams.indexer_top_k > 0 && !cparams.kv_unified && cparams.n_seq_max > 1) {
+            throw std::runtime_error("Kolibri-1.1 sparse attention with several sequences requires a unified KV cache (--kv-unified)");
+        }
+
+        return new llama_kv_cache_iswa(
+                *this,
+                params.no_alloc,
+                params.type_k,
+                params.type_v,
+                !cparams.flash_attn,
+                cparams.offload_kqv,
+                params.swa_full,
+                cparams.kv_unified,
+                cparams.n_ctx_seq,
+                cparams.n_seq_max,
+                cparams.n_ubatch,
+                nullptr,
+                nullptr,
+                [&](int32_t il) -> int32_t { return hparams.has_kv(il) ? -1 : (int32_t) hparams.kv_source(il); },
+                nullptr);
+    }
+
     // DSpark draft: attention only, optionally with sliding-window layers
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         GGML_ASSERT(hparams.is_swa_any());
@@ -2291,6 +2320,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         // VL files carry mrope sections, but text positions are equal on all axes, so NORM gives the same result
         case LLM_ARCH_BAILINGMOE3:
             return LLAMA_ROPE_TYPE_NORM;
+
+        case LLM_ARCH_KOLIBRI1:
+            return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_UNKNOWN:
             GGML_ABORT("unknown architecture");

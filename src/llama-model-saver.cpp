@@ -252,10 +252,16 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,          hparams.n_embd_head_k_swa);
     add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,        hparams.n_embd_head_v_swa);
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-        if (hparams.kv_source(il) != il) {
+        if (hparams.kv_source(il) != il || hparams.indexer_top_k > 0) {
             add_kv(LLM_KV_ATTENTION_KV_SOURCE_MAP, hparams.kv_source_impl, true);
             break;
         }
+    }
+    if (hparams.indexer_top_k > 0) {
+        add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,                  hparams.indexer_top_k);
+        add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,                  hparams.is_indexer_full_impl, true);
+        add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   hparams.indexer_cand_block_size);
+        add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, hparams.indexer_cand_top_k_blocks);
     }
     add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
     if (hparams.n_relative > 0) {

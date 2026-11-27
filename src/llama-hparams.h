@@ -51,6 +51,14 @@ struct llama_hparams {
     // layer il reads the KV cache of layer kv_source_impl[il] (own cache if equal to il)
     std::array<uint32_t, LLAMA_MAX_LAYERS> kv_source_impl;
 
+    // sparse attention (Kolibri-1.1): top-k keys per query, 0 = dense attention
+    uint32_t indexer_top_k = 0;
+    // a long context query selects keys only from its indexer_cand_top_k_blocks best blocks of indexer_cand_block_size positions
+    uint32_t indexer_cand_block_size   = 0;
+    uint32_t indexer_cand_top_k_blocks = 0;
+    // indexer layers (1) choose the key pool, the other sparse layers (0) select from the pool of the preceding indexer
+    std::array<uint32_t, LLAMA_MAX_LAYERS> is_indexer_full_impl;
+
     // different head size for full_attention and SWA layers
     uint32_t n_embd_head_k_full; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
     uint32_t n_embd_head_v_full; // dimension of values (d_v) aka n_embd_head
@@ -290,6 +298,8 @@ struct llama_hparams {
     bool has_kv(uint32_t il) const;
 
     uint32_t kv_source(uint32_t il) const;
+
+    bool is_indexer_full(uint32_t il) const;
 
     bool has_rope(uint32_t il) const;
 
