@@ -738,11 +738,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     return GGML_STATUS_SUCCESS;
 }
 
-void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *), void * user_data) {
     //const int64_t t_start = ggml_time_us();
 
     if (ctx->use_graph_optimize) {
-        ggml_graph_optimize(gf);
+        ggml_graph_optimize(gf, add_alloc_dep, user_data);
     }
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);

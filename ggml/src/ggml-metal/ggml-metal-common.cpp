@@ -5,6 +5,9 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -289,7 +292,7 @@ static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
             continue;
         }
 
-        if (mr.p0 < cmp.p1 && mr.p1 >= cmp.p0) {
+        if (mr.p0 < cmp.p1 && mr.p1 > cmp.p0) {
             if (mrs->debug > 2) {
                 GGML_LOG_DEBUG("%s: the %s range buf=%lld, [%lld, %lld) overlaps with a previous %s range buf=%lld, [%lld, %lld)\n",
                         __func__,
@@ -347,7 +350,7 @@ struct node_info {
         return node->op;
     }
 
-    const ggml_tensor * dst() const {
+    ggml_tensor * dst() const {
         return fused.empty() ? node : fused.back();
     }
 
@@ -372,196 +375,254 @@ struct node_info {
     }
 };
 
-static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
-    // helper to add node src and dst ranges
-    const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
-        // only external sources matter: sources produced by the fused group are internal
-        for (int i = 0; i < GGML_MAX_SRC; i++) {
-            const ggml_tensor * src = node.node->src[i];
-            if (src && !node.is_output(src)) {
-                if (!ggml_mem_ranges_add_src(mrs, src)) {
-                    return false;
-                }
-            }
-        }
+// the ops that the level reorder can move: their memory accesses are their sources and their destination
+// (with the extra memory of the destination, see ggml_backend_metal_buffer_type_get_alloc_size)
+static bool ggml_metal_graph_optimize_movable_op(ggml_op op) {
+    switch (op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_ROPE:
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_GROUP_NORM:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_CLAMP:
+        case GGML_OP_TRI:
+        case GGML_OP_DIAG:
+        case GGML_OP_MUL:
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_DIV:
+        case GGML_OP_GLU:
+        case GGML_OP_SCALE:
+        case GGML_OP_UNARY:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_SIN:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_SET:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_REPEAT:
+        case GGML_OP_CONCAT:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_PAD:
+        case GGML_OP_FILL:
+        case GGML_OP_LOG:
+        case GGML_OP_FLASH_ATTN_EXT:
+            return true;
+        default:
+            return ggml_op_is_empty(op);
+    }
+}
 
-        for (const auto * fused : node.fused) {
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                const ggml_tensor * src = fused->src[i];
-                if (src && !node.is_output(src)) {
-                    if (!ggml_mem_ranges_add_src(mrs, src)) {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // all fused tensors are produced by the fused kernel
-        if (!ggml_mem_ranges_add_dst(mrs, node.node)) {
+// a node and the nodes fused with it can move if all their ops can
+static bool ggml_metal_graph_optimize_movable(const node_info & node) {
+    if (!ggml_metal_graph_optimize_movable_op(node.op())) {
+        return false;
+    }
+    for (const auto * f : node.fused) {
+        if (!ggml_metal_graph_optimize_movable_op(f->op)) {
             return false;
         }
-        for (const auto * fused : node.fused) {
-            if (!ggml_mem_ranges_add_dst(mrs, fused)) {
-                return false;
-            }
-        }
+    }
+    return true;
+}
 
-        return true;
-    };
-
-    // helper to check if a node can run concurrently with the existing set of nodes
-    const auto & h_check = [](ggml_mem_ranges_t mrs, const node_info & node) {
-        for (int i = 0; i < GGML_MAX_SRC; i++) {
-            const ggml_tensor * src = node.node->src[i];
-            if (src && !node.is_output(src)) {
-                if (!ggml_mem_ranges_check_src(mrs, src)) {
-                    return false;
-                }
-            }
-        }
-
-        for (const auto * fused : node.fused) {
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                const ggml_tensor * src = fused->src[i];
-                if (src && !node.is_output(src)) {
-                    if (!ggml_mem_ranges_check_src(mrs, src)) {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        if (!ggml_mem_ranges_check_dst(mrs, node.node)) {
-            return false;
-        }
-        for (const auto * fused : node.fused) {
-            if (!ggml_mem_ranges_check_dst(mrs, fused)) {
-                return false;
-            }
-        }
-
-        return true;
-    };
-
-    // perform reorders only across these types of ops
-    // can be expanded when needed
-    const auto & h_safe = [](ggml_op op) {
-        switch (op) {
-            case GGML_OP_MUL_MAT:
-            case GGML_OP_MUL_MAT_ID:
-            case GGML_OP_ROPE:
-            case GGML_OP_NORM:
-            case GGML_OP_RMS_NORM:
-            case GGML_OP_GROUP_NORM:
-            case GGML_OP_L2_NORM:
-            case GGML_OP_SUM_ROWS:
-            case GGML_OP_SSM_CONV:
-            case GGML_OP_SSM_SCAN:
-            case GGML_OP_CLAMP:
-            case GGML_OP_TRI:
-            case GGML_OP_DIAG:
-            case GGML_OP_MUL:
-            case GGML_OP_ADD:
-            case GGML_OP_SUB:
-            case GGML_OP_DIV:
-            case GGML_OP_GLU:
-            case GGML_OP_SCALE:
-            case GGML_OP_UNARY:
-            case GGML_OP_GET_ROWS:
-            case GGML_OP_SET_ROWS:
-            case GGML_OP_SET:
-            case GGML_OP_CPY:
-            case GGML_OP_CONT:
-            case GGML_OP_REPEAT:
-                return true;
-            default:
-                return ggml_op_is_empty(op);
-        }
-    };
-
+// order the nodes by level: a node goes one level after the last node that it must follow, so that the nodes of a level
+// can run together and the encoder puts one barrier between two levels
+// a node must follow an earlier node if it reads what the earlier node writes, or writes what the earlier node reads or writes
+// each node takes the latest level that its followers allow, so that its result is made shortly before its first use
+// a node with an op that cannot move splits the graph: the nodes before it stay before it
+// level gets the level of each node, a segment after an op that cannot move starts at a higher level than the ones before it
+static std::vector<int> ggml_metal_graph_optimize_levels(const std::vector<node_info> & nodes, std::vector<int> & level) {
     const int n = nodes.size();
 
     std::vector<int> res;
     res.reserve(n);
 
-    std::vector<bool> used(n, false);
+    // the earlier nodes that a node must follow
+    std::vector<std::vector<int>> preds(n);
+    level.assign(n, 0);
 
-    // the memory ranges for the set of currently concurrent nodes
-    ggml_mem_ranges_t mrs0 = ggml_mem_ranges_init(0);
+    // the first level of the current segment
+    int base = 0;
 
-    // the memory ranges for the set of nodes that haven't been processed yet, when looking forward for a node to reorder
-    ggml_mem_ranges_t mrs1 = ggml_mem_ranges_init(0);
+    // the accesses of the current segment, per buffer, or per tensor if the tensor is not allocated
+    struct access {
+        uint64_t p0;
+        uint64_t p1;
+        int      node;
+    };
+    struct accesses {
+        std::vector<access> writes;
+        std::vector<access> reads;
+    };
+    std::unordered_map<uint64_t, accesses> acc;
 
-    for (int i0 = 0; i0 < n; i0++) {
-        if (used[i0]) {
-            continue;
+    // the node that makes a tensor, for the views
+    std::unordered_map<const ggml_tensor *, int> maker;
+
+    const auto add_pred = [&](int i, int p) {
+        if (p != i && std::find(preds[i].begin(), preds[i].end(), p) == preds[i].end()) {
+            preds[i].push_back(p);
         }
+    };
 
-        const auto & node0 = nodes[i0];
+    const auto schedule = [&](int i0, int i1) {
+        acc.clear();
+        maker.clear();
 
-        // the node is not concurrent with the existing concurrent set, so we have to "put a barrier" (i.e reset mrs0)
-        // but before we do that, look forward for some other nodes that can be added to the concurrent set mrs0
-        //
-        // note: we can always add empty nodes to the concurrent set as they don't read nor write anything
-        if (!node0.is_empty() && !h_check(mrs0, node0)) {
-            // this will hold the set of memory ranges from the nodes that haven't been processed yet
-            // if a node is not concurrent with this set, we cannot reorder it
-            ggml_mem_ranges_reset(mrs1);
+        int n_level = 0;
 
-            // initialize it with the current node
-            h_add(mrs1, node0);
+        for (int i = i0; i < i1; i++) {
+            const node_info & node = nodes[i];
 
-            // that many nodes forward to search for a concurrent node
-            constexpr int N_FORWARD = 64;
+            maker[node.node] = i;
+            for (const auto * f : node.fused) {
+                maker[f] = i;
+            }
 
-            for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < n; i1++) {
-                if (used[i1]) {
+            if (node.is_empty()) {
+                continue;
+            }
+
+            // the reads: the sources from outside of the fused group
+            std::vector<ggml_mem_range> rd;
+            const auto add_srcs = [&](const ggml_tensor * t) {
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    const ggml_tensor * src = t->src[s];
+                    if (src && !node.is_output(src)) {
+                        rd.push_back(ggml_mem_range_from_tensor_src(src));
+                    }
+                }
+            };
+            add_srcs(node.node);
+            for (const auto * f : node.fused) {
+                add_srcs(f);
+            }
+
+            // the writes: all the tensors of the fused group
+            std::vector<ggml_mem_range> wr;
+            wr.push_back(ggml_mem_range_from_tensor_dst(node.node));
+            for (const auto * f : node.fused) {
+                wr.push_back(ggml_mem_range_from_tensor_dst(f));
+            }
+
+            for (const auto & mr : rd) {
+                auto it = acc.find(mr.pb);
+                if (it == acc.end()) {
                     continue;
                 }
-
-                const auto & node1 = nodes[i1];
-
-                // disallow reordering of certain ops
-                if (!h_safe(node1.op())) {
-                    break;
+                for (const auto & a : it->second.writes) {
+                    if (mr.p0 < a.p1 && a.p0 < mr.p1) {
+                        add_pred(i, a.node);
+                    }
                 }
-
-                const bool is_empty = node1.is_empty();
-
-                // to reorder a node and add it to the concurrent set, it has to be:
-                //   + empty or concurrent with all nodes in the existing concurrent set (mrs0)
-                //   + concurrent with all nodes prior to it that haven't been processed yet (mrs1)
-                if ((is_empty || h_check(mrs0, node1)) && h_check(mrs1, node1)) {
-                    // add the node to the existing concurrent set (i.e. reorder it for early execution)
-                    h_add(mrs0, node1);
-                    res.push_back(i1);
-
-                    // mark as used, so we skip re-processing it later
-                    used[i1] = true;
-                } else {
-                    // expand the set of nodes that haven't been processed yet
-                    h_add(mrs1, node1);
+            }
+            for (const auto & mr : wr) {
+                auto it = acc.find(mr.pb);
+                if (it == acc.end()) {
+                    continue;
+                }
+                for (const auto & a : it->second.writes) {
+                    if (mr.p0 < a.p1 && a.p0 < mr.p1) {
+                        add_pred(i, a.node);
+                    }
+                }
+                for (const auto & a : it->second.reads) {
+                    if (mr.p0 < a.p1 && a.p0 < mr.p1) {
+                        add_pred(i, a.node);
+                    }
                 }
             }
 
-            // finalize the concurrent set and begin a new one
-            ggml_mem_ranges_reset(mrs0);
+            for (const auto & mr : rd) {
+                acc[mr.pb].reads.push_back({ mr.p0, mr.p1, i });
+            }
+            for (const auto & mr : wr) {
+                acc[mr.pb].writes.push_back({ mr.p0, mr.p1, i });
+            }
+
+            int l = 0;
+            for (const int p : preds[i]) {
+                l = std::max(l, level[p] + 1);
+            }
+            level[i] = l;
+            n_level = std::max(n_level, l + 1);
         }
 
-        // expand the concurrent set with the current node
-        {
-            h_add(mrs0, node0);
-            res.push_back(i0);
+        // move each node to the latest level before its first follower
+        for (int i = i0; i < i1; i++) {
+            if (!nodes[i].is_empty()) {
+                level[i] = n_level - 1;
+            }
+        }
+        for (int i = i1 - 1; i >= i0; i--) {
+            for (const int p : preds[i]) {
+                level[p] = std::min(level[p], level[i] - 1);
+            }
+        }
+
+        // a view goes with the node that makes its source, before the nodes that use it
+        for (int i = i0; i < i1; i++) {
+            const node_info & node = nodes[i];
+            if (!node.is_empty()) {
+                continue;
+            }
+            int l = -1;
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                const ggml_tensor * src = node.node->src[s];
+                if (!src) {
+                    continue;
+                }
+                auto it = maker.find(src);
+                if (it != maker.end() && it->second < i) {
+                    l = std::max(l, level[it->second]);
+                }
+            }
+            level[i] = l;
+        }
+
+        std::vector<int> order;
+        order.reserve(i1 - i0);
+        for (int i = i0; i < i1; i++) {
+            order.push_back(i);
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            return level[a] < level[b];
+        });
+
+        res.insert(res.end(), order.begin(), order.end());
+
+        for (int i = i0; i < i1; i++) {
+            level[i] += base + 1;
+        }
+        base += n_level + 1;
+    };
+
+    int i0 = 0;
+    for (int i = 0; i < n; i++) {
+        if (!ggml_metal_graph_optimize_movable(nodes[i])) {
+            schedule(i0, i);
+            res.push_back(i);
+            level[i] = base++;
+            i0 = i + 1;
         }
     }
+    schedule(i0, n);
 
-    ggml_mem_ranges_free(mrs0);
-    ggml_mem_ranges_free(mrs1);
+    GGML_ASSERT((int) res.size() == n);
 
     return res;
 }
 
-void ggml_graph_optimize(ggml_cgraph * gf) {
+void ggml_graph_optimize(ggml_cgraph * gf, void (*add_alloc_dep)(void *, ggml_tensor *, ggml_tensor *), void * user_data) {
     const int n = gf->n_nodes;
 
     std::vector<node_info> nodes;
@@ -594,7 +655,78 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
 
 #if 1
     // reorder to improve concurrency
-    const auto order = ggml_metal_graph_optimize_reorder(nodes);
+    std::vector<int> level;
+    const auto order = ggml_metal_graph_optimize_levels(nodes, level);
+
+    // the nodes of a level run together: keep the sources of a level allocated until its last node,
+    // else the allocator gives their memory to a later node of the same level and the encoder must put a barrier
+    if (add_alloc_dep != nullptr) {
+        // the last node of each level in the new order
+        std::unordered_map<int, int> last;
+        for (const int i : order) {
+            if (!nodes[i].is_empty()) {
+                last[level[i]] = i;
+            }
+        }
+
+        // the last level that uses each tensor of the compute buffer, and the last node of that level that uses it
+        std::unordered_map<ggml_tensor *, std::pair<int, int>> use;
+        std::vector<ggml_tensor *> used; // in the order of the first use
+        const auto keep = [&](ggml_tensor * t, int i) {
+            t = t->view_src ? t->view_src : t;
+            if (t->buffer) {
+                return;
+            }
+            auto it = use.find(t);
+            if (it == use.end()) {
+                use[t] = { level[i], i };
+                used.push_back(t);
+            } else if (it->second.first <= level[i]) {
+                it->second = { level[i], i };
+            }
+        };
+
+        for (const int i : order) {
+            const node_info & node = nodes[i];
+            if (node.is_empty()) {
+                continue;
+            }
+
+            // the sources from outside of the fused group
+            const auto add_srcs = [&](const ggml_tensor * t) {
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (t->src[s] && !node.is_output(t->src[s])) {
+                        keep(t->src[s], i);
+                    }
+                }
+            };
+            add_srcs(node.node);
+            for (const auto * f : node.fused) {
+                add_srcs(f);
+            }
+
+            // the encoder adds the dst of each fused node to its ranges, also when the fused kernel does not write it:
+            // keep the dst of the nodes before the last one of the group allocated until the last node of the level too
+            if (!node.fused.empty()) {
+                if (!ggml_op_is_empty(node.node->op)) {
+                    keep(node.node, i);
+                }
+                for (size_t k = 0; k + 1 < node.fused.size(); ++k) {
+                    if (!ggml_op_is_empty(node.fused[k]->op)) {
+                        keep(node.fused[k], i);
+                    }
+                }
+            }
+        }
+
+        for (ggml_tensor * t : used) {
+            const int l = use[t].first;
+            const int i = use[t].second;
+            if (last[l] != i) {
+                add_alloc_dep(user_data, t, nodes[last[l]].dst());
+            }
+        }
+    }
 #else
     std::vector<int> order(nodes.size());
     for (size_t i = 0; i < nodes.size(); i++) {

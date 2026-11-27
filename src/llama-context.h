@@ -296,6 +296,9 @@ private:
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
+    // ggml_backend_sched gate callback, the slot maps of the MoE cache are copied while their split waits
+    static bool sched_gate_experts(ggml_backend_t backend, const ggml_tensor * src, void * user_data);
+
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
@@ -412,9 +415,13 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend_kv  = nullptr; // kv_gpu: the attention of the full-attention layers, owned by backends
 
-    // kv_gpu: keeps the GPUs awake during each graph and keep_awake_us after it (LLAMA_KV_REMOTE_KEEP_AWAKE_MS)
+    // kv_gpu and LongHaul: keeps the GPUs awake during each graph and keep_awake_us after it
+    // (LLAMA_KV_REMOTE_KEEP_AWAKE_MS, LLAMA_LONGHAUL_KEEP_AWAKE_MS, 0 disables)
     std::vector<std::pair<ggml_backend_dev_t, ggml_backend_dev_keep_awake_t>> keep_awake_fns;
     int64_t keep_awake_us = 0;
+
+    // keep_awake_us from the environment variable env_name in ms (100 ms if not set), and the keep awake functions of the devices
+    void keep_awake_init(const char * env_name);
     std::vector<ggml_backend_ptr> backends;
 
     // training

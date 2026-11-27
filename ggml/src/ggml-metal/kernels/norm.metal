@@ -236,6 +236,85 @@ typedef decltype(kernel_l2_norm_impl<float, float>) kernel_l2_norm_t;
 template [[host_name("kernel_l2_norm_f32_f32")]]   kernel kernel_l2_norm_t kernel_l2_norm_impl<float,  float>;
 template [[host_name("kernel_l2_norm_f32_f32_4")]] kernel kernel_l2_norm_t kernel_l2_norm_impl<float4, float4>;
 
+constant bool FC_l2_norm_pre  [[function_constant(FC_L2_NORM + 0)]];
+constant bool FC_l2_norm_post [[function_constant(FC_L2_NORM + 1)]];
+
+// x*v (FC_l2_norm_pre), then L2_NORM, then SCALE, then times t (FC_l2_norm_post), as the separate MUL, L2_NORM, SCALE and
+// MUL kernels compute it: the sum is as in kernel_l2_norm_impl, each product is rounded, no reassociation, no fma
+template <typename T>
+kernel void kernel_l2_norm_fuse_impl(
+        constant ggml_metal_kargs_l2_norm_fuse & args,
+        device const char * src0,
+        device const char * srcv,
+        device const char * srct,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i03 = tgpig.z;
+    const int i02 = tgpig.y;
+    const int i01 = tgpig.x;
+
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    device const T * x = (device const T *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const T * v = (device const T *) (srcv + (i03%args.nev3)*args.nbv3 + (i02%args.nev2)*args.nbv2 + (i01%args.nev1)*args.nbv1);
+    device       T * y = (device       T *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    // the input of the norm, the output of the MUL kernel
+    auto xv = [&](int i00) -> T {
+#pragma clang fp reassociate(off)
+#pragma METAL fp contract(off)
+        return FC_l2_norm_pre ? x[i00]*v[i00] : x[i00];
+    };
+
+    float sumf = 0.0f;
+
+    // parallel sum
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+        const T m = xv(i00);
+        sumf += dot(m, m);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float scale = 1.0f/max(sqrt(sumf), args.eps);
+
+    const float tv = FC_l2_norm_post ?
+        *((device const float *) (srct + (i03%args.net3)*args.nbt3 + (i02%args.net2)*args.nbt2 + (i01%args.net1)*args.nbt1)) : 1.0f;
+
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
+#pragma clang fp reassociate(off)
+#pragma METAL fp contract(off)
+        T r = xv(i00) * scale;
+        r = args.scale * r + args.bias;
+        if (FC_l2_norm_post) {
+            r = r * tv;
+        }
+        y[i00] = r;
+    }
+}
+
+typedef decltype(kernel_l2_norm_fuse_impl<float>) kernel_l2_norm_fuse_t;
+
+template [[host_name("kernel_l2_norm_fuse_f32")]]   kernel kernel_l2_norm_fuse_t kernel_l2_norm_fuse_impl<float>;
+template [[host_name("kernel_l2_norm_fuse_f32_4")]] kernel kernel_l2_norm_fuse_t kernel_l2_norm_fuse_impl<float4>;
+
 constant bool FC_group_norm_flat [[function_constant(FC_GROUP_NORM + 0)]];
 
 kernel void kernel_group_norm_f32(

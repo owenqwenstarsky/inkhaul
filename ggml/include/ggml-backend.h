@@ -257,6 +257,9 @@ extern "C" {
     // Keep the device awake for the next us microseconds, so that it starts quickly after a short wait on an event
     // (a GPU that sleeps between the steps of a tensor parallel all-reduce loses about 100 us per step)
     typedef void                         (*ggml_backend_dev_keep_awake_t)(ggml_backend_dev_t device, int64_t us);
+    // True if the tensor get and set of the buffers of buft are plain memory copies, which do not use the queue of the device
+    // (proc "ggml_backend_buft_is_shared", see ggml_backend_sched_gate_callback)
+    typedef bool                         (*ggml_backend_buft_is_shared_t)(ggml_backend_buffer_type_t buft);
 
     //
     // Backend registry
@@ -358,6 +361,13 @@ extern "C" {
     // `graph` is the compute graph of the split
     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
+    // Callback that asks if the copy callback of a host weight can run while its split waits in the queue of the backend
+    // if it returns true for all the host weights of a split, the split is queued behind a host event before the copy callback runs,
+    // so that the backend can start the split as soon as the callback returns
+    // the copy callback then runs after the earlier work of the backend is complete, and it must not synchronize the backend
+    // or queue work on it (see ggml_backend_sched_copy_gated)
+    typedef bool (*ggml_backend_sched_gate_callback)(ggml_backend_t backend, const struct ggml_tensor * src, void * user_data);
+
     // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
     // it happens on the graph allocation path and costs a synchronization of the backends
     // `sched` is the scheduler
@@ -411,6 +421,12 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+
+    // Set a callback that selects the host weights whose copy callback runs while their split waits (needs host events, see ggml_backend_event_arm_host)
+    GGML_API void                 ggml_backend_sched_set_gate_callback(ggml_backend_sched_t sched, ggml_backend_sched_gate_callback callback, void * user_data);
+
+    // true while the copy callback runs for a split that waits in the queue of the backend
+    GGML_API bool                 ggml_backend_sched_copy_gated(ggml_backend_sched_t sched);
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);

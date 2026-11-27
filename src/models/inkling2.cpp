@@ -238,6 +238,21 @@ ggml_tensor * llama_model_inkling2::graph::conv_weight(ggml_tensor * weight, flo
     return res;
 }
 
+// the scale of a conv, so that the taps and the residual add to unit variance
+float llama_model_inkling2::graph::conv_scale(bool dynamic) const {
+    return 1.0f/sqrtf((dynamic ? 2 : 1)*hparams.n_shortconv_l_cache + 1);
+}
+
+// the bias table of a layer padded with the zero row of the far distance, built once per table
+ggml_tensor * llama_model_inkling2::graph::rel_bias(ggml_tensor * table, int il) {
+    ggml_tensor *& res = rel_biases[table];
+    if (!res) {
+        res = ggml_pad(ctx0, table, 0, 1, 0, 0);
+        pin_kv(res, il);
+    }
+    return res;
+}
+
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
 // the last n_conv - 1 inputs of each sequence live in the recurrent state at channel offset `offset`
 ggml_tensor * llama_model_inkling2::graph::convolve(
@@ -253,7 +268,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
-    const float scale = 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1);
+    const float scale = conv_scale(dynamic != nullptr);
 
     cur = ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs);
 
@@ -263,7 +278,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
 
-    ggml_tensor * out = ggml_reshape_2d(ctx0, ggml_ssm_conv(ctx0, x, conv_weight(weight, scale)), n_channels, n_tokens);
+    // the conv right after the store of its state, so that the backend can run the concat, the store and the conv as one op
+    ggml_tensor * out = ggml_ssm_conv(ctx0, x, conv_weight(weight, scale));
+    ggml_build_forward_expand(gf, out);
+    out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
 
     if (dynamic) {
         const int64_t n_heads = dynamic->ne[0]/n_conv;
@@ -273,7 +291,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         // the inputs as rows [n_channels, n_conv - 1 + n_seq_tokens, n_seqs]: the window of a lag is a shifted view
         ggml_tensor * rows = ggml_concat(ctx0, ggml_transpose(ctx0, past), cur, 1);
 
-        // all products first, so that the adds form one chain
+        // all products first, so that the adds form one chain: the products go in the graph before the adds,
+        // else the graph has them in the order of the adds and each add waits for the product after it
         std::vector<ggml_tensor *> terms(n_conv);
         for (int64_t lag = 0; lag < n_conv; ++lag) {
             ggml_tensor * tap    = ggml_view_4d(ctx0, dynamic, 1, n_heads, n_seq_tokens, n_seqs,
@@ -282,7 +301,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
                     (n_channels/n_heads)*rows->nb[0], rows->nb[1], rows->nb[2], (n_conv - 1 - lag)*rows->nb[1]);
 
             terms[lag] = ggml_reshape_2d(ctx0, ggml_mul(ctx0, window, tap), n_channels, n_tokens);
+            ggml_build_forward_expand(gf, terms[lag]);
         }
+        ggml_build_forward_expand(gf, out);
         for (ggml_tensor * term : terms) {
             out = ggml_add(ctx0, out, term);
         }
@@ -300,10 +321,21 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     ggml_tensor * gate = ggml_concat(ctx0, normed, ggml_rms_norm(ctx0, message, 1e-6f), 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
+    // the projections first, so that the element-wise ops after them are one group in the graph (one kernel in some backends)
+    ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
+    ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
+    ggml_build_forward_expand(gf, gain);
+    ggml_build_forward_expand(gf, forget);
+    ggml_build_forward_expand(gf, cur);
+    ggml_build_forward_expand(gf, message);
 
-    return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    gain   = ggml_tanh(ctx0, gain);
+    forget = ggml_tanh(ctx0, forget);
+
+    ggml_tensor * res = ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    ggml_build_forward_expand(gf, res);
+
+    return res;
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {
@@ -319,7 +351,26 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
 
+    // the embeddings first: with host token embeddings, a host split before the first device split
+    // does not wait for the device (the scheduler waits for the device before a split without inputs on another backend)
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
+    ggml_build_forward_expand(gf, cur);
+
+    // the tensors that come from the weights alone go next, so that a layer does not wait for them in its chain of ops
+    // a bias table on a remote KV device stays in the layer, so that it does not add a split on that device
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = model.layers[il];
+
+        const bool dynamic = !hparams.is_swa(il);
+        ggml_build_forward_expand(gf, conv_weight(layer.attn_k_conv,    conv_scale(dynamic)));
+        ggml_build_forward_expand(gf, conv_weight(layer.attn_v_conv,    conv_scale(dynamic)));
+        ggml_build_forward_expand(gf, conv_weight(layer.attn_post_conv, conv_scale(false)));
+        ggml_build_forward_expand(gf, conv_weight(layer.ffn_post_conv,  conv_scale(false)));
+
+        if (backend_kv == nullptr || !model.kv_remote(il)) {
+            ggml_build_forward_expand(gf, rel_bias(layer.attn_rel_bias, il));
+        }
+    }
 
     // important: do not normalize raw embeddings input (i.e. encoded image embeddings)
     if (ubatch.token) {
@@ -417,12 +468,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         // the table is [n_head*n_tokens, n_extent + 1], so the heads of one distance and token are a contiguous row for get_rows
         // with kv_gpu the bias is built on the KV device (pin_kv), from the small Rcur and sinks, so it does not cross the link
-        ggml_tensor *& rel_bias = rel_biases[layer.attn_rel_bias];
-        if (!rel_bias) {
-            rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
-            pin_kv(rel_bias, il);
-        }
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head*n_tokens), rel_bias);
+        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head*n_tokens),
+                rel_bias(layer.attn_rel_bias, il));
         pin_kv(table, il);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
@@ -454,7 +501,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (ip % hparams.attn_res_block_size == 0) {
         blocks.push_back(inpSA);
     } else {
+        // right after the conv, so that the backend can add the residual in the conv
         cur = ggml_add(ctx0, inpSA, cur);
+        ggml_build_forward_expand(gf, cur);
     }
 
     ggml_tensor * ffn_inp = cur;
@@ -485,7 +534,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
     cb(cur, "ffn_out", il);
 
+    // right after the conv, so that the backend can add the residual in the conv
     cur = ggml_add(ctx0, ffn_inp, cur);
+    ggml_build_forward_expand(gf, cur);
     cb(cur, "l_out", il);
 
     return cur;

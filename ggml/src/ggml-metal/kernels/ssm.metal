@@ -67,6 +67,69 @@ kernel void kernel_ssm_conv_f32_f32_4(
 }
 
 constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
+constant bool  FC_ssm_conv_use4 [[function_constant(FC_SSM_CONV + 3)]];
+constant bool  FC_ssm_conv_add  [[function_constant(FC_SSM_CONV + 4)]];
+
+// SSM_CONV of sx = concat(past, cur) with the copy of the last nc - 1 columns of sx to the state, without sx in memory
+// with FC_ssm_conv_add, dst is the residual plus the conv, as an ADD after the conv
+// the sums are as in kernel_ssm_conv_f32_f32_4 (use4) or in the scalar kernels, so that the result is the same
+// one thread per channel and token, the thread of the last token writes the state
+kernel void kernel_ssm_conv_state_f32(
+        constant ggml_metal_kargs_ssm_conv_state & args,
+        device const char * past,
+        device const char * cur,
+        device const char * w,
+        device       char * dst,
+        device       char * state,
+        device const char * res,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int ir = tgpig.x*ntg.x + tpitg.x;
+    const int it = tgpig.y;
+    const int is = tgpig.z;
+
+    if (ir >= args.nr) {
+        return;
+    }
+
+    const int nc = FC_ssm_conv_nc;
+
+    // column j of the window of token it, a column of sx
+    auto sx = [&](int j) -> float {
+        const int col = it + j;
+        return col < nc - 1 ?
+            *((device const float *) (past + col*args.nbp0 + ir*args.nbp1 + is*args.nbp2)) :
+            *((device const float *) (cur  + (col - (nc - 1))*args.nbc0 + ir*args.nbc1 + is*args.nbc2));
+    };
+
+    device const float * c = (device const float *) (w + ir*args.nbw1);
+
+    float sumf = 0.0f;
+
+    if (FC_ssm_conv_use4) {
+        FOR_UNROLL (int i0 = 0; i0 < nc/4; ++i0) {
+            const float4 s4 = float4(sx(4*i0 + 0), sx(4*i0 + 1), sx(4*i0 + 2), sx(4*i0 + 3));
+            sumf += dot(s4, ((device const float4 *) c)[i0]);
+        }
+    } else {
+        FOR_UNROLL (int i0 = 0; i0 < nc; ++i0) {
+            sumf += sx(i0) * c[i0];
+        }
+    }
+
+    if (FC_ssm_conv_add) {
+        sumf = *((device const float *) (res + ir*args.nbr0 + it*args.nbr1 + is*args.nbr2)) + sumf;
+    }
+
+    *((device float *) (dst + ir*args.nb0 + it*args.nb1 + is*args.nb2)) = sumf;
+
+    if (it == args.nt - 1) {
+        for (int j = 0; j < nc - 1; ++j) {
+            *((device float *) (state + (ir*(nc - 1) + j)*args.nbs0 + is*args.nbs1)) = sx(j + 1);
+        }
+    }
+}
 
 // Batched version: each threadgroup processes multiple tokens for better efficiency
 // Thread layout: each thread handles one token, threadgroup covers BATCH_SIZE tokens

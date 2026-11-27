@@ -132,6 +132,7 @@
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
 #define FC_GROUP_NORM                  2500
+#define FC_L2_NORM                     2600
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -676,6 +677,32 @@ typedef struct {
     float    eps;
 } ggml_metal_kargs_l2_norm;
 
+// L2_NORM of x (times the row v before it, if FC_l2_norm_pre), then SCALE, then times one value t per row (if FC_l2_norm_post)
+typedef struct {
+    int32_t  ne00; // elements of a row of x, in float4 for the c4 kernel
+    uint64_t nb01; // x [ne00, ne01, ne02, ne03]
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  nev1; // v [ne00, nev1, nev2, nev3], repeated over the rows of x
+    int32_t  nev2;
+    int32_t  nev3;
+    uint64_t nbv1;
+    uint64_t nbv2;
+    uint64_t nbv3;
+    int32_t  net1; // t [1, net1, net2, net3], repeated over the rows of x
+    int32_t  net2;
+    int32_t  net3;
+    uint64_t nbt1;
+    uint64_t nbt2;
+    uint64_t nbt3;
+    uint64_t nb1;  // dst in the shape of x
+    uint64_t nb2;
+    uint64_t nb3;
+    float    eps;
+    float    scale;
+    float    bias;
+} ggml_metal_kargs_l2_norm_fuse;
+
 typedef struct {
     int64_t  ne00;
     int64_t  ne01;
@@ -714,6 +741,61 @@ typedef struct {
     int32_t T;
     int32_t C;
 } ggml_metal_kargs_snake;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nbg1;
+    uint64_t nbg2;
+    uint64_t nbu1;
+    uint64_t nbu2;
+    uint64_t nb1;
+    uint64_t nb2;
+    float    s0; // the scales of s1*tanh(s0*g)*sigmoid(g) * s3*tanh(s2*u)
+    float    s1;
+    float    s2;
+    float    s3;
+    uint64_t nbs1; // the scale per row of the scaled variant
+    uint64_t nbs2;
+} ggml_metal_kargs_situ;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nbf1; // f, the gate of the row
+    uint64_t nbf2;
+    uint64_t nbg1; // g, the gate of the message
+    uint64_t nbg2;
+    uint64_t nbc1; // c, the row
+    uint64_t nbc2;
+    uint64_t nbm1; // m, the message
+    uint64_t nbm2;
+    uint64_t nb1;
+    uint64_t nb2;
+} ggml_metal_kargs_ctrl_mix;
+
+typedef struct {
+    int32_t  nr;   // channels
+    int32_t  nt;   // tokens per sequence
+    int32_t  ns;   // sequences
+    uint64_t nbp0; // past [nc - 1, nr, ns], the first source of the concat
+    uint64_t nbp1;
+    uint64_t nbp2;
+    uint64_t nbc0; // cur [nt, nr, ns], the second source of the concat
+    uint64_t nbc1;
+    uint64_t nbc2;
+    uint64_t nbw1; // conv weights [nc, nr]
+    uint64_t nb0;  // dst [nr, nt, ns]
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nbr0; // residual in the shape of dst, if FC_ssm_conv_add
+    uint64_t nbr1;
+    uint64_t nbr2;
+    uint64_t nbs0; // state [(nc - 1)*nr, ns], the destination of the copy
+    uint64_t nbs1;
+} ggml_metal_kargs_ssm_conv_state;
 
 typedef struct {
     int32_t  IC;
@@ -944,6 +1026,24 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
 } ggml_metal_kargs_soft_max;
+
+// SOFT_MAX without a mask of the rows of the transpose of c = concat(a, b, 1): row (i01, i02, i03) is c[i01, :, i02, i03]
+typedef struct {
+    int32_t  ne00; // elements of a row, the rows of a and b in the concat
+    int32_t  na;   // rows of a in the concat
+    uint64_t nba0; // a
+    uint64_t nba1;
+    uint64_t nba2;
+    uint64_t nba3;
+    uint64_t nbb0; // b
+    uint64_t nbb1;
+    uint64_t nbb2;
+    uint64_t nbb3;
+    uint64_t nb1;  // dst [ne00, ne01, ne02, ne03]
+    uint64_t nb2;
+    uint64_t nb3;
+    float    scale;
+} ggml_metal_kargs_soft_max_concat;
 
 typedef struct {
     int64_t  ne00;

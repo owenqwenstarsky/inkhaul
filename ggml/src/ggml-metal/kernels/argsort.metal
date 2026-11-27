@@ -7,6 +7,7 @@ constant int  FC_topk_moe_gating    [[function_constant(FC_TOPK_MOE + 3)]];
 constant bool FC_topk_moe_pbias     [[function_constant(FC_TOPK_MOE + 4)]];
 
 constant int  FC_moe_reduce_n_expert_used [[function_constant(FC_MOE_REDUCE + 0)]];
+constant bool FC_moe_reduce_scaled        [[function_constant(FC_MOE_REDUCE + 1)]];
 
 // bitonic sort implementation following the CUDA kernels as reference
 typedef void (argsort_t)(
@@ -568,12 +569,14 @@ kernel void kernel_topk_moe_f32(
 }
 
 // fused MoE expert weighting + reduction: weighted = sum(experts[e] * weights[e]).
+// with FC_moe_reduce_scaled, each row of experts is first multiplied by its scale, as a MUL before the reduction.
 // The host guarantees all tensors are contiguous F32.
 kernel void kernel_moe_reduce_f32(
         constant   ggml_metal_kargs_moe_reduce & args,
         device const float * experts,
         device const float * weights,
         device       float * dst,
+        device const float * scales,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
@@ -588,7 +591,11 @@ kernel void kernel_moe_reduce_f32(
     const int64_t base = token * (int64_t) n_expert_used * args.ne00 + col;
     float sum = 0.0f;
     FOR_UNROLL (int e = 0; e < n_expert_used; ++e) {
-        sum += experts[base + e * args.ne00] * weights[token * n_expert_used + e];
+        float x = experts[base + e * args.ne00];
+        if (FC_moe_reduce_scaled) {
+            x = x * scales[token * n_expert_used + e];
+        }
+        sum += x * weights[token * n_expert_used + e];
     }
     dst[token * args.ne00 + col] = sum;
 }

@@ -359,15 +359,7 @@ llama_context::llama_context(
 
             // each GPU waits for the other at every full-attention layer, and an Apple GPU that waits more than
             // about 50 us sleeps and starts again 100-200 us late, so keep the GPUs awake while graphs come
-            const char * env = getenv("LLAMA_KV_REMOTE_KEEP_AWAKE_MS");
-            keep_awake_us = (env != nullptr ? (int64_t) atoll(env) : 100)*1000;
-            for (const auto & dev : model.devices) {
-                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
-                auto fn = reg ? (ggml_backend_dev_keep_awake_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_keep_awake") : nullptr;
-                if (fn != nullptr && keep_awake_us > 0) {
-                    keep_awake_fns.emplace_back(dev.dev, fn);
-                }
-            }
+            keep_awake_init("LLAMA_KV_REMOTE_KEEP_AWAKE_MS");
         }
 
         // add CPU backend
@@ -492,6 +484,11 @@ llama_context::llama_context(
                     LLAMA_LOG_WARN("%s: n_ubatch = %u is reduced to %" PRId64 " to fit the LongHaul cache, a larger cache gives faster prompt processing\n",
                         __func__, cparams.n_ubatch, max_ubatch);
                     cparams.n_ubatch = (uint32_t) max_ubatch;
+                }
+
+                // the GPU waits for the cache at every MoE layer, the same as for kv_gpu above
+                if (keep_awake_fns.empty()) {
+                    keep_awake_init("LLAMA_LONGHAUL_KEEP_AWAKE_MS");
                 }
             } else if (getenv("LLAMA_LONGHAUL_RESIDENT") != nullptr) {
                 LLAMA_LOG_WARN("%s: LLAMA_LONGHAUL_RESIDENT is set, the experts are read from the mapped file without a RAM bound (for tests)\n", __func__);
@@ -639,6 +636,21 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+void llama_context::keep_awake_init(const char * env_name) {
+    const char * env = getenv(env_name);
+    keep_awake_us = (env != nullptr ? (int64_t) atoll(env) : 100)*1000;
+    if (keep_awake_us <= 0) {
+        return;
+    }
+    for (const auto & dev : model.devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
+        auto fn = reg ? (ggml_backend_dev_keep_awake_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_keep_awake") : nullptr;
+        if (fn != nullptr) {
+            keep_awake_fns.emplace_back(dev.dev, fn);
+        }
+    }
+}
+
 void llama_context::sched_new(const sched_params & params) {
     // reusing the scheduler avoids reallocating its buffers (incl. the compute buffers)
     if (sched && params.can_reuse(sched_params_cur)) {
@@ -651,6 +663,7 @@ void llama_context::sched_new(const sched_params & params) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    ggml_backend_sched_set_gate_callback(sched.get(), sched_gate_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     sched_params_cur = params;
@@ -2764,11 +2777,18 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+bool llama_context::sched_gate_experts(ggml_backend_t backend, const ggml_tensor * src, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    return lctx->moe_cache && lctx->moe_cache->can_gate(src);
+
+    GGML_UNUSED(backend);
+}
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, ggml_backend_sched_copy_gated(lctx->sched.get()))) {
         return true;
     }
 

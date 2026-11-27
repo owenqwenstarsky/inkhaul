@@ -513,6 +513,98 @@ typedef decltype(kernel_count_equal<int32_t>) kernel_count_equal_t;
 
 template [[host_name("kernel_count_equal_i32")]] kernel kernel_count_equal_t kernel_count_equal<int32_t>;
 
+// s1*tanh(s0*g)*sigmoid(g) * s3*tanh(s2*u), as the separate scale, tanh, sigmoid and mul kernels compute it
+// one threadgroup per row of [ne0, ne1, ne2], g and u are rows of their own strides (the halves of a merged gate_up)
+kernel void kernel_situ_f32(
+        constant ggml_metal_kargs_situ & args,
+        device const char * g,
+        device const char * u,
+        device       char * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    // each product is rounded as in the separate kernels: no reassociation of the scales, no fma
+#pragma clang fp reassociate(off)
+#pragma METAL fp contract(off)
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y;
+
+    device const float * g_row = (device const float *) (g   + i1*args.nbg1 + i2*args.nbg2);
+    device const float * u_row = (device const float *) (u   + i1*args.nbu1 + i2*args.nbu2);
+    device       float * d_row = (device       float *) (dst + i1*args.nb1  + i2*args.nb2);
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const float x = g_row[i0];
+        const float a = args.s1*precise::tanh(args.s0*x);
+        const float b = 1/(1 + exp(-x));
+        const float c = args.s3*precise::tanh(args.s2*u_row[i0]);
+        d_row[i0] = (a*b)*c;
+    }
+}
+
+// (c - tanh(f)*c) + tanh(g)*m, as the separate tanh, mul, sub and add kernels compute it: no reassociation, no fma
+// one threadgroup per row of [ne0, ne1, ne2]
+kernel void kernel_ctrl_mix_f32(
+        constant ggml_metal_kargs_ctrl_mix & args,
+        device const char * f,
+        device const char * g,
+        device const char * c,
+        device const char * m,
+        device       char * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+#pragma clang fp reassociate(off)
+#pragma METAL fp contract(off)
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y;
+
+    device const float * f_row = (device const float *) (f   + i1*args.nbf1 + i2*args.nbf2);
+    device const float * g_row = (device const float *) (g   + i1*args.nbg1 + i2*args.nbg2);
+    device const float * c_row = (device const float *) (c   + i1*args.nbc1 + i2*args.nbc2);
+    device const float * m_row = (device const float *) (m   + i1*args.nbm1 + i2*args.nbm2);
+    device       float * d_row = (device       float *) (dst + i1*args.nb1  + i2*args.nb2);
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const float cv = c_row[i0];
+        const float pf = precise::tanh(f_row[i0])*cv;
+        const float pg = precise::tanh(g_row[i0])*m_row[i0];
+        const float sv = cv - pf;
+        d_row[i0] = sv + pg;
+    }
+}
+
+// kernel_situ_f32 of g*sc and u*sc, where sc is one scale per row (the MUL of the expert scales of the merged gate_up)
+kernel void kernel_situ_scaled_f32(
+        constant ggml_metal_kargs_situ & args,
+        device const char * g,
+        device const char * u,
+        device       char * dst,
+        device const char * sc,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    // each product is rounded as in the separate kernels: no reassociation of the scales, no fma
+#pragma clang fp reassociate(off)
+#pragma METAL fp contract(off)
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y;
+
+    device const float * g_row = (device const float *) (g   + i1*args.nbg1 + i2*args.nbg2);
+    device const float * u_row = (device const float *) (u   + i1*args.nbu1 + i2*args.nbu2);
+    device       float * d_row = (device       float *) (dst + i1*args.nb1  + i2*args.nb2);
+
+    const float sv = *((device const float *) (sc + i1*args.nbs1 + i2*args.nbs2));
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const float x = g_row[i0]*sv;
+        const float a = args.s1*precise::tanh(args.s0*x);
+        const float b = 1/(1 + exp(-x));
+        const float c = args.s3*precise::tanh(args.s2*(u_row[i0]*sv));
+        d_row[i0] = (a*b)*c;
+    }
+}
+
 template <typename T>
 kernel void kernel_snake(
         constant ggml_metal_kargs_snake & args,
