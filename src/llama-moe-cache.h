@@ -64,8 +64,12 @@ public:
     // call before each graph compute: with the expert split, moves experts between the devices toward the target shares
     void begin_graph();
 
+    // ggml_backend_sched gate callback: true if the copy of slot map src can run while its split waits in the queue of the backend
+    bool can_gate(const ggml_tensor * src) const;
+
     // ggml_backend_sched copy callback, returns false if src is not a slot map
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+    // gated: the split waits in the queue of the backend, so the backend must not be synchronized (see ggml_backend_sched_copy_gated)
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool gated);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

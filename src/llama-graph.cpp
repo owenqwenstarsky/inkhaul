@@ -1257,9 +1257,16 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
-        ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids);
+        ggml_tensor * s;
+        if (ggml_is_contiguous(ids)) {
+            // one gather by all the ids, without a copy of the scales per token
+            s = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, w_s, 1, n_expert), ggml_reshape_1d(ctx0, ids, ggml_nelements(ids)));
+            s = ggml_reshape_3d(ctx0, s, 1, ids->ne[0], ids->ne[1]);
+        } else {
+            s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+            s = ggml_get_rows(ctx0, s, ids);
+        }
         res = ggml_mul(ctx0, res, s);
     }
     for (const auto & lora : *loras) {

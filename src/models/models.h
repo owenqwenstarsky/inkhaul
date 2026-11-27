@@ -166,9 +166,11 @@ struct llama_model_inkling2 : public llama_model_base {
         std::map<std::pair<const ggml_tensor *, float>, ggml_tensor *> conv_weights;
         ggml_tensor * conv_last = nullptr; // [n_conv] 1 at the last tap, 0 elsewhere
         ggml_tensor * conv_weight(ggml_tensor * weight, float scale);
+        float conv_scale(bool dynamic) const;
 
         // per graph: the bias tables padded with the zero row of the far distance, and the zero sinks per head count
         std::map<const ggml_tensor *, ggml_tensor *> rel_biases;
+        ggml_tensor * rel_bias(ggml_tensor * table, int il);
         std::map<int64_t, ggml_tensor *> zero_sinks_of;
     };
 

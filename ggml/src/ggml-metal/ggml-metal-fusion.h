@@ -22,6 +22,9 @@ struct ggml_metal_device_props;
 // (also the maximum length of a packed fusion group during graph optimization)
 #define GGML_METAL_FUSION_MAX 16
 
+// the maximum number of raw nodes of a pattern or of a packed fusion group, with the views
+#define GGML_METAL_FUSION_MAX_RAW 32
+
 typedef enum ggml_metal_fusion_mode {
     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
     // already are); a check may skip conditions that differ between batch sizes, and so accept more than FULL
@@ -43,6 +46,14 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_MUL_MAT_SCALE, // MUL_MAT + MUL by one f32 value (q8_0 weight scale in the mat-vec store)
+    GGML_METAL_FUSION_SITU,         // SCALE + TANH + SCALE + SIGMOID + MUL + SCALE + TANH + SCALE + MUL (SiTU gate)
+    GGML_METAL_FUSION_SITU_SCALED,  // MUL (expert scale of the merged gate_up) + the SiTU gate
+    GGML_METAL_FUSION_MOE_REDUCE_SCALED, // MUL (expert scale of the down projection) + MOE_REDUCE
+    GGML_METAL_FUSION_CTRL_MIX,     // TANH + MUL + SUB + TANH + MUL + ADD: (c - tanh(f)*c) + tanh(g)*m
+    GGML_METAL_FUSION_SSM_CONV_STATE, // CONCAT + CPY + SSM_CONV (+ ADD): short conv with the store of its state (and a residual)
+    GGML_METAL_FUSION_L2_NORM_CLIP, // (MUL +) L2_NORM + SCALE (+ MUL): clip of the row norm, with a channel scale before and a row scale after
+    GGML_METAL_FUSION_SOFT_MAX_CONCAT, // CONCAT + PERMUTE + CONT + SOFT_MAX (or CONCAT + RESHAPE + SOFT_MAX): softmax over the concat axis
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

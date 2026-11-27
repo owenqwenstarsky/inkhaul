@@ -89,6 +89,7 @@ static ggml_tensor * new_add_operand(ggml_context * ctx, ggml_context * ctx_w, a
 
 // the reordered positions of a mat-mul with rows src1 rows, the add of an operand of kind to it and an independent
 // mat-mul, which the reorder runs between the first mat-mul and the add unless the pair is packed
+// a scale uses the independent mat-mul, so that the reorder cannot move the independent mat-mul after the add
 static std::vector<int> reorder_mul_mat_add(int64_t rows, add_operand_kind kind) {
     ggml_init_params params = { n_tensors*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx   = ggml_init(params);
@@ -97,12 +98,13 @@ static std::vector<int> reorder_mul_mat_add(int64_t rows, add_operand_kind kind)
     ggml_tensor * mm    = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_k, n_m), x);
     ggml_tensor * add   = ggml_add(ctx, mm, new_add_operand(ctx, ctx_w, kind, rows));
     ggml_tensor * other = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_k, n_m), x);
+    ggml_tensor * use   = ggml_scale(ctx, other, 2.0f);
     ggml_backend_buffer_t weights = alloc_weights(ctx_w);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, add);
-    ggml_build_forward_expand(graph, other);
-    ggml_graph_optimize(graph);
+    ggml_build_forward_expand(graph, use);
+    ggml_graph_optimize(graph, nullptr, nullptr);
     const std::vector<int> res = node_positions(graph, { mm, add, other });
 
     ggml_backend_buffer_free(weights);
@@ -221,7 +223,7 @@ static void expand_all(ggml_cgraph * graph, const std::vector<ggml_tensor *> & o
 static ggml_cgraph * optimized_graph(ggml_context * ctx, const std::vector<ggml_tensor *> & outputs) {
     ggml_cgraph * graph = ggml_new_graph(ctx);
     expand_all(graph, outputs);
-    ggml_graph_optimize(graph);
+    ggml_graph_optimize(graph, nullptr, nullptr);
     return graph;
 }
 

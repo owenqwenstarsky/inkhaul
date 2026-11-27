@@ -424,6 +424,7 @@ struct llama_moe_cache::impl {
         ggml_backend_buffer_type_t buft;
         std::string name; // of the device, the stats at exit come after the backends are freed
         bool is_rpc = false;
+        bool gate_safe = false; // the copy of a slot map uses plain memory copies only, so it can run while the split waits (see can_gate)
         size_t host_bytes = 0; // experts on disk of the layers it caches (the owned ones with the expert split)
         double split = 0.0;    // share of the budget
         bool   named = false;  // its budget is set by the per-device sizes
@@ -963,6 +964,16 @@ struct llama_moe_cache::impl {
             open_server_files();
         }
 
+        // the gated copy gets the selected experts and sets the slot map (compute buffers of the backend) and the banks:
+        // these must be plain memory copies, which do not queue work behind the split that waits for the copy
+        for (device & d : devices) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto is_shared = reg ? (ggml_backend_buft_is_shared_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_shared") : nullptr;
+            d.gate_safe = !d.is_rpc && d.server_files.empty() && is_shared != nullptr &&
+                is_shared(d.buft) && is_shared(ggml_backend_get_default_buffer_type(d.backend));
+        }
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -1159,7 +1170,16 @@ struct llama_moe_cache::impl {
         return it->second[dev];
     }
 
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+    bool can_gate(const ggml_tensor * src) const {
+        const auto it = layer_of.find(src);
+        if (it == layer_of.end() || split_expert) {
+            return false;
+        }
+        const device & d = devices[groups[layers[it->second.first].parts[it->second.second].ig].id];
+        return d.gate_safe;
+    }
+
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool gated) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -1203,7 +1223,10 @@ struct llama_moe_cache::impl {
 
             // this also waits for the earlier splits, so the slots they read can be refilled
             // the backend is idle after this, so the plain get and set below need no extra command (a memcpy for unified memory)
-            ggml_backend_synchronize(backend);
+            // gated: the scheduler waited for the earlier splits, and this split waits for the callback
+            if (!gated) {
+                ggml_backend_synchronize(backend);
+            }
             ids.resize(ggml_nelements(sel));
             ggml_backend_tensor_get(sel, ids.data(), 0, ggml_nbytes(sel));
 
@@ -1541,8 +1564,12 @@ void llama_moe_cache::check_op(const ggml_tensor * w, const ggml_tensor * op, in
     }
 }
 
-bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
-    return pimpl->copy(backend, src, dst, graph);
+bool llama_moe_cache::can_gate(const ggml_tensor * src) const {
+    return pimpl->can_gate(src);
+}
+
+bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, bool gated) {
+    return pimpl->copy(backend, src, dst, graph, gated);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

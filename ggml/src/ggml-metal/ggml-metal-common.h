@@ -48,7 +48,9 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * ten
 //
 // note: this implementation is generic and not specific to metal
 //       if it proves to work well, we can start using it for other backends in the future
-void ggml_graph_optimize(struct ggml_cgraph * gf);
+// reorder the nodes so that more of them run together
+// add_alloc_dep keeps a tensor allocated until a node (see ggml_backend_graph_optimize_params), it can be NULL
+void ggml_graph_optimize(struct ggml_cgraph * gf, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *), void * user_data);
 
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);

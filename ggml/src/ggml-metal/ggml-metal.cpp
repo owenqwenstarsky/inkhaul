@@ -652,7 +652,7 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
 
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    ggml_metal_graph_optimize(ctx, cgraph);
+    ggml_metal_graph_optimize(ctx, cgraph, params->add_alloc_dep, params->user_data);
 }
 
 // iOS can stop a command buffer that runs for more than a few seconds, so split the graph into shorter ones there
@@ -987,6 +987,21 @@ static void ggml_backend_metal_dev_keep_awake(ggml_backend_dev_t dev, int64_t us
     ggml_metal_device_keep_awake((ggml_metal_device_t) dev->context, us);
 }
 
+// the buffers of the mapped type are shared, the ones of the shared type are shared if the device uses shared buffers
+// (see ggml_metal_buffer_init), the tensor get and set of a private buffer use the queue of the device
+static bool ggml_backend_metal_buft_is_shared(ggml_backend_buffer_type_t buft) {
+    if (buft->iface.alloc_buffer == ggml_backend_metal_buffer_type_mapped_alloc_buffer) {
+        return true;
+    }
+    if (buft->iface.alloc_buffer != ggml_backend_metal_buffer_type_shared_alloc_buffer) {
+        return false;
+    }
+
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) buft->device->context;
+
+    return ggml_metal_device_get_props(ctx_dev)->use_shared_buffers;
+}
+
 static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t reg) {
     return g_ggml_backend_metal_features;
 
@@ -1050,6 +1065,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_dev_keep_awake") == 0) {
         return (void *)ggml_backend_metal_dev_keep_awake;
+    }
+    if (strcmp(name, "ggml_backend_buft_is_shared") == 0) {
+        return (void *)ggml_backend_metal_buft_is_shared;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

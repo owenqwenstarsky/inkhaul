@@ -597,6 +597,34 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// kernel_mul_mv_q8_0_f32, then each sum times the f32 value in sc, as a MUL after the mat-vec computes it
+// the thread that writes a sum of the threadgroup multiplies it, so it reads its own write
+[[host_name("kernel_mul_mv_q8_0_f32_scaled")]]
+kernel void kernel_mul_mv_q8_0_f32_scaled(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * sc,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+
+    if (tiisg == 0 && sgitg == 0) {
+        const float s = *((device const float *) sc);
+
+        const int r0 = tgpig.x*N_R0_Q8_0;
+
+        device float * dst_f32 = (device float *) dst + (uint64_t)tgpig.z*args.ne0*args.ne1 + (uint64_t)tgpig.y*args.ne0;
+
+        for (short row = 0; row < N_R0_Q8_0 && r0 + row < args.ne01; ++row) {
+            dst_f32[r0 + row] = dst_f32[r0 + row]*s;
+        }
+    }
+}
+
 // mat-vec kernel processing in chunks of float4
 // chpb - chunks per quantization block
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
