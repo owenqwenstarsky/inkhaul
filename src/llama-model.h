@@ -170,6 +170,36 @@ struct llama_layer {
     struct ggml_tensor * attn_res_query   = nullptr;
     struct ggml_tensor * ffn_post_conv    = nullptr;
     struct ggml_tensor * ffn_res_query    = nullptr;
+
+    // hy_v4_flash: hyper-connections
+    struct ggml_tensor * hc_attn_fn    = nullptr;
+    struct ggml_tensor * hc_attn_base  = nullptr;
+    struct ggml_tensor * hc_attn_scale = nullptr;
+    struct ggml_tensor * hc_ffn_fn     = nullptr;
+    struct ggml_tensor * hc_ffn_base   = nullptr;
+    struct ggml_tensor * hc_ffn_scale  = nullptr;
+
+    // hy_v4_flash: latent routed experts
+    struct ggml_tensor * ffn_routed_down = nullptr; // n_embd -> n_expert_latent
+    struct ggml_tensor * ffn_routed_up   = nullptr; // n_expert_latent -> n_embd
+
+    // hy_v4_flash: pooled lightning indexer
+    struct ggml_tensor * indexer_k_norm      = nullptr;
+    struct ggml_tensor * indexer_proj        = nullptr;
+    struct ggml_tensor * indexer_attn_k      = nullptr;
+    struct ggml_tensor * indexer_attn_q_b    = nullptr; // note: for lora a/b, not bias
+    struct ggml_tensor * indexer_comp_norm   = nullptr;
+    struct ggml_tensor * indexer_kpool_gate  = nullptr;
+    struct ggml_tensor * indexer_kpool_ape   = nullptr;
+    struct ggml_tensor * indexer_kpool_value = nullptr;
+
+    // hy_v4_flash: Engram
+    struct ggml_tensor * engram_kv          = nullptr;
+    struct ggml_tensor * engram_gate        = nullptr; // q_weight*k_weight folded
+    struct ggml_tensor * engram_kv_b        = nullptr;
+    struct ggml_tensor * engram_lookup_norm = nullptr;
+    struct ggml_tensor * engram_pre_gamma   = nullptr;
+    struct ggml_tensor * engram_hc_scale    = nullptr;
 };
 
 struct llama_device {
@@ -258,6 +288,20 @@ struct llama_model {
 
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * tok_norm   = nullptr;
+
+    // hy_v4_flash: hyper-connection head, Engram table
+    struct ggml_tensor * hc_head_fn         = nullptr;
+    struct ggml_tensor * hc_head_base       = nullptr;
+    struct ggml_tensor * hc_head_scale      = nullptr;
+    struct ggml_tensor * per_layer_tok_embd = nullptr;
+
+    // hy_v4_flash Engram: token id -> id of its normalized form, hashed into the n-grams
+    std::vector<int32_t> engram_token_map;
+    // hy_v4_flash Engram: n_modules*ngram_size hash multipliers
+    std::vector<uint64_t> engram_multipliers;
+
+    // lazily read tensors whose rows llama_prefetch_rows may read ahead
+    std::unordered_set<const ggml_tensor *> can_prefetch;
 
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_res_query = nullptr; // inkling2: query of the final attention-residual mix

@@ -15,6 +15,7 @@ enum llama_vocab_pre_type {
     LLAMA_VOCAB_PRE_TYPE_QWEN2      = 2,
     LLAMA_VOCAB_PRE_TYPE_QWEN35     = 3,
     LLAMA_VOCAB_PRE_TYPE_BAILINGMOE = 4,
+    LLAMA_VOCAB_PRE_TYPE_HY_V4      = 5,
 };
 
 struct LLM_KV;

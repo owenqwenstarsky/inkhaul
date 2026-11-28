@@ -38,6 +38,7 @@ endif()
 add_library(mtmd
             ${MTMD_CORE_SOURCES}
             models/models.h
+            models/hy-v4.cpp
             models/inkling2v.cpp
             models/qwen3vl.cpp
             )

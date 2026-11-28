@@ -144,6 +144,7 @@ class Keys:
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
         CLASSIFIER_FREE_GUIDANCE          = "{arch}.classifier_free_guidance"
+        EXPERT_LATENT_LENGTH              = "{arch}.expert_latent_length"
 
     class Attention:
         HEAD_COUNT                   = "{arch}.attention.head_count"
@@ -167,6 +168,8 @@ class Keys:
         VALUE_LENGTH_MLA             = "{arch}.attention.value_length_mla"
         KEY_LENGTH_SWA               = "{arch}.attention.key_length_swa"
         VALUE_LENGTH_SWA             = "{arch}.attention.value_length_swa"
+        KEY_LENGTH_MLA_SWA           = "{arch}.attention.key_length_mla_swa"
+        VALUE_LENGTH_MLA_SWA         = "{arch}.attention.value_length_mla_swa"
         SHARED_KV_LAYERS             = "{arch}.attention.shared_kv_layers"
         KV_SOURCE_MAP                = "{arch}.attention.kv_source_map"
         SLIDING_WINDOW_PATTERN       = "{arch}.attention.sliding_window_pattern"
@@ -184,9 +187,19 @@ class Keys:
             TYPES                  = "{arch}.attention.indexer.types"
             CANDIDATE_BLOCK_SIZE   = "{arch}.attention.indexer.candidate_block_size"
             CANDIDATE_TOP_K_BLOCKS = "{arch}.attention.indexer.candidate_top_k_blocks"
+            HEAD_COUNT             = "{arch}.attention.indexer.head_count"
+            KEY_LENGTH             = "{arch}.attention.indexer.key_length"
+            KPOOL                  = "{arch}.attention.indexer.kpool"
+            KPOOL_SELECT_TAIL      = "{arch}.attention.indexer.kpool_select_tail"
 
     class HyperConnection:
         COUNT                = "{arch}.hyper_connection.count"
+        EPSILON              = "{arch}.hyper_connection.epsilon"
+        MAGNITUDE            = "{arch}.hyper_connection.magnitude"
+
+    class Engram:  # hy_v4_flash; the table uses the PerLayerEmbedding keys
+        PAD_TOKEN_ID         = "{arch}.engram.pad_token_id"
+        TOKEN_MAP            = "{arch}.engram.token_map"
 
     class PerLayerEmbedding:
         LAYERS             = "{arch}.ple.layers"
@@ -394,6 +407,7 @@ class MODEL_ARCH(IntEnum):
     QWEN35           = auto()
     QWEN35MOE        = auto()
     KOLIBRI1         = auto()
+    HY_V4_FLASH      = auto()
 
 
 class MODEL_TENSOR(IntEnum):
@@ -536,6 +550,34 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_EH_PROJ          = auto()
     NEXTN_ENORM            = auto()
     NEXTN_HNORM            = auto()
+    NEXTN_SHARED_HEAD_NORM = auto()
+    # hy_v4_flash
+    HC_HEAD_FN              = auto()
+    HC_HEAD_BASE            = auto()
+    HC_HEAD_SCALE           = auto()
+    INDEXER_K_NORM          = auto()
+    INDEXER_PROJ            = auto()
+    INDEXER_ATTN_K          = auto()
+    INDEXER_ATTN_Q_B        = auto()
+    HC_ATTN_FN              = auto()
+    HC_ATTN_BASE            = auto()
+    HC_ATTN_SCALE           = auto()
+    HC_FFN_FN               = auto()
+    HC_FFN_BASE             = auto()
+    HC_FFN_SCALE            = auto()
+    FFN_ROUTED_DOWN         = auto()
+    FFN_ROUTED_UP           = auto()
+    PER_LAYER_TOKEN_EMBD    = auto()
+    ENGRAM_KV               = auto()
+    ENGRAM_GATE             = auto()
+    ENGRAM_KV_B             = auto()
+    ENGRAM_LOOKUP_NORM      = auto()
+    ENGRAM_PRE_GAMMA        = auto()
+    ENGRAM_HC_SCALE         = auto()
+    INDEXER_KPOOL_GATE      = auto()
+    INDEXER_KPOOL_APE       = auto()
+    INDEXER_KPOOL_VALUE     = auto()
+    INDEXER_COMPRESSOR_NORM = auto()
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
@@ -547,6 +589,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.QWEN35:           "qwen35",
     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
     MODEL_ARCH.KOLIBRI1:         "kolibri1",
+    MODEL_ARCH.HY_V4_FLASH:      "hy_v4_flash",
 }
 
 
@@ -690,6 +733,34 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_EH_PROJ:             "blk.{bid}.nextn.eh_proj",
     MODEL_TENSOR.NEXTN_ENORM:               "blk.{bid}.nextn.enorm",
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
+    MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+    # hy_v4_flash
+    MODEL_TENSOR.HC_HEAD_FN:              "output_hc_fn",
+    MODEL_TENSOR.HC_HEAD_BASE:            "output_hc_base",
+    MODEL_TENSOR.HC_HEAD_SCALE:           "output_hc_scale",
+    MODEL_TENSOR.INDEXER_K_NORM:          "blk.{bid}.indexer.k_norm",
+    MODEL_TENSOR.INDEXER_PROJ:            "blk.{bid}.indexer.proj",
+    MODEL_TENSOR.INDEXER_ATTN_K:          "blk.{bid}.indexer.attn_k",
+    MODEL_TENSOR.INDEXER_ATTN_Q_B:        "blk.{bid}.indexer.attn_q_b",
+    MODEL_TENSOR.HC_ATTN_FN:              "blk.{bid}.hc_attn_fn",
+    MODEL_TENSOR.HC_ATTN_BASE:            "blk.{bid}.hc_attn_base",
+    MODEL_TENSOR.HC_ATTN_SCALE:           "blk.{bid}.hc_attn_scale",
+    MODEL_TENSOR.HC_FFN_FN:               "blk.{bid}.hc_ffn_fn",
+    MODEL_TENSOR.HC_FFN_BASE:             "blk.{bid}.hc_ffn_base",
+    MODEL_TENSOR.HC_FFN_SCALE:            "blk.{bid}.hc_ffn_scale",
+    MODEL_TENSOR.FFN_ROUTED_DOWN:         "blk.{bid}.ffn_routed_down",
+    MODEL_TENSOR.FFN_ROUTED_UP:           "blk.{bid}.ffn_routed_up",
+    MODEL_TENSOR.PER_LAYER_TOKEN_EMBD:    "per_layer_token_embd",
+    MODEL_TENSOR.ENGRAM_KV:               "blk.{bid}.engram_kv",
+    MODEL_TENSOR.ENGRAM_GATE:             "blk.{bid}.engram_gate",
+    MODEL_TENSOR.ENGRAM_KV_B:             "blk.{bid}.engram_kv_b",
+    MODEL_TENSOR.ENGRAM_LOOKUP_NORM:      "blk.{bid}.engram_lookup_norm",
+    MODEL_TENSOR.ENGRAM_PRE_GAMMA:        "blk.{bid}.engram_pre_gamma",
+    MODEL_TENSOR.ENGRAM_HC_SCALE:         "blk.{bid}.engram_hc_scale",
+    MODEL_TENSOR.INDEXER_KPOOL_GATE:      "blk.{bid}.indexer_compressor_gate",
+    MODEL_TENSOR.INDEXER_KPOOL_APE:       "blk.{bid}.indexer_compressor_ape",
+    MODEL_TENSOR.INDEXER_KPOOL_VALUE:     "blk.{bid}.indexer_compressor_value",
+    MODEL_TENSOR.INDEXER_COMPRESSOR_NORM: "blk.{bid}.indexer_compressor_norm",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -978,6 +1049,67 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
     ],
+    MODEL_ARCH.HY_V4_FLASH: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.HC_HEAD_FN,
+        MODEL_TENSOR.HC_HEAD_BASE,
+        MODEL_TENSOR.HC_HEAD_SCALE,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_SINKS,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_KV_A_MQA,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_K_B,
+        MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.INDEXER_K_NORM,
+        MODEL_TENSOR.INDEXER_PROJ,
+        MODEL_TENSOR.INDEXER_ATTN_K,
+        MODEL_TENSOR.INDEXER_ATTN_Q_B,
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_SCALE,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.FFN_ROUTED_DOWN,
+        MODEL_TENSOR.FFN_ROUTED_UP,
+        MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
+        MODEL_TENSOR.ENGRAM_KV,
+        MODEL_TENSOR.ENGRAM_GATE,
+        MODEL_TENSOR.ENGRAM_KV_B,
+        MODEL_TENSOR.ENGRAM_LOOKUP_NORM,
+        MODEL_TENSOR.ENGRAM_PRE_GAMMA,
+        MODEL_TENSOR.ENGRAM_HC_SCALE,
+        MODEL_TENSOR.INDEXER_KPOOL_GATE,
+        MODEL_TENSOR.INDEXER_KPOOL_APE,
+        MODEL_TENSOR.INDEXER_KPOOL_VALUE,
+        MODEL_TENSOR.INDEXER_COMPRESSOR_NORM,
+        MODEL_TENSOR.NEXTN_EH_PROJ,
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+    ],
 }
 
 
@@ -1154,6 +1286,7 @@ class GGUFValueType(IntEnum):
 class VisionProjectorType:
     INKLING2V      = "inkling2v"
     QWEN3VL        = "qwen3vl_merger"
+    HY_V4_FLASH    = "hy_v4_flash"
 
 
 # Items here are (block size, type size)

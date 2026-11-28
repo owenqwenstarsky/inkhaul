@@ -639,6 +639,10 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
             {
                 builder = std::make_unique<mtmd_graph_qwen3vl>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_HY_V4_FLASH:
+            {
+                builder = std::make_unique<mtmd_graph_hy_v4>(ctx, img);
+            } break;
         default:
             GGML_ABORT("missing cgraph builder");
     }

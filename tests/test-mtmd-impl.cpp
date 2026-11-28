@@ -342,6 +342,189 @@ MAKE_TEST(test_qwen3vl_encode_deepstack) {
 }
 
 //
+// hy_v4_flash
+//
+
+// tiny random hy_v4_flash mmproj, with the tensor names of the converter
+// the load and encode helpers of the qwen3vl tests do not depend on the projector type
+static bool write_tiny_hy_v4(const std::string & fname) {
+    const int n_embd = 64, n_ff = 96, n_layer = 2, patch_size = 16, image_size = 64, n_mmproj = 48;
+    const int n_pos = (image_size / patch_size) * (image_size / patch_size);
+    const int n_mid = 4 * n_embd;
+
+    gguf_context_ptr gguf(gguf_init_empty());
+    gguf_context * g = gguf.get();
+    gguf_set_val_str (g, "general.architecture", "clip");
+    gguf_set_val_str (g, KEY_PROJ_TYPE, "hy_v4_flash");
+    gguf_set_val_bool(g, KEY_HAS_VISION_ENC, true);
+    gguf_set_val_u32 (g, "clip.vision.embedding_length", n_embd);
+    gguf_set_val_u32 (g, "clip.vision.feed_forward_length", n_ff);
+    gguf_set_val_u32 (g, "clip.vision.block_count", n_layer);
+    gguf_set_val_u32 (g, "clip.vision.projection_dim", n_mmproj);
+    gguf_set_val_u32 (g, "clip.vision.attention.head_count", 2);
+    gguf_set_val_f32 (g, "clip.vision.attention.layer_norm_epsilon", 1e-6f);
+    gguf_set_val_u32 (g, KEY_IMAGE_SIZE, image_size);
+    gguf_set_val_u32 (g, KEY_PATCH_SIZE, patch_size);
+    gguf_set_val_u32 (g, KEY_SPATIAL_MERGE_SIZE, 2);
+    const float mean_std[3] = { 0.5f, 0.5f, 0.5f };
+    gguf_set_arr_data(g, KEY_IMAGE_MEAN, GGUF_TYPE_FLOAT32, mean_std, 3);
+    gguf_set_arr_data(g, KEY_IMAGE_STD,  GGUF_TYPE_FLOAT32, mean_std, 3);
+
+    ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    ggml_context_ptr ctx(ggml_init(params));
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+    auto add = [&](const std::string & name, std::vector<int64_t> ne, float base = 0.0f) {
+        ggml_tensor * cur = ggml_new_tensor(ctx.get(), GGML_TYPE_F32, (int) ne.size(), ne.data());
+        ggml_set_name(cur, name.c_str());
+        float * data = (float *) cur->data;
+        for (int64_t i = 0; i < ggml_nelements(cur); i++) {
+            data[i] = base + dist(rng);
+        }
+        gguf_add_tensor(g, cur);
+    };
+
+    add("v.patch_embd.weight",    { patch_size, patch_size, 3, n_embd });
+    add("v.patch_embd.bias",      { n_embd });
+    add("v.position_embd.weight", { n_embd, n_pos }, 0.0f);
+    for (int il = 0; il < n_layer; il++) {
+        const std::string p = "v.blk." + std::to_string(il) + ".";
+        add(p + "ln1.weight",      { n_embd }, 1.0f);
+        add(p + "ln1.bias",        { n_embd });
+        add(p + "attn_q.weight",   { n_embd, n_embd });
+        add(p + "attn_q.bias",     { n_embd });
+        add(p + "attn_k.weight",   { n_embd, n_embd });
+        add(p + "attn_k.bias",     { n_embd });
+        add(p + "attn_v.weight",   { n_embd, n_embd });
+        add(p + "attn_v.bias",     { n_embd });
+        add(p + "attn_out.weight", { n_embd, n_embd });
+        add(p + "attn_out.bias",   { n_embd });
+        add(p + "ln2.weight",      { n_embd }, 1.0f);
+        add(p + "ln2.bias",        { n_embd });
+        add(p + "ffn_up.weight",   { n_embd, n_ff });
+        add(p + "ffn_up.bias",     { n_ff });
+        add(p + "ffn_down.weight", { n_ff, n_embd });
+        add(p + "ffn_down.bias",   { n_embd });
+    }
+    add("mm.pre_norm.weight", { n_embd }, 1.0f);
+    add("mm.0.weight",        { 2, 2, n_embd, n_mid });
+    add("mm.0.bias",          { n_mid });
+    add("mm.2.weight",        { 1, 1, n_mid, n_mmproj });
+    add("mm.2.bias",          { n_mmproj });
+    add("v.image_newline",    { n_mmproj }, 1.0f);
+    return gguf_write_to_file(g, fname.c_str(), false);
+}
+
+struct tiny_hy_v4_file {
+    std::string path;
+    bool ok;
+
+    tiny_hy_v4_file() {
+        path = (std::filesystem::temp_directory_path() / ("test-mtmd-hy-v4-" + std::to_string(std::random_device{}()) + ".gguf")).string();
+        ok = write_tiny_hy_v4(path);
+    }
+
+    ~tiny_hy_v4_file() {
+        std::remove(path.c_str());
+    }
+};
+
+MAKE_TEST(test_hy_v4_n_output_tokens) {
+    tiny_hy_v4_file file;
+    if (!t.assert_true("write gguf", file.ok)) {
+        return;
+    }
+    mtmd_models models = load_tiny_qwen3vl(file.path, nullptr);
+    const mtmd_model & model = *models.v;
+    t.assert_equal("n_merge", 2, model.hparams.n_merge);
+    t.assert_equal("n_mmproj_embd", 48, model.n_mmproj_embd());
+
+    // each row of merged patches ends with one newline token
+    mtmd_image_preprocessor_dyn_size preproc(&model);
+    for (const auto & size : std::vector<mtmd_image_size>{ { 640, 480 }, { 45, 30 }, { 4000, 3000 }, { 80, 400 } }) {
+        const std::string name = std::to_string(size.width) + "x" + std::to_string(size.height);
+        mtmd_image_u8 image;
+        image.set_size(size, true);
+        const auto result = preproc.preprocess(image);
+        if (!t.assert_equal(name + " one image", size_t(1), result.entries.size())) {
+            continue;
+        }
+        const auto & img = result.entries[0];
+        t.assert_equal(name + " width aligned",  0, img.nx() % 32);
+        t.assert_equal(name + " height aligned", 0, img.ny() % 32);
+        const int ow = img.nx() / 32;
+        const int oh = img.ny() / 32;
+        t.assert_true(name + " token limits", ow * oh >= 4 && ow * oh <= 4096);
+        t.assert_equal(name + " n_output_tokens_x", ow + 1, model.n_output_tokens_x(&img));
+        t.assert_equal(name + " n_output_tokens_y", oh, model.n_output_tokens_y(&img));
+        t.assert_equal(name + " n_output_tokens", (ow + 1) * oh, model.n_output_tokens(&img));
+    }
+    mtmd_image_u8 image;
+    image.set_size({ 640, 480 }, true);
+    const auto result = preproc.preprocess(image);
+    const auto & img  = result.entries[0];
+    t.assert_equal("640x480 kept", 640, img.nx());
+    t.assert_equal("640x480 tokens", 21 * 15, model.n_output_tokens(&img));
+}
+
+MAKE_TEST(test_hy_v4_encode) {
+    tiny_hy_v4_file file;
+    if (!t.assert_true("write gguf", file.ok)) {
+        return;
+    }
+    mtmd_models models_cpu = load_tiny_qwen3vl(file.path, nullptr);
+    ggml_backend_dev_t dev_gpu = mtmd_select_device(true, nullptr);
+    mtmd_models models_gpu;
+    if (dev_gpu) {
+        models_gpu = load_tiny_qwen3vl(file.path, dev_gpu);
+    }
+    const mtmd_model & model = *models_cpu.v;
+    std::vector<float> newline(ggml_nelements(model.image_newline));
+    ggml_backend_tensor_get(model.image_newline, newline.data(), 0, ggml_nbytes(model.image_newline));
+
+    // 64x64 keeps the position grid, 96x64 and 64x128 resample it
+    for (const auto & size : std::vector<mtmd_image_size>{ { 64, 64 }, { 96, 64 }, { 64, 128 } }) {
+        const std::string name = std::to_string(size.width) + "x" + std::to_string(size.height);
+        const mtmd_image_f32 img = make_random_image(size.width, size.height);
+        const int ow = size.width / 32;
+        const int oh = size.height / 32;
+        const int n_out = model.n_mmproj_embd();
+
+        const std::vector<float> out_cpu = encode_tiny_qwen3vl(model, nullptr, img);
+        if (!t.assert_equal(name + " encode cpu", size_t((ow + 1) * oh * n_out), out_cpu.size())) {
+            continue;
+        }
+        t.assert_true(name + " finite", std::all_of(out_cpu.begin(), out_cpu.end(), [](float v) { return std::isfinite(v); }));
+
+        // the last token of each row is the newline embedding, the others are image features
+        bool newline_ok = true;
+        bool image_ok   = true;
+        for (int y = 0; y < oh; y++) {
+            for (int x = 0; x <= ow; x++) {
+                const float * row = out_cpu.data() + size_t(y * (ow + 1) + x) * n_out;
+                const bool same = std::equal(row, row + n_out, newline.begin());
+                if (x == ow) {
+                    newline_ok = newline_ok && same;
+                } else {
+                    image_ok = image_ok && !same;
+                }
+            }
+        }
+        t.assert_true(name + " newline tokens", newline_ok);
+        t.assert_true(name + " image tokens", image_ok);
+
+        if (dev_gpu) {
+            const std::vector<float> out_gpu = encode_tiny_qwen3vl(*models_gpu.v, dev_gpu, img);
+            if (t.assert_equal(name + " gpu size", out_cpu.size(), out_gpu.size())) {
+                const float diff = max_abs_diff(out_cpu, out_gpu);
+                t.log(name + " cpu vs " + ggml_backend_dev_name(dev_gpu) + " max diff = " + std::to_string(diff));
+                t.assert_true(name + " cpu vs " + ggml_backend_dev_name(dev_gpu) + " max diff = " + std::to_string(diff), diff < 1e-2f);
+            }
+        }
+    }
+}
+
+//
 // mtmd temporal merge
 //
 

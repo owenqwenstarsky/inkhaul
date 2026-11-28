@@ -2496,6 +2496,10 @@ static void test_role_markers_all_templates(testing & t) {
 
         // HunYuan V3: <｜hy_User:opensource｜> / <｜hy_Assistant:opensource｜>
         { "tencent-Hy3.jinja",                               "<｜hy_User:opensource｜>", "<｜hy_Assistant:opensource｜>" },
+        // Hy4-flash: hy_start {role} hy_middle, with full-width bars (U+FF5C)
+        { "tencent-Hy4-flash.jinja",
+          "<\uff5chy_start:opensource\uff5c>user<\uff5chy_middle:opensource\uff5c>",
+          "<\uff5chy_start:opensource\uff5c>assistant<\uff5chy_middle:opensource\uff5c>" },
 
         // Nemotron Nano v2: <SPECIAL_11>{User|Assistant}; assistant marker
         // is followed by a prefilled <think> block that gets included.

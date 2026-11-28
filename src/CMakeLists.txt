@@ -22,6 +22,8 @@ set(LLAMA_CORE_SOURCES
     llama-io.cpp
     llama-kv-cache.cpp
     llama-kv-cache-iswa.cpp
+    llama-kv-cache-dsa.cpp
+    llama-kv-cache-dsa-iswa.cpp
     llama-memory.cpp
     llama-moe-cache.cpp
     llama-expert-share.cpp

@@ -10,6 +10,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-dsa-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -50,6 +51,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kolibri1(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
+        case LLM_ARCH_HY_V4_FLASH:
+            return new llama_model_hy_v4_flash(params);
         case LLM_ARCH_QWEN35:
             return new llama_model_qwen35(params);
         case LLM_ARCH_QWEN35MOE:
@@ -868,8 +871,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all);
-    // Qwen 3.5 and bailingmoe3 load their MTP block and skip it, the other archs have none
-    if (hparams.n_layer_nextn > 0 && arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_BAILINGMOE3) {
+    // Qwen 3.5, bailingmoe3 and hy_v4_flash load their MTP block and skip it, the other archs have none
+    if (hparams.n_layer_nextn > 0 && arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_BAILINGMOE3 &&
+            arch != LLM_ARCH_HY_V4_FLASH) {
         throw std::runtime_error("NextN/MTP layers are not supported");
     }
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
@@ -909,6 +913,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
     std::iota(hparams.kv_source_impl.begin(), hparams.kv_source_impl.end(), 0);
     std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
+    std::fill(hparams.ple_head_offsets.begin(),     hparams.ple_head_offsets.end(),     0);
+    std::fill(hparams.ple_head_vocab_sizes.begin(), hparams.ple_head_vocab_sizes.end(), 0);
+    hparams.is_ple_impl.reset();
 
     ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer_all, false);
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer_all, false);
@@ -1347,6 +1354,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     ml.done_getting_tensors();
+
+    if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
+        LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
+
+        can_prefetch.insert(per_layer_tok_embd);
+    }
 
     if (output && tok_embd &&
             strcmp(output->name, tok_embd->name) == 0 &&
@@ -1856,6 +1869,24 @@ void llama_model::print_info() const {
         // general kv
         LLAMA_LOG_INFO("%s: general.name          = %s\n",    __func__, name.c_str());
 
+        if (arch == LLM_ARCH_HY_V4_FLASH) {
+            LLAMA_LOG_INFO("%s: n_layer_dense_lead    = %d\n",     __func__, hparams.n_layer_dense_lead);
+            LLAMA_LOG_INFO("%s: n_lora_q              = %d\n",     __func__, hparams.n_lora_q);
+            LLAMA_LOG_INFO("%s: n_lora_kv             = %d\n",     __func__, hparams.n_lora_kv);
+            LLAMA_LOG_INFO("%s: n_embd_head_k_mla     = %d\n",     __func__, hparams.n_embd_head_k_mla());
+            LLAMA_LOG_INFO("%s: n_embd_head_v_mla     = %d\n",     __func__, hparams.n_embd_head_v_mla());
+            LLAMA_LOG_INFO("%s: n_ff_exp              = %d\n",     __func__, hparams.n_ff_exp());
+            LLAMA_LOG_INFO("%s: n_expert_shared       = %d\n",     __func__, hparams.n_expert_shared);
+            LLAMA_LOG_INFO("%s: n_expert_latent       = %u\n",     __func__, hparams.n_expert_latent);
+            LLAMA_LOG_INFO("%s: expert_weights_scale  = %.1f\n",   __func__, hparams.expert_weights_scale);
+            LLAMA_LOG_INFO("%s: expert_weights_norm   = %d\n",     __func__, hparams.expert_weights_norm);
+            LLAMA_LOG_INFO("%s: expert_gating_func    = %s\n",     __func__, llama_expert_gating_func_name((llama_expert_gating_func_type) hparams.expert_gating_func));
+            LLAMA_LOG_INFO("%s: hc_mult               = %u\n",     __func__, hparams.dsv4_hc_mult);
+            LLAMA_LOG_INFO("%s: indexer               = %u heads x %u, kpool %u, top_k %u\n", __func__,
+                    hparams.indexer_n_head, hparams.indexer_head_size, hparams.indexer_kpool, hparams.indexer_top_k);
+            LLAMA_LOG_INFO("%s: engram modules        = %u\n",     __func__, hparams.ple_n_heads > 0 ? hparams.ple_n_modules : 0);
+            LLAMA_LOG_INFO("%s: n_layer_nextn         = %u (not run)\n", __func__, hparams.n_layer_nextn);
+        }
     }
 
     vocab.print_info();
@@ -2088,6 +2119,34 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             /* unified           */ cparams.kv_unified,
             /* filter_attn       */ [](uint32_t) { return true; },
             /* filter_recr       */ [](uint32_t) { return true; });
+    }
+
+    // hy_v4_flash: a DSA cache for the sparse layers (MLA rows plus pooled indexer keys) and a window-sized SWA cache
+    // the MTP block is skipped, so it has no cache
+    if (arch == LLM_ARCH_HY_V4_FLASH) {
+        GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+
+        llama_kv_cache::layer_filter_cb filter_mla = nullptr;
+        if (hparams.n_layer_nextn > 0) {
+            filter_mla = [&](uint32_t il) { return il < hparams.n_layer(); };
+        }
+        llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && hparams.is_indexer_full(il); };
+
+        return new llama_kv_cache_dsa_iswa(
+                *this,
+                params.no_alloc,
+                params.type_k,
+                params.type_v,
+                !cparams.flash_attn,
+                cparams.offload_kqv,
+                params.swa_full,
+                cparams.kv_unified,
+                cparams.n_ctx_seq,
+                cparams.n_seq_max,
+                cparams.n_ubatch,
+                filter_mla,
+                filter_lid,
+                nullptr);
     }
 
     // Kolibri: sliding-window and full-attention layers, Kolibri-1.1 layers can read the K/V of an earlier layer
@@ -2323,6 +2382,10 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
 
         case LLM_ARCH_KOLIBRI1:
             return LLAMA_ROPE_TYPE_NEOX;
+
+        // keeps the interleaved rope rows and reorders them in the graph for M-RoPE (see src/models/hy-v4-flash.cpp)
+        case LLM_ARCH_HY_V4_FLASH:
+            return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_IMROPE : LLAMA_ROPE_TYPE_NORM;
 
         case LLM_ARCH_UNKNOWN:
             GGML_ABORT("unknown architecture");

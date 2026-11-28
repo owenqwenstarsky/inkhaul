@@ -285,6 +285,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_head  = 8;
         n_ff    = 192;
         n_layer = 8; // see the layer layout below
+    } else if (arch == LLM_ARCH_HY_V4_FLASH) {
+        n_embd  = 128;
+        n_head  = 1;
+        n_ff    = 192;
+        n_layer = 4; // dense + MoE across both sparse and sliding attention layers
     }
 
     uint32_t n_head_kv = n_head;
@@ -451,6 +456,68 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, false);
     }
 
+    if (arch == LLM_ARCH_HY_V4_FLASH) {
+        // the odd layers are sliding-window, with twice the heads
+        // MLA-as-MQA: one latent KV head on every layer, whatever the query head count
+        std::vector<uint32_t> n_head_per_layer;
+        std::vector<uint32_t> swa;
+        std::vector<uint32_t> indexer_types;
+        for (uint32_t il = 0; il < n_layer; il++) {
+            n_head_per_layer.push_back(il % 2 ? 2*n_head : n_head);
+            swa.push_back(il % 2);
+            // the indexer lives on the non-SWA layers, the even ones here
+            indexer_types.push_back(il % 2 ? 0 : 1);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,             n_head_per_layer);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,          uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa);
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,          indexer_types);
+
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
+        // the published VL sections, so the text model runs the M-RoPE path
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,    std::vector<uint32_t>({12, 10, 10, 0}));
+        ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,         10000.0f);
+
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,     uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,   1.0e-6f);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE, 2.0f);
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,           10.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,       1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,        true);
+
+        // 2 indexer heads of 96: the indexer key must be longer than n_rot
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(2));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(96));
+
+        // one Engram module on layer 1, the head offsets are the running sum of the bucket counts
+        // the loader reads the bucket ranges as u64 arrays
+        const std::vector<uint64_t> primes = {7, 11, 13, 17};
+        std::vector<uint64_t> offsets;
+        uint64_t base = 0;
+        for (uint64_t p : primes) {
+            offsets.push_back(base);
+            base += p;
+        }
+        ms.add_kv(LLM_KV_PLE_LAYERS,                 std::vector<uint32_t>({1}));
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,             uint32_t(3));
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,        uint32_t(2));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, uint32_t(32));
+        // n_modules * ngram_size multipliers, odd as the reference derives them
+        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,      std::vector<uint64_t>({3, 5, 7}));
+        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,           offsets);
+        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,       primes);
+        ms.add_kv(LLM_KV_ENGRAM_PAD_TOKEN_ID,        uint32_t(1));
+        std::vector<int32_t> token_map(n_vocab);
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            token_map[i] = (int32_t) i;
+        }
+        ms.add_kv(LLM_KV_ENGRAM_TOKEN_MAP,           token_map);
+    }
+
     // dummy tokenizer: token ids are derived from fixed-size chunks and detokenized as hex ids
     {
         std::vector<std::string> tokenizer_list(n_vocab);
@@ -472,7 +539,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         // distinct from n_ff so a saver key-clobber surfaces on reload,
         // and 256 for qwen35moe so that -sm tensor gives each of two devices a slice of 128
         ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, arch == LLM_ARCH_QWEN35MOE ? uint32_t(256) : n_ff / 2);
-        ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
+        // hy_v4_flash: a latent width distinct from n_ff_exp catches a transposed routed_down / routed_up
+        ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       arch == LLM_ARCH_HY_V4_FLASH ? uint32_t(64) : n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         // with more experts than a ubatch uses, the copy of the used experts in host memory skips some of them
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
@@ -792,6 +860,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KOLIBRI1:
+        case LLM_ARCH_HY_V4_FLASH:
             return true;
         default:
             return false;
@@ -3962,6 +4031,562 @@ static int test_state_kolibri1(const std::string & arch_filter, const size_t see
     return all_ok ? 0 : 1;
 }
 
+// text, an image of n_img_x*n_img_y embeddings, text, in one batch with M-RoPE positions as mtmd gives them:
+// every image row has the same t position, so the SWA cache cannot free a cell while the image is decoded
+// returns the llama_process error, ret gets the logits of every entry
+static int32_t get_logits_image(llama_context * lctx, const std::vector<llama_token> & tokens, uint32_t n_text,
+        uint32_t n_img_x, uint32_t n_img_y, const std::vector<float> & embd, std::vector<float> & ret) {
+    const llama_model * model = llama_get_model(lctx);
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_embd  = llama_model_n_embd_inp(model);
+    const uint32_t n_img   = n_img_x*n_img_y;
+    GGML_ASSERT(tokens.size() >= 2*n_text && embd.size() >= (size_t) n_img*n_embd);
+
+    llama_memory_clear(llama_get_memory(lctx), true);
+    llama_batch_ext_ptr batch(llama_batch_ext_init(lctx));
+    auto add = [&](int32_t idx, llama_pos t, llama_pos y, llama_pos x) {
+        GGML_ASSERT(idx >= 0);
+        const llama_pos pos[4] = { t, y, x, 0 };
+        llama_batch_ext_set_pos(batch.get(), idx, pos);
+        llama_batch_ext_set_output_logits(batch.get(), idx, true);
+    };
+    for (uint32_t i = 0; i < n_text; i++) {
+        add(llama_batch_ext_add_token(batch.get(), 0, tokens[i]), i, i, i);
+    }
+    for (uint32_t i = 0; i < n_img; i++) {
+        const llama_pos y = n_text + i/n_img_x;
+        const llama_pos x = n_text + i%n_img_x;
+        add(llama_batch_ext_add_embd(batch.get(), 0, { embd.data() + (size_t) i*n_embd, 1, n_embd }), n_text, y, x);
+    }
+    const llama_pos pos_next = n_text + std::max(n_img_x, n_img_y);
+    for (uint32_t i = 0; i < n_text; i++) {
+        const llama_pos p = pos_next + i;
+        add(llama_batch_ext_add_token(batch.get(), 0, tokens[n_text + i]), p, p, p);
+    }
+    const int32_t err = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    if (err != 0) {
+        return err;
+    }
+    ret.clear();
+    for (uint32_t i = 0; i < 2*n_text + n_img; i++) {
+        const float * logits_ith = llama_get_logits_ith(lctx, i);
+        ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+    }
+    return 0;
+}
+
+// LongHaul with hy_v4_flash: a dense lead layer, latent routed experts, a shared expert, Engram and the pooled indexer
+// a prompt of 400 tokens, then steps of 1 to 3 tokens; the logits must match the in-memory model
+// every pool is selected: with random weights many pools score exactly 0, and the GPU kernels for other ubatch sizes
+// break these ties in another order (test_hy_v4_flash checks a small top-k on the CPU)
+static int test_longhaul_hy_v4_flash(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    const llm_arch arch = LLM_ARCH_HY_V4_FLASH;
+    if (!arch_matches(arch_filter, arch)) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu = get_gpu(target_backend, nullptr);
+    // a second GPU, for the layer split and the expert split (GGML_METAL_DEVICES=2 emulates one)
+    ggml_backend_dev_t gpu2 = get_gpu(nullptr, gpu);
+
+    const uint32_t n_prompt = 400;
+    const uint32_t n_ctx    = 512;
+    const std::vector<llama_token> tokens = get_tokens(n_prompt + 20, 128, seed);
+    // more experts than used per token, so that the small caches evict
+    const uint32_t n_expert      = 16;
+    const uint32_t n_expert_used = 2;
+
+    struct variant {
+        ggml_type type_exps; // GGML_TYPE_COUNT: the default F32 experts
+        bool      mixed;     // the last layer keeps F32 experts, a group of its own in the cache
+    };
+    const std::vector<variant> variants = {
+        { GGML_TYPE_COUNT, false },
+        { GGML_TYPE_Q8_0,  true  },
+    };
+
+    bool all_ok = true;
+    for (const variant & v : variants) {
+        std::string name = llama_arch_name(arch);
+        if (v.type_exps != GGML_TYPE_COUNT) {
+            name += std::string(" ") + ggml_type_name(v.type_exps);
+        }
+        if (v.mixed) {
+            name += " + F32";
+        }
+        if (gpu == nullptr) {
+            LOG("LongHaul %s: SKIP (no GPU)\n", name.c_str());
+            continue;
+        }
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_CONTEXT_LENGTH).c_str(),         n_ctx);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_COUNT).c_str(),           n_expert);
+        gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_USED_COUNT).c_str(),      n_expert_used);
+
+        const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_BLOCK_COUNT).c_str()));
+        const uint32_t n_dense = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_LEADING_DENSE_BLOCK_COUNT).c_str()));
+
+        if (v.type_exps != GGML_TYPE_COUNT) {
+            // quantized experts need rows that are a multiple of the block size
+            gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EXPERT_FEED_FORWARD_LENGTH).c_str(), 64);
+            for (uint32_t il = n_dense; il < n_layer; il++) {
+                if (v.mixed && il == n_layer - 1) {
+                    continue;
+                }
+                for (const char * e : { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps" }) {
+                    ggml_tensor t;
+                    memset(&t, 0, sizeof(ggml_tensor));
+                    t.type = v.type_exps;
+                    ggml_format_name(&t, "blk.%" PRIu32 ".%s.weight", il, e);
+                    gguf_add_tensor(gguf_ctx.get(), &t);
+                }
+            }
+        }
+
+        const std::string path = get_tmp_gguf_path();
+        {
+            llama_model_ptr model_cpu = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+            llama_model_save_with_meta(model_cpu.get(), gguf_ctx.get(), path.c_str());
+        }
+
+        uint32_t n_expert_file = 0;
+        const std::vector<expert_group> groups = get_expert_groups(path, arch, n_expert_file);
+        GGML_ASSERT(n_expert_file == n_expert);
+        GGML_ASSERT(groups.size() == (v.mixed ? 2u : 1u));
+        const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(gpu));
+        auto cache_size = [&](int32_t n_slots) { return get_cache_size(groups, n_expert, n_expert_used, alignment, n_slots); };
+        auto reserve    = [&](uint32_t n_ubatch) { return get_reserve(groups, n_expert, n_expert_used, alignment, n_ubatch); };
+
+        std::vector<float> logits_ref;
+        try {
+            llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, { gpu });
+            llama_context_ptr lctx = get_ctx(model.get(), 0, GGML_TYPE_F16, 1, false);
+            if (!lctx) {
+                throw std::runtime_error("failed to create llama context");
+            }
+            logits_ref = get_logits(model.get(), lctx.get(), tokens);
+        } catch (const std::exception & err) {
+            LOG("LongHaul %s, reference: FAIL (%s)\n", name.c_str(), err.what());
+            all_ok = false;
+            std::filesystem::remove(path);
+            continue;
+        }
+
+        // the smallest cache cuts the ubatch to 1 token, 5 slots to 2 tokens, 512 MiB holds all experts
+        struct cache_case {
+            const char * name;
+            size_t       size;
+        };
+        const std::vector<cache_case> cases = {
+            { "reserve(1)", reserve(1)       },
+            { "5 slots",    cache_size(5)    },
+            { "512 MiB",    512ull*1024*1024 },
+        };
+        for (const cache_case & cc : cases) {
+            const uint32_t n_ubatch_exp = get_expected_ubatch(groups, n_expert, n_expert_used, alignment, cc.size);
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            bool ok = true;
+            std::string detail;
+            try {
+                llama_model_ptr model = get_model(nullptr, file, seed, stdev, { gpu });
+                // the routed experts are LongHaul tensors
+                if (!llama_model_has_longhaul(model.get())) {
+                    ok = false;
+                    detail = "no LongHaul tensors";
+                }
+                llama_context_ptr lctx = get_ctx(model.get(), cc.size, GGML_TYPE_F16, 1, false);
+                if (!lctx) {
+                    throw std::runtime_error("failed to create llama context");
+                }
+                const uint32_t n_ubatch = llama_n_ubatch(lctx.get());
+                if (n_ubatch != n_ubatch_exp) {
+                    ok = false;
+                    detail += (detail.empty() ? "" : ", ") + std::string("n_ubatch = ") + std::to_string(n_ubatch) + ", expected " + std::to_string(n_ubatch_exp);
+                }
+                const std::vector<float> logits = get_logits(model.get(), lctx.get(), tokens);
+                // also the steps after the prompt
+                const double nmse_val = std::max(nmse(logits_ref, logits),
+                    nmse(logits_ref, get_logits_steps(model.get(), lctx.get(), tokens, n_prompt)));
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail += detail.empty() ? buf : std::string(", ") + buf;
+                ok = ok && nmse_val <= 1e-4;
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            fclose(file);
+            LOG("LongHaul %s, cache %s: %s (%s)\n", name.c_str(), cc.name, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+
+        if (gpu2 != nullptr) {
+            all_ok = test_longhaul_two_gpus(name, path, seed, stdev, gpu, gpu2, v.mixed ? reserve(2) : cache_size(5), tokens, logits_ref) && all_ok;
+            all_ok = test_longhaul_expert_split(name, path, seed, stdev, gpu, gpu2, v.mixed ? reserve(2) : cache_size(5), reserve(1), tokens, logits_ref) && all_ok;
+        }
+
+        if (!v.mixed) {
+            // placement: the Engram table stays in a CPU buffer (rows are read from the file on use), not on the GPU
+            // the real table (33 GiB) is lazy in the default mode (above 4 GiB), the tiny one here needs the "on" mode
+            struct engram_place {
+                int  n_get_rows = 0;
+                bool all_cpu    = true;
+            } place;
+            auto place_cb = [](ggml_tensor * t, bool ask, void * user_data) -> bool {
+                engram_place * p = (engram_place *) user_data;
+                if (ask && t->op == GGML_OP_GET_ROWS && strncmp(t->src[0]->name, "per_layer_token_embd", 20) == 0) {
+                    const ggml_tensor * base = t->src[0]->view_src ? t->src[0]->view_src : t->src[0];
+                    const ggml_backend_dev_t dev = base->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(base->buffer)) : nullptr;
+                    p->n_get_rows++;
+                    // the mapped file buffer (CPU_Mapped) has no device
+                    p->all_cpu = p->all_cpu && base->buffer != nullptr && ggml_backend_buffer_is_host(base->buffer) &&
+                        (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+                }
+                return false;
+            };
+            bool ok = true;
+            std::string detail;
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            try {
+                llama_model_params mparams = llama_model_default_params();
+                ggml_backend_dev_t devs[2] = { gpu, nullptr };
+                mparams.devices           = devs;
+                mparams.progress_callback = silent_model_load_progress;
+                mparams.lazy_mode         = LLAMA_LAZY_MODE_ON;
+                llama_model_ptr model(llama_model_load_from_file_ptr(file, mparams));
+                if (!model) {
+                    throw std::runtime_error("failed to load the model");
+                }
+                llama_context_params cparams = llama_context_default_params();
+                cparams.n_ctx               = 0;
+                cparams.n_threads           = 4;
+                cparams.n_threads_batch     = 4;
+                cparams.n_ubatch            = 64;
+                cparams.longhaul_cache_size = 512ull*1024*1024;
+                cparams.cb_eval             = place_cb;
+                cparams.cb_eval_user_data   = &place;
+                llama_context_ptr lctx(llama_init_from_model(model.get(), cparams));
+                if (!lctx) {
+                    throw std::runtime_error("failed to create llama context");
+                }
+                place = {};
+                decode_range(lctx.get(), tokens.data(), 16, 0, 0, false);
+                ok = place.n_get_rows > 0 && place.all_cpu;
+                detail = std::to_string(place.n_get_rows) + " Engram row reads, " + (place.all_cpu ? "all in a CPU buffer" : "not all in a CPU buffer");
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            fclose(file);
+            LOG("LongHaul %s, Engram table placement: %s (%s)\n", name.c_str(), ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+
+        if (!v.mixed) {
+            // a Q8_0 KV cache: the MLA rows and the indexer rows are cached at the KV type, the smallest cache against the in-memory model
+            bool ok = true;
+            std::string detail;
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            try {
+                llama_model_ptr model_ref = get_model(gguf_ctx.get(), nullptr, seed, stdev, { gpu });
+                llama_model_ptr model     = get_model(nullptr, file, seed, stdev, { gpu });
+                llama_context_ptr lctx_ref = get_ctx(model_ref.get(), 0,          GGML_TYPE_Q8_0, 1, false);
+                llama_context_ptr lctx     = get_ctx(model.get(),     reserve(1), GGML_TYPE_Q8_0, 1, false);
+                if (!lctx_ref || !lctx) {
+                    throw std::runtime_error("failed to create llama context");
+                }
+                const std::vector<float> ref = get_logits(model_ref.get(), lctx_ref.get(), tokens);
+                const double nmse_val = std::max(nmse(ref, get_logits(model.get(), lctx.get(), tokens)),
+                    nmse(ref, get_logits_steps(model.get(), lctx.get(), tokens, n_prompt)));
+                char buf[32];
+                snprintf(buf, sizeof(buf), "NMSE %.2e", nmse_val);
+                detail = buf;
+                ok = nmse_val <= 1e-4;
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            fclose(file);
+            LOG("LongHaul %s, Q8_0 KV cache: %s (%s)\n", name.c_str(), ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+
+        if (!v.mixed) {
+            // an image of 300 rows needs 300 SWA cells: the SWA cache is sized with the requested n_ubatch (512),
+            // before LongHaul reduces it to 1 token, so the image fits (a size from 1 token would give 256 cells)
+            // a requested n_ubatch of 64 gives 256 cells: decode returns 1, mtmd_helper_decode_image_chunk names the -ub that fits
+            // the SWA cache is window-sized, as with the common params (llama_context_default_params uses a full-size one)
+            auto get_ctx_swa = [](llama_model * model, size_t longhaul_cache_size, uint32_t n_ubatch) {
+                llama_context_params ctx_params = llama_context_default_params();
+                ctx_params.n_ctx               = 0;
+                ctx_params.n_threads           = 4;
+                ctx_params.n_threads_batch     = 4;
+                ctx_params.n_ubatch            = n_ubatch;
+                ctx_params.swa_full            = false;
+                ctx_params.longhaul_cache_size = longhaul_cache_size;
+                return llama_context_ptr(llama_init_from_model(model, ctx_params));
+            };
+            const uint32_t n_text = 10, n_img_x = 20, n_img_y = 15;
+            const uint32_t n_embd = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_EMBEDDING_LENGTH).c_str()));
+            std::vector<float> embd((size_t) n_img_x*n_img_y*n_embd);
+            std::mt19937 gen(seed);
+            std::normal_distribution<float> dist(0.0f, 1.0f);
+            for (float & e : embd) {
+                e = dist(gen);
+            }
+            bool ok = true;
+            std::string detail;
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            try {
+                llama_model_ptr model = get_model(nullptr, file, seed, stdev, { gpu });
+                llama_context_ptr lctx_ref = get_ctx_swa(model.get(), 512ull*1024*1024, 512);
+                llama_context_ptr lctx     = get_ctx_swa(model.get(), reserve(1),        512);
+                if (!lctx_ref || !lctx) {
+                    throw std::runtime_error("failed to create llama context");
+                }
+                std::vector<float> ref;
+                std::vector<float> out;
+                const int32_t err_ref = get_logits_image(lctx_ref.get(), tokens, n_text, n_img_x, n_img_y, embd, ref);
+                const int32_t err     = get_logits_image(lctx.get(),     tokens, n_text, n_img_x, n_img_y, embd, out);
+                llama_context_ptr lctx_small = get_ctx_swa(model.get(), reserve(1), 64);
+                if (!lctx_small) {
+                    throw std::runtime_error("failed to create llama context");
+                }
+                std::vector<float> out_small;
+                const int32_t err_small = get_logits_image(lctx_small.get(), tokens, n_text, n_img_x, n_img_y, embd, out_small);
+                if (err_ref != 0 || err != 0) {
+                    ok = false;
+                    detail = "decode error " + std::to_string(err_ref) + "/" + std::to_string(err);
+                } else if (err_small != 1) {
+                    ok = false;
+                    detail = "-ub 64: decode returned " + std::to_string(err_small) + ", expected 1";
+                } else {
+                    const double nmse_val = nmse(ref, out);
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "n_ubatch %u, NMSE %.2e", llama_n_ubatch(lctx.get()), nmse_val);
+                    detail = buf;
+                    ok = llama_n_ubatch(lctx.get()) == 1 && nmse_val <= 1e-4;
+                }
+            } catch (const std::exception & err) {
+                ok = false;
+                detail = err.what();
+            }
+            fclose(file);
+            LOG("LongHaul %s, image of %u rows: %s (%s)\n", name.c_str(), n_img_x*n_img_y, ok ? "OK" : "FAIL", detail.c_str());
+            all_ok = all_ok && ok;
+        }
+
+        if (v.mixed) {
+            // below the reserve of one token, the error names the smallest cache
+            bool failed = false;
+            const std::string log = capture_log([&]() {
+                FILE * file = fopen(path.c_str(), "rb");
+                GGML_ASSERT(file != nullptr);
+                try {
+                    llama_model_ptr model = get_model(nullptr, file, seed, stdev, { gpu });
+                    failed = get_ctx(model.get(), reserve(1) - 1, GGML_TYPE_F16, 1, false) == nullptr;
+                } catch (const std::exception &) {
+                    failed = true;
+                }
+                fclose(file);
+            });
+            char min_str[64];
+            snprintf(min_str, sizeof(min_str), "use at least %.0f MiB", std::ceil(reserve(1)/1024.0/1024.0));
+            const bool ok = failed && log.find(min_str) != std::string::npos;
+            LOG("LongHaul %s, cache below reserve(1): %s\n", name.c_str(), ok ? "OK" : "FAIL (no error or no minimum)");
+            all_ok = all_ok && ok;
+        }
+
+        std::filesystem::remove(path);
+    }
+    return all_ok ? 0 : 1;
+}
+
+// hy_v4_flash, without LongHaul:
+// - a file without rope sections gets the checkpoint's sections: M-RoPE, the same logits
+// - a file without Engram runs, CPU and GPU agree
+// - chunked decode gives the logits of one batch: the pools are rebuilt for every ubatch
+// - the state of a sequence that ends in the middle of a pool, restored in a new context
+// - seq_rm in the middle of a pool, then decode again
+// - 2 sequences without --kv-unified (forced on with a warning) give the logits of a unified cache
+// the CPU runs these with a small top-k, so that the selection drops pools; the GPU selects every pool:
+// with random weights many pools score exactly 0, and the GPU kernels for other ubatch sizes break these ties in another order
+static int test_hy_v4_flash(const std::string & arch_filter, const size_t seed, const float stdev, const char * target_backend) {
+    const llm_arch arch = LLM_ARCH_HY_V4_FLASH;
+    if (!arch_matches(arch_filter, arch)) {
+        return 0;
+    }
+
+    std::vector<std::pair<std::string, std::vector<ggml_backend_dev_t>>> configs = { { "CPU", {} } };
+    ggml_backend_dev_t gpu = get_gpu(target_backend, nullptr);
+    if (gpu != nullptr) {
+        configs.push_back({ ggml_backend_dev_name(gpu), { gpu } });
+    }
+
+    bool all_ok = true;
+    auto report = [&](const std::string & name, bool ok, const std::string & detail) {
+        LOG("hy_v4_flash %s: %s (%s)\n", name.c_str(), ok ? "OK" : "FAIL", detail.c_str());
+        all_ok = all_ok && ok;
+    };
+    auto nmse_str = [](double v) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "NMSE %.2e", v);
+        return std::string(buf);
+    };
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+
+    // no rope sections: the default turns on M-RoPE, and text gives the same logits
+    try {
+        gguf_context_ptr gguf_ref = get_gguf_ctx(arch, true);
+        gguf_context_ptr gguf_def = get_gguf_ctx(arch, true);
+        GGML_ASSERT(gguf_remove_key(gguf_def.get(), llama_arch_kv_name(arch, LLM_KV_ROPE_DIMENSION_SECTIONS).c_str()) >= 0);
+        auto ref = get_model_and_ctx(gguf_ref.get(), nullptr, seed, stdev, {});
+        auto def = get_model_and_ctx(gguf_def.get(), nullptr, seed, stdev, {});
+        const bool mrope = llama_model_rope_type(def.first.get()) == LLAMA_ROPE_TYPE_IMROPE;
+        const double v = nmse(get_logits(ref.first.get(), ref.second.get(), tokens), get_logits(def.first.get(), def.second.get(), tokens));
+        report("no rope sections", mrope && v <= 1e-10, std::string(mrope ? "IMROPE" : "not IMROPE") + ", " + nmse_str(v));
+    } catch (const std::exception & err) {
+        report("no rope sections", false, err.what());
+    }
+
+    // no Engram
+    try {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true);
+        for (const llm_kv kv : { LLM_KV_PLE_LAYERS, LLM_KV_PLE_NGRAM_SIZE, LLM_KV_PLE_HEADS_PER_NGRAM, LLM_KV_EMBEDDING_LENGTH_PER_LAYER,
+                LLM_KV_PLE_LAYER_MULTIPLIERS, LLM_KV_PLE_HEAD_OFFSETS, LLM_KV_PLE_HEAD_VOCAB_SIZES,
+                LLM_KV_ENGRAM_PAD_TOKEN_ID, LLM_KV_ENGRAM_TOKEN_MAP }) {
+            GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), llama_arch_kv_name(arch, kv).c_str()) >= 0);
+        }
+        auto cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {});
+        const std::vector<float> logits_cpu = get_logits(cpu.first.get(), cpu.second.get(), tokens);
+        if (gpu != nullptr) {
+            auto dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { gpu });
+            const double v = nmse(logits_cpu, get_logits(dev.first.get(), dev.second.get(), tokens));
+            report("no Engram, CPU vs GPU", v <= 1e-4, nmse_str(v));
+        } else {
+            report("no Engram", true, "CPU only");
+        }
+    } catch (const std::exception & err) {
+        report("no Engram", false, err.what());
+    }
+
+    // 1 history pool and the tail pool of each token, so that the selection drops most cells
+    gguf_context_ptr gguf_top_k = get_gguf_ctx(arch, true);
+    gguf_set_val_u32(gguf_top_k.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TOP_K).c_str(), 8);
+    gguf_context_ptr gguf_all = get_gguf_ctx(arch, true);
+
+    const uint32_t n_prefix = 102; // 102 % 4 != 0: the prefix ends in the middle of a pool
+    const uint32_t n_probe  = 16;
+    const std::vector<llama_token> tokens_long = get_tokens(n_prefix + n_probe + 40, 128, seed + 1);
+
+    for (const auto & [dev_name_base, devs] : configs) {
+        const bool cpu = devs.empty();
+        const std::string dev_name = dev_name_base + (cpu ? ", top-k 8" : ", all pools");
+        try {
+            llama_model_ptr model = get_model(cpu ? gguf_top_k.get() : gguf_all.get(), nullptr, seed, stdev, devs);
+            const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            auto probe_logits = [&](llama_context * lctx, llama_pos pos0) {
+                decode_range(lctx, tokens_long.data() + pos0, n_probe, pos0, 0, true);
+                std::vector<float> ret;
+                for (uint32_t i = 0; i < n_probe; i++) {
+                    const float * logits_ith = llama_get_logits_ith(lctx, i);
+                    ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+                }
+                return ret;
+            };
+
+            // chunked decode vs one batch
+            {
+                llama_context_ptr lctx = get_ctx(model.get(), 0, GGML_TYPE_F16, 1, false);
+                if (!lctx) {
+                    throw std::runtime_error("failed to create llama context");
+                }
+                const std::vector<float> ref = get_logits(model.get(), lctx.get(), tokens_long);
+                const double v = nmse(ref, get_logits_steps(model.get(), lctx.get(), tokens_long, n_prefix));
+                report("steps vs one batch (" + dev_name + ")", v <= 1e-4, nmse_str(v));
+            }
+
+            // state save/load of a sequence that ends in the middle of a pool
+            {
+                llama_context_ptr lctx  = get_ctx(model.get(), 0, GGML_TYPE_F16, 1, false);
+                llama_context_ptr lctx2 = get_ctx(model.get(), 0, GGML_TYPE_F16, 1, false);
+                if (!lctx || !lctx2) {
+                    throw std::runtime_error("failed to create llama context");
+                }
+                decode_range(lctx.get(), tokens_long.data(), n_prefix, 0, 0, false);
+                std::vector<uint8_t> state(llama_state_seq_get_size(lctx.get(), 0));
+                if (llama_state_seq_get_data(lctx.get(), state.data(), state.size(), 0) != state.size()) {
+                    throw std::runtime_error("failed to save the sequence state");
+                }
+                const std::vector<float> ref = probe_logits(lctx.get(), n_prefix);
+                if (llama_state_seq_set_data(lctx2.get(), state.data(), state.size(), 0) != state.size()) {
+                    throw std::runtime_error("failed to restore the sequence state");
+                }
+                const double v = nmse(ref, probe_logits(lctx2.get(), n_prefix));
+                report("state save/load (" + dev_name + ")", v <= 1e-10, nmse_str(v));
+            }
+
+            // seq_rm in the middle of a pool: decode past the cut, remove the tail, decode the probe again
+            {
+                llama_context_ptr lctx_ref = get_ctx(model.get(), 0, GGML_TYPE_F16, 1, false);
+                llama_context_ptr lctx     = get_ctx(model.get(), 0, GGML_TYPE_F16, 1, false);
+                if (!lctx_ref || !lctx) {
+                    throw std::runtime_error("failed to create llama context");
+                }
+                decode_range(lctx_ref.get(), tokens_long.data(), n_prefix, 0, 0, false);
+                const std::vector<float> ref = probe_logits(lctx_ref.get(), n_prefix);
+
+                decode_range(lctx.get(), tokens_long.data(), n_prefix + 30, 0, 0, false);
+                if (!llama_memory_seq_rm(llama_get_memory(lctx.get()), 0, n_prefix, -1)) {
+                    throw std::runtime_error("failed to remove the tail");
+                }
+                const double v = nmse(ref, probe_logits(lctx.get(), n_prefix));
+                report("seq_rm in a pool (" + dev_name + ")", v <= 1e-4, nmse_str(v));
+            }
+
+            // 2 sequences: without --kv-unified the context forces it on, with a warning
+            {
+                llama_context_ptr lctx_u;
+                const std::string log = capture_log([&]() {
+                    lctx_u = get_ctx(model.get(), 0, GGML_TYPE_F16, 2, false);
+                });
+                llama_context_ptr lctx_ref = get_ctx(model.get(), 0, GGML_TYPE_F16, 2, true);
+                if (!lctx_u || !lctx_ref) {
+                    throw std::runtime_error("failed to create llama context");
+                }
+                auto two_seqs = [&](llama_context * lctx) {
+                    common_batch batch(lctx);
+                    for (uint32_t i = 0; i < 64; i++) {
+                        batch.add(tokens_long[i],      i, 0, true);
+                        batch.add(tokens_long[64 + i], i, 1, true);
+                    }
+                    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+                        throw std::runtime_error("failed to decode batch");
+                    }
+                    std::vector<float> ret;
+                    for (uint32_t i = 0; i < 128; i++) {
+                        const float * logits_ith = llama_get_logits_ith(lctx, i);
+                        ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+                    }
+                    return ret;
+                };
+                const bool warned = log.find("needs a unified KV cache") != std::string::npos;
+                const double v = nmse(two_seqs(lctx_ref.get()), two_seqs(lctx_u.get()));
+                report("2 sequences without --kv-unified (" + dev_name + ")", warned && v <= 1e-10,
+                        std::string(warned ? "warned" : "no warning") + ", " + nmse_str(v));
+            }
+        } catch (const std::exception & err) {
+            report(dev_name, false, err.what());
+        }
+    }
+
+    return all_ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -4085,6 +4710,8 @@ int main(int argc, char ** argv) {
         ret = test_longhaul(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_longhaul_bailingmoe3(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         ret = test_longhaul_kolibri1(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        ret = test_longhaul_hy_v4_flash(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
+        ret = test_hy_v4_flash(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
         return test_state_kolibri1(arch_filter, seed, stdev, target_backend) != 0 ? 1 : ret;
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());

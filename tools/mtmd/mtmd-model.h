@@ -209,6 +209,10 @@ struct mtmd_model {
     ggml_tensor * mm_2_w = nullptr;
     ggml_tensor * mm_2_b = nullptr;
 
+    // hy_v4_flash
+    ggml_tensor * mm_pre_norm_w = nullptr;
+    ggml_tensor * image_newline = nullptr;
+
     // this should be equal to the embedding dimension of the text model
     int n_mmproj_embd() const;
 

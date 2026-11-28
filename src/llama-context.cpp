@@ -52,6 +52,24 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
+    /*.name             =*/ "fused DeepSeek V4 HC pre",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
+    /*.name             =*/ "fused DeepSeek V4 HC post",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+    /*.op               =*/ LLM_FUSED_OP_TOP_K_MASK,
+    /*.name             =*/ "fused top-k mask",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -184,6 +202,13 @@ llama_context::llama_context(
     // the KV cache is shared with ctx_other, so follow its flash attention setting instead of resolving it here:
     // the probe disables it when the layers and the shared KV are on different devices, which breaks a quantized V cache
 
+    // only hy_v4_flash builds these fused nodes, skip the probes for the others
+    cparams.fused_dsv4_hc_pre  = true;
+    cparams.fused_dsv4_hc_post = true;
+    cparams.auto_fhc           = model.arch == LLM_ARCH_HY_V4_FLASH;
+    cparams.fused_top_k_mask   = true;
+    cparams.auto_ftkm          = model.arch == LLM_ARCH_HY_V4_FLASH;
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -214,6 +239,12 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
+
+    // the Hy4 flash pools gather their members from a single KV stream
+    if (model.arch == LLM_ARCH_HY_V4_FLASH && !cparams.kv_unified && cparams.n_seq_max > 1) {
+        LLAMA_LOG_WARN("%s: %s needs a unified KV cache, the sequences share n_ctx\n", __func__, llm_arch_name(model.arch));
+        cparams.kv_unified = true;
+    }
     cparams.longhaul_cache_size = params.longhaul_cache_size;
     if (params.longhaul_cache_sizes != nullptr) {
         cparams.longhaul_cache_sizes.assign(params.longhaul_cache_sizes, params.longhaul_cache_sizes + model.n_devices());
@@ -225,7 +256,8 @@ llama_context::llama_context(
 
         const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
         if (!LLAMA_KV_ROWS_DISABLE) {
-            cparams.auto_fkvr = cparams.kv_unified;
+            // the DSA inputs build dense masks over the cells, the pools index them
+            cparams.auto_fkvr = cparams.kv_unified && model.arch != LLM_ARCH_HY_V4_FLASH;
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
@@ -605,6 +637,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_kv_rows = cparams.flash_attn;
         resolve(llm_fused_op_flash_attn_kv_rows_probe, cparams.fused_kv_rows);
         cparams.auto_fkvr = false;
+    }
+
+    if (cparams.auto_fhc) {
+        LLAMA_LOG_INFO("%s: resolving fused hyper-connection support:\n", func);
+        resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+        resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_ftkm) {
+        LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
+        resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
+        cparams.auto_ftkm = false;
     }
 }
 

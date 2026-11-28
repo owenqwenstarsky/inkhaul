@@ -263,6 +263,38 @@ void llama_model_saver::add_kv_from_model() {
         add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   hparams.indexer_cand_block_size);
         add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, hparams.indexer_cand_top_k_blocks);
     }
+    if (model->arch == LLM_ARCH_HY_V4_FLASH) {
+        add_kv(LLM_KV_EXPERT_LATENT_LENGTH,                     hparams.n_expert_latent);
+        add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,             hparams.indexer_n_head);
+        add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,             hparams.indexer_head_size);
+        add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,                  hparams.indexer_kpool);
+        add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL,      hparams.indexer_kpool_select_tail);
+        add_kv(LLM_KV_HYPER_CONNECTION_COUNT,                   hparams.dsv4_hc_mult);
+        add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,                 hparams.dsv4_hc_eps);
+        add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE,               hparams.hc_magnitude);
+
+        // the Engram group only means anything whole: write all of it or none
+        if (hparams.ple_n_heads > 0) {
+            std::vector<uint32_t> ple_layers;
+            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                if (hparams.is_ple_impl[il]) {
+                    ple_layers.push_back(il);
+                }
+            }
+            const size_t n_cols = (size_t) hparams.ple_n_modules*hparams.ple_n_heads;
+            add_kv(LLM_KV_PLE_LAYERS,                 ple_layers);
+            add_kv(LLM_KV_PLE_NGRAM_SIZE,             hparams.ple_ngram_size);
+            add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,        hparams.ple_heads_per_ngram);
+            add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.ple_head_dim);
+            add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,      model->engram_multipliers);
+            add_kv(LLM_KV_PLE_HEAD_OFFSETS,           std::vector<uint64_t>(
+                    hparams.ple_head_offsets.begin(),     hparams.ple_head_offsets.begin()     + n_cols));
+            add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,       std::vector<uint64_t>(
+                    hparams.ple_head_vocab_sizes.begin(), hparams.ple_head_vocab_sizes.begin() + n_cols));
+            add_kv(LLM_KV_ENGRAM_PAD_TOKEN_ID,        hparams.engram_pad_id);
+            add_kv(LLM_KV_ENGRAM_TOKEN_MAP,           model->engram_token_map);
+        }
+    }
     add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
     if (hparams.n_relative > 0) {
         add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,     hparams.n_relative);
@@ -377,6 +409,10 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->cls_b);
     add_tensor(model->cls_out);
     add_tensor(model->cls_out_b);
+    add_tensor(model->hc_head_fn);
+    add_tensor(model->hc_head_base);
+    add_tensor(model->hc_head_scale);
+    add_tensor(model->per_layer_tok_embd);
 
     // looped architectures alias physical tensors across cache slots; save each
     // tensor once. a different tensor with an existing name still asserts below

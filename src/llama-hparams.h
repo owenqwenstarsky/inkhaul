@@ -3,12 +3,14 @@
 #include "llama.h"
 
 #include <array>
+#include <bitset>
 #include <cassert>
 #include <cmath>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
 #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
+#define LLAMA_MAX_PLE_HEADS 64 // hy_v4_flash (all Engram modules)
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
@@ -58,6 +60,32 @@ struct llama_hparams {
     uint32_t indexer_cand_top_k_blocks = 0;
     // indexer layers (1) choose the key pool, the other sparse layers (0) select from the pool of the preceding indexer
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_indexer_full_impl;
+
+    // DSA (hy_v4_flash): learned indexer over pools of indexer_kpool consecutive tokens
+    uint32_t indexer_n_head    = 0;
+    uint32_t indexer_head_size = 0;
+    uint32_t indexer_kpool     = 0; // k-pool size
+    bool     indexer_kpool_select_tail = true;
+
+    // hyper-connections (hy_v4_flash)
+    uint32_t dsv4_hc_mult = 0;
+    float    dsv4_hc_eps  = 0.0f;
+    // scale of the hyper-connection post gate
+    float    hc_magnitude = 0.0f;
+
+    // Engram (hy_v4_flash): n-gram hash embeddings, one module per Engram layer
+    uint32_t ple_ngram_size      = 0;
+    uint32_t ple_heads_per_ngram = 0;
+    uint32_t ple_n_heads         = 0;   // (ngram_size - 1) * heads_per_ngram
+    uint32_t ple_head_dim        = 0;
+    uint32_t ple_n_modules       = 1;
+    // the token that pads the n-gram history, an index into llama_model::engram_token_map
+    uint32_t engram_pad_id       = 0;
+    // the file lists PLE layer indices, so this is never a per-layer gguf array and can hold one bit per layer
+    std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
+    // head offsets and vocab sizes are token-space indices; the gather truncates them to int32 anyway
+    std::array<uint32_t, LLAMA_MAX_PLE_HEADS> ple_head_offsets;
+    std::array<uint32_t, LLAMA_MAX_PLE_HEADS> ple_head_vocab_sizes;
 
     // different head size for full_attention and SWA layers
     uint32_t n_embd_head_k_full; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
@@ -156,6 +184,7 @@ struct llama_hparams {
     std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_shexp; // shared expert
 
     // kimi-k3
+    uint32_t n_expert_latent      = 0;      // routed_expert_hidden_size (0 = experts run at n_embd)
     uint32_t attn_res_block_size  = 0;      // 0 = no cross-layer attention residuals
     float    situ_beta            = 1.0f;
     float    situ_linear_beta     = 0.0f;   // 0 = no linear-beta transform on the up branch
@@ -295,11 +324,16 @@ struct llama_hparams {
 
     uint32_t n_pos_per_embd() const;
 
+    // the file carries M-RoPE sections
+    bool use_mrope() const;
+
     bool has_kv(uint32_t il) const;
 
     uint32_t kv_source(uint32_t il) const;
 
     bool is_indexer_full(uint32_t il) const;
+
+    bool is_ple(uint32_t il) const;
 
     bool has_rope(uint32_t il) const;
 

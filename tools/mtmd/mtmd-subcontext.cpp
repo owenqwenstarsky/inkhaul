@@ -556,6 +556,65 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
 
                 set_input_i32("positions", positions);
             } break;
+        case PROJECTOR_TYPE_HY_V4_FLASH:
+            {
+                // resample the position embedding on the host: bilinear with sf = (target + 0.1)/n_grid, as the reference
+                // the result goes to the graph input of mtmd_graph_hy_v4::build()
+                GGML_ASSERT(model.position_embeddings != nullptr);
+                ggml_tensor * src_t   = model.position_embeddings;
+                GGML_ASSERT(ggml_is_matrix(src_t) && src_t->type == GGML_TYPE_F32);
+                const int64_t n_embd  = src_t->ne[0];
+                const int64_t n_pos   = src_t->ne[1]; // n_grid * n_grid
+                const int     n_grid  = (int) std::lround(std::sqrt((double) n_pos));
+                GGML_ASSERT((int64_t) n_grid * n_grid == n_pos);
+                const int     out_w   = pos_w;
+                const int     out_h   = pos_h;
+
+                std::vector<float> src(n_embd * n_pos);
+                ggml_backend_tensor_get(src_t, src.data(), 0, ggml_nbytes(src_t));
+
+                // dst[(y*out_w + x)*n_embd + c], as ggml_new_tensor_2d(F32, n_embd, out_h*out_w)
+                std::vector<float> dst((size_t) n_embd * out_h * out_w);
+
+                const float sx = (float) (out_w + 0.1f) / (float) n_grid;
+                const float sy = (float) (out_h + 0.1f) / (float) n_grid;
+
+                for (int y = 0; y < out_h; ++y) {
+                    // pixel centers as ggml_compute_forward_upscale_f32 (align_corners=False): src_y = (y + 0.5)/sy - 0.5
+                    const float fy = ((float) y + 0.5f) / sy - 0.5f;
+                    int y0 = (int) std::floor(fy);
+                    int y1 = y0 + 1;
+                    y0 = std::clamp(y0, 0, n_grid - 1);
+                    y1 = std::clamp(y1, 0, n_grid - 1);
+                    const float wy1 = std::clamp(fy - (float) y0, 0.0f, 1.0f);
+                    const float wy0 = 1.0f - wy1;
+                    for (int x = 0; x < out_w; ++x) {
+                        const float fx = ((float) x + 0.5f) / sx - 0.5f;
+                        int x0 = (int) std::floor(fx);
+                        int x1 = x0 + 1;
+                        x0 = std::clamp(x0, 0, n_grid - 1);
+                        x1 = std::clamp(x1, 0, n_grid - 1);
+                        const float wx1 = std::clamp(fx - (float) x0, 0.0f, 1.0f);
+                        const float wx0 = 1.0f - wx1;
+
+                        const float w00 = wy0 * wx0;
+                        const float w01 = wy0 * wx1;
+                        const float w10 = wy1 * wx0;
+                        const float w11 = wy1 * wx1;
+
+                        const float * s00 = &src[((size_t) y0 * n_grid + x0) * n_embd];
+                        const float * s01 = &src[((size_t) y0 * n_grid + x1) * n_embd];
+                        const float * s10 = &src[((size_t) y1 * n_grid + x0) * n_embd];
+                        const float * s11 = &src[((size_t) y1 * n_grid + x1) * n_embd];
+                        float * d         = &dst[((size_t) y * out_w + x) * n_embd];
+                        for (int c = 0; c < n_embd; ++c) {
+                            d[c] = w00 * s00[c] + w01 * s01[c] + w10 * s10[c] + w11 * s11[c];
+                        }
+                    }
+                }
+
+                set_input_f32("hy_v4_pos_embd", dst);
+            } break;
         default:
             GGML_ABORT("Unknown projector type");
     }

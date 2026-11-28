@@ -169,6 +169,12 @@ int32_t mtmd_helper_decode_image_chunk(
         int32_t ret = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch_embd.render(lctx, pos_offset, n_tokens_batch));
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);
+            // the rows of an M-RoPE image share one position, so the sliding window cannot free a cell during the image
+            // the requested -ub sets the SWA cache size, also when LongHaul reduces the compute ubatch
+            if (ret == 1 && chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE && n_pos_per_embd > 1 && llama_model_n_swa(model) > 0) {
+                LOG_ERR("the image has %d tokens and the sliding window KV cache cannot hold them, use -b and -ub of at least %d (image tokens + 512)\n",
+                        n_tokens, n_tokens + 512);
+            }
             return ret;
         }
 

@@ -902,6 +902,17 @@ struct mtmd_context {
                     img_end = "<|vision_end|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(models.v.get());
                 } break;
+            case PROJECTOR_TYPE_HY_V4_FLASH:
+                {
+                    // the image rows carry 2D M-RoPE positions
+                    if (text_model && pos_type != MTMD_POS_TYPE_MROPE) {
+                        throw std::runtime_error("the hy_v4_flash projector needs a text model with M-RoPE rope sections");
+                    }
+                    // <|hy_image_start:opensource|> ... (image embeddings) ... <|hy_image_end:opensource|>, with full-width bars
+                    img_beg = "<\uff5chy_image\u2581start:opensource\uff5c>";
+                    img_end = "<\uff5chy_image\u2581end:opensource\uff5c>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(models.v.get());
+                } break;
             default:
                 throw std::runtime_error(mtmd_format("%s: unexpected vision projector type %d\n", __func__, proj));
         }

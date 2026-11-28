@@ -90,6 +90,8 @@
 #define TN_LN_PRE          "%s.pre_ln.%s"
 #define TN_LN_POST         "%s.post_ln.%s"
 #define TN_LLAVA_PROJ      "mm.%d.%s"
+#define TN_IMAGE_NEWLINE   "v.image_newline"
+#define TN_MM_PRE_NORM     "mm.pre_norm.%s"
 #define TN_DEEPSTACK_NORM  "v.deepstack.%d.norm.%s"     // qwen3vl deepstack
 #define TN_DEEPSTACK_FC1   "v.deepstack.%d.fc1.%s"      // qwen3vl deepstack
 #define TN_DEEPSTACK_FC2   "v.deepstack.%d.fc2.%s"      // qwen3vl deepstack
@@ -100,12 +102,14 @@
 enum projector_type {
     PROJECTOR_TYPE_INKLING2V,
     PROJECTOR_TYPE_QWEN3VL,
+    PROJECTOR_TYPE_HY_V4_FLASH,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
 static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_INKLING2V,         "inkling2v"},
     { PROJECTOR_TYPE_QWEN3VL,           "qwen3vl_merger"},
+    { PROJECTOR_TYPE_HY_V4_FLASH,       "hy_v4_flash"},
 };
 
 static projector_type projector_type_from_string(const std::string & str) {

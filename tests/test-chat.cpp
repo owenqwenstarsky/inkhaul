@@ -3715,6 +3715,108 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Hy4-flash: <think:opensource> is open at the generation prompt, the tool calls use the GLM-4.6 layout:
+    // <tool_calls:opensource><tool_call:opensource>name<arg_key:opensource>k</arg_key:opensource><arg_value:opensource>v</arg_value:opensource></tool_call:opensource></tool_calls:opensource>
+    // the reasoning effort is a template kwarg: high (default), max or no_think
+    {
+        auto tst = peg_tester("models/templates/tencent-Hy4-flash.jinja", detailed_debug);
+
+        // reasoning with content, the default effort
+        tst.test("I'm\nthinking</think:opensource>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        tst.test("I'm\nthinking</think:opensource>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .chat_template_kwargs({ { "reasoning_effort", "\"max\"" } })
+            .expect(message_assist_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        // the template ignores enable_thinking: the think block stays open, the reasoning is still split off
+        // (--reasoning off does not turn thinking off, the docs name reasoning_effort no_think)
+        tst.test("I'm\nthinking</think:opensource>Hello, world!\nWhat's up?")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        // no_think: the generation prompt has an empty think block
+        tst.test("Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .chat_template_kwargs({ { "reasoning_effort", "\"no_think\"" } })
+            .expect(message_assist)
+            .expect_reconstruction()
+            .run();
+
+        // tool call with reasoning
+        tst.test(
+               "I'm\nthinking</think:opensource>"
+               "<tool_calls:opensource><tool_call:opensource>special_function"
+               "<arg_key:opensource>arg1</arg_key:opensource><arg_value:opensource>1</arg_value:opensource>"
+               "</tool_call:opensource></tool_calls:opensource>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .expect_reconstruction()
+            .run();
+
+        // tool call without reasoning
+        tst.test(
+               "<tool_calls:opensource><tool_call:opensource>special_function"
+               "<arg_key:opensource>arg1</arg_key:opensource><arg_value:opensource>1</arg_value:opensource>"
+               "</tool_call:opensource></tool_calls:opensource>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .chat_template_kwargs({ { "reasoning_effort", "\"no_think\"" } })
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .expect_reconstruction()
+            .run();
+
+        // parallel calls, a string value as is and a non-string value as JSON
+        tst.test(
+               "I'm\nthinking</think:opensource>"
+               "<tool_calls:opensource>"
+               "<tool_call:opensource>python"
+               "<arg_key:opensource>code</arg_key:opensource><arg_value:opensource>print(\"hi\")\nprint(2)</arg_value:opensource>"
+               "</tool_call:opensource>"
+               "<tool_call:opensource>special_function_with_opt"
+               "<arg_key:opensource>arg1</arg_key:opensource><arg_value:opensource>1</arg_value:opensource>"
+               "<arg_key:opensource>arg2</arg_key:opensource><arg_value:opensource>2</arg_value:opensource>"
+               "</tool_call:opensource>"
+               "</tool_calls:opensource>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ python_tool, special_function_tool_with_optional_param })
+            .expect_reasoning("I'm\nthinking")
+            .expect_tool_calls({
+                { "python", R"J({"code": "print(\"hi\")\nprint(2)"})J", {} },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", {} },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // a JSON schema after the reasoning
+        tst.test(
+               "I need to output the invoice details in JSON</think:opensource>"
+               R"({"amount": 123.45, "date": "2025-12-03"})")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .json_schema(invoice_schema)
+            .expect_reasoning("I need to output the invoice details in JSON")
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+    }
+
     // Spark2.5 uses tagged arguments with forced-open thinking.
     {
         auto tst = peg_tester("models/templates/Spark2.5.jinja", detailed_debug);
@@ -5309,6 +5411,105 @@ static void test_inkling2_media_blocks() {
     assert_equals(U + T + "a" + E,                             render({ "a" }));
 }
 
+// Hy4-flash renders, written from the template:
+// - tools: the tools prompt and the effort in the leading system turn, the reasoning of a tool call turn is kept,
+//   the tool responses follow the order of the tool calls, a non-string argument is JSON
+// - no tools and no_think: a system turn for the effort, the history and the generation prompt get empty think blocks
+static void test_hy4_flash_render() {
+    LOG_DBG("%s\n", __func__);
+
+    const std::string HS = "<\uff5chy_start:opensource\uff5c>";
+    const std::string HM = "<\uff5chy_middle:opensource\uff5c>";
+    const std::string HE = "<\uff5chy_end:opensource\uff5c>";
+    const std::string RM = "<\uff5creasoning_mode:opensource\uff5c>reasoning_effort:";
+
+    auto tmpls = read_templates("models/templates/tencent-Hy4-flash.jinja");
+
+    {
+        common_chat_msg system_msg;
+        system_msg.role    = "system";
+        system_msg.content = "You are a helpful assistant.";
+
+        common_chat_msg assist_msg = simple_assist_msg("", "Let me check", "special_function", "{\"arg1\": 1}", "call0");
+        assist_msg.tool_calls.push_back({ "python", "{\"code\": \"print(42)\"}", "call1" });
+
+        common_chat_msg tool_msg1;
+        tool_msg1.role         = "tool";
+        tool_msg1.tool_call_id = "call1";
+        tool_msg1.content      = "42";
+        common_chat_msg tool_msg0;
+        tool_msg0.role         = "tool";
+        tool_msg0.tool_call_id = "call0";
+        tool_msg0.content      = "ok";
+
+        common_chat_templates_inputs inputs;
+        inputs.messages = { system_msg, message_user, assist_msg, tool_msg1, tool_msg0 };
+        inputs.tools    = { special_function_tool };
+        inputs.add_generation_prompt = true;
+        const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+
+        // the JSON of the tool comes from the template engine, the rest from the template text
+        const size_t tools_beg = prompt.find("<tools>\n");
+        const size_t tools_end = prompt.find("\n</tools>");
+        if (tools_beg == std::string::npos || tools_end == std::string::npos) {
+            throw std::runtime_error("no tools block in the Hy4-flash prompt: " + prompt);
+        }
+        const std::string tool_json = prompt.substr(tools_beg + 8, tools_end - tools_beg - 8);
+        const json tool = json::parse(tool_json);
+        assert_equals(std::string("special_function"), tool.at("name").get<std::string>());
+        assert_equals(json::parse(special_function_tool.parameters).dump(), tool.at("parameters").dump());
+
+        const std::string expected =
+            HS + "system" + HM +
+                "# Tools\n\nYou may call one or more functions to assist with the user query."
+                "\n\nYou are provided with function signatures within <tools></tools> XML tags:"
+                "\n<tools>\n" + tool_json + "\n</tools>\n\n"
+                "For function call returns, you should first print <tool_calls:opensource>"
+                "\nFor each function call, you should return object like:\n"
+                "<tool_call:opensource>{function-name}"
+                "<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource>"
+                "<arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>"
+                "...</tool_call:opensource>"
+                "\nAt the end of function call returns, you should print </tool_calls:opensource>"
+                "\n\nYou are a helpful assistant." + RM + "high" + HE +
+            HS + "user" + HM + message_user.content + HE +
+            HS + "assistant" + HM + "<think:opensource>Let me check</think:opensource>"
+                "<tool_calls:opensource>"
+                "<tool_call:opensource>special_function"
+                "<arg_key:opensource>arg1</arg_key:opensource><arg_value:opensource>1</arg_value:opensource>"
+                "</tool_call:opensource>"
+                "<tool_call:opensource>python"
+                "<arg_key:opensource>code</arg_key:opensource><arg_value:opensource>print(42)</arg_value:opensource>"
+                "</tool_call:opensource>"
+                "</tool_calls:opensource>" + HE +
+            HS + "tool" + HM +
+                "<tool_response:opensource>ok</tool_response:opensource>"
+                "<tool_response:opensource>42</tool_response:opensource>" + HE +
+            HS + "assistant" + HM + "<think:opensource>";
+        assert_equals(expected, prompt);
+    }
+
+    {
+        common_chat_msg user_msg;
+        user_msg.role    = "user";
+        user_msg.content = "Bye";
+
+        common_chat_templates_inputs inputs;
+        inputs.messages = { message_user, simple_assist_msg("Hi there", "greeting"), user_msg };
+        inputs.chat_template_kwargs = { { "reasoning_effort", "\"no_think\"" } };
+        inputs.add_generation_prompt = true;
+        const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+
+        const std::string expected =
+            HS + "system" + HM + RM + "no_think" + HE +
+            HS + "user" + HM + message_user.content + HE +
+            HS + "assistant" + HM + "<think:opensource></think:opensource>Hi there" + HE +
+            HS + "user" + HM + "Bye" + HE +
+            HS + "assistant" + HM + "<think:opensource></think:opensource>";
+        assert_equals(expected, prompt);
+    }
+}
+
 static void test_template_generation_prompt() {
     common_chat_msg system_msg;
     system_msg.role = "system";
@@ -5664,6 +5865,7 @@ static void test_reasoning_effort_caps() {
 
     assert_supports_effort("models/templates/thinkingmachines-Inkling-2-Small.jinja", true);
     assert_supports_effort("models/templates/tencent-Hy3.jinja", true);
+    assert_supports_effort("models/templates/tencent-Hy4-flash.jinja", true);
     assert_supports_effort("models/templates/upstage-Solar-Open-100B.jinja", true);
     assert_supports_effort("models/templates/Aleph-Alpha-Kolibri-1.1.jinja", true);
     assert_supports_effort("models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja", false);
@@ -5675,6 +5877,8 @@ static void test_reasoning_effort_caps() {
     };
 
     assert_effort_levels("models/templates/tencent-Hy3.jinja", { "low", "high" });
+    // Hy4-flash also has no_think, which is not a standard level; none turns thinking off and is not listed
+    assert_effort_levels("models/templates/tencent-Hy4-flash.jinja", { "high", "max" });
     assert_effort_levels("models/templates/upstage-Solar-Open-100B.jinja", { "low" });
     assert_effort_levels("models/templates/thinkingmachines-Inkling-2-Small.jinja", { "none", "minimal", "low", "medium", "high", "max" });
     assert_effort_levels("models/templates/Qwen-Qwen3-0.6B.jinja", {});
@@ -5687,6 +5891,7 @@ static void test_reasoning_effort_caps() {
     };
 
     assert_effort_rejected("models/templates/tencent-Hy3.jinja", { "minimal", "medium", "xhigh", "max" });
+    assert_effort_rejected("models/templates/tencent-Hy4-flash.jinja", { "minimal", "low", "medium", "xhigh" });
     assert_effort_rejected("models/templates/Aleph-Alpha-Kolibri-1.1.jinja", {});
 }
 
@@ -5849,6 +6054,7 @@ int main(int argc, char ** argv) {
         test_inkling2_media_blocks();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
+        test_hy4_flash_render();
         test_prompt_parts();
         test_chat_session();
         test_chat_json_depth();

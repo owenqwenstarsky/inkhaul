@@ -115,6 +115,14 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                     "'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+",
                 };
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_HY_V4:
+                regex_exprs = {
+                    "\\p{N}{1,3}",
+                    // CJK ideographs, hiragana and katakana
+                    "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+                    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+                };
+                break;
             default:
                 // default regex for BPE tokenization pre-processing
                 regex_exprs = {
@@ -592,6 +600,9 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 clean_spaces = false;
             } else if (tokenizer_pre == "qwen35") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_QWEN35;
+                clean_spaces = false;
+            } else if (tokenizer_pre == "hy_v4") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_HY_V4;
                 clean_spaces = false;
             } else if (
                 tokenizer_pre == "bailingmoe" ||

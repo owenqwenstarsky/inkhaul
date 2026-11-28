@@ -272,6 +272,28 @@ struct mtmd_model_loader {
                             LOG_WRN("%s: more info: https://github.com/ggml-org/llama.cpp/issues/16842\n\n", __func__);
                         }
                     } break;
+                case PROJECTOR_TYPE_HY_V4_FLASH:
+                    {
+                        hparams.n_merge = 2;
+                        // the HF processor replaces lanczos with torchvision bicubic
+                        hparams.image_resize_algo = static_cast<resize_algo>(RESIZE_ALGO_BICUBIC | RESIZE_ALGO_FLAG_TORCH);
+                        hparams.image_round_half_even = true;
+                        hparams.image_resize_pad = PAD_NONE;
+                        hparams.ffn_op = FFN_GELU; // tanh gelu (bias_activation_fusion)
+                        log_ffn_op = "gelu";
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        if (hparams.n_merge <= 0) {
+                            throw std::runtime_error(mtmd_format("%s: spatial_merge_size must be > 0\n", __func__));
+                        }
+                        hparams.set_limit_image_tokens(4, 4096);
+                        if (hparams.custom_image_min_tokens <= 0) {
+                            get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels, false);
+                        }
+                        if (hparams.custom_image_max_tokens <= 0) {
+                            get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, false);
+                        }
+                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                    } break;
                 default:
                     throw std::runtime_error(mtmd_format("%s: unknown vision projector type %s\n", __func__, proj_type.c_str()));
             }
@@ -469,6 +491,21 @@ struct mtmd_model_loader {
                     model.mm_1_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 1, "bias"), false);
                     model.mm_2_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_2_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"), false);
+                } break;
+            case PROJECTOR_TYPE_HY_V4_FLASH:
+                {
+                    model.mm_0_w        = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b        = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_1_w        = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_1_b        = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"));
+                    model.mm_pre_norm_w = get_tensor(mtmd_format(TN_MM_PRE_NORM, "weight"));
+                    model.image_newline = get_tensor(TN_IMAGE_NEWLINE);
+                    // the position embedding is resampled on the host as F32
+                    if (!model.position_embeddings || model.position_embeddings->type != GGML_TYPE_F32 ||
+                            !ggml_is_matrix(model.position_embeddings) || model.position_embeddings->ne[0] != hparams.n_embd) {
+                        throw std::runtime_error(mtmd_format("%s: %s requires a 2D F32 %s\n", __func__,
+                                PROJECTOR_TYPE_NAMES[model.proj_type].c_str(), mtmd_format(TN_POS_EMBD, prefix).c_str()));
+                    }
                 } break;
             case PROJECTOR_TYPE_QWEN3VL:
                 {
@@ -695,6 +732,8 @@ int mtmd_model::n_output_tokens_x(const mtmd_image_f32 * img) const {
             return (img->nx() / params.patch_size) / 2;
         case PROJECTOR_TYPE_INKLING2V:
             return img->nx() / (params.patch_size * params.n_merge);
+        case PROJECTOR_TYPE_HY_V4_FLASH:
+            return (img->nx() / params.patch_size) / params.n_merge + 1; // +1 for the newline
         default:
             break;
     }
@@ -709,6 +748,8 @@ int mtmd_model::n_output_tokens_y(const mtmd_image_f32 * img) const {
             return (img->ny() / params.patch_size) / 2;
         case PROJECTOR_TYPE_INKLING2V:
             return img->ny() / (params.patch_size * params.n_merge);
+        case PROJECTOR_TYPE_HY_V4_FLASH:
+            return (img->ny() / params.patch_size) / params.n_merge;
         default:
             break;
     }
@@ -738,6 +779,13 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
                 int y_patch = img->ny() / (params.patch_size * 2);
                 n_patches = x_patch * y_patch;
             } break;
+        case PROJECTOR_TYPE_HY_V4_FLASH:
+            {
+                // one newline after each row of merged patches
+                const int ow = (img->nx() / patch_size) / params.n_merge;
+                const int oh = (img->ny() / patch_size) / params.n_merge;
+                n_patches = (ow + 1) * oh;
+            } break;
         default:
             GGML_ABORT("unsupported projector type");
     }
@@ -754,6 +802,8 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_QWEN3VL:
             // main path + deepstack paths
             return mm_1_b->ne[0] * (1 + n_deepstack_layers);
+        case PROJECTOR_TYPE_HY_V4_FLASH:
+            return mm_1_w->ne[3];
         default:
             GGML_ABORT("Unknown projector type");
     }
